@@ -43,31 +43,31 @@ func TestDefaultBindsResolve(t *testing.T) {
 		t.Fatalf("prefix = %#x, want C-b (0x02)", binds.Prefix)
 	}
 
-	want := map[byte]BindOp{
-		'c': {Action: []string{"new-window"}},
-		'n': {Action: []string{"next-window"}},
-		'p': {Action: []string{"previous-window"}},
-		'%': {Action: []string{"split-window", "-h"}},
-		'"': {Action: []string{"split-window"}},
-		'x': {Action: []string{"kill-pane"}},
-		'd': {Action: []string{"detach"}},
-		'q': {Action: []string{"display-panes"}},
-		'z': {Action: []string{"resize-pane", "-Z"}},
-		'{': {Action: []string{"swap-pane", "-U"}},
-		'}': {Action: []string{"swap-pane"}},
-		'<': {Action: []string{"swap-window", "-L"}},
-		'>': {Action: []string{"swap-window"}},
-		'!': {Action: []string{"break-pane"}},
-		'm': {Action: []string{"mark-pane"}},
-		'J': {Action: []string{"join-marked"}},
-		's': {Action: []string{"choose-session"}},
-		'[': {Action: []string{"copy-mode"}},
-		']': {Action: []string{"paste"}},
-		'$': {Local: "rename-session"},
-		',': {Local: "rename-window"},
-		':': {Action: []string{"command-prompt"}},
-		'w': {Action: []string{"choose-tree"}},
-		'W': {Local: "choose-window"},
+	want := map[string]BindOp{
+		"c": {Action: []string{"new-window"}},
+		"n": {Action: []string{"next-window"}},
+		"p": {Action: []string{"previous-window"}},
+		"%": {Action: []string{"split-window", "-h"}},
+		"\"": {Action: []string{"split-window"}},
+		"x": {Action: []string{"kill-pane"}},
+		"d": {Action: []string{"detach"}},
+		"q": {Action: []string{"display-panes"}},
+		"z": {Action: []string{"resize-pane", "-Z"}},
+		"{": {Action: []string{"swap-pane", "-U"}},
+		"}": {Action: []string{"swap-pane"}},
+		"<": {Action: []string{"swap-window", "-L"}},
+		">": {Action: []string{"swap-window"}},
+		"!": {Action: []string{"break-pane"}},
+		"m": {Action: []string{"mark-pane"}},
+		"J": {Action: []string{"join-marked"}},
+		"s": {Action: []string{"choose-session"}},
+		"[": {Action: []string{"copy-mode"}},
+		"]": {Action: []string{"paste"}},
+		"$": {Local: "rename-session"},
+		",": {Local: "rename-window"},
+		":": {Action: []string{"command-prompt"}},
+		"w": {Action: []string{"choose-tree"}},
+		"W": {Local: "choose-window"},
 	}
 	for key, exp := range want {
 		ops := binds.Resolve(key)
@@ -129,11 +129,11 @@ gtmux.bind("K", function() gtmux.confirm_before("kill-window", "kill? (y/n)") en
 	defer binds.Close()
 
 	wantW := []string{"command-prompt", "-p", "new name:", "-I", "old", "--", "rename-window", "%1"}
-	if ops := binds.Resolve('W'); len(ops) != 1 || !reflect.DeepEqual(ops[0].Action, wantW) {
+	if ops := binds.Resolve("W"); len(ops) != 1 || !reflect.DeepEqual(ops[0].Action, wantW) {
 		t.Errorf("command_prompt encoded as %v, want %v", ops, wantW)
 	}
 	wantK := []string{"confirm-before", "-p", "kill? (y/n)", "--", "kill-window"}
-	if ops := binds.Resolve('K'); len(ops) != 1 || !reflect.DeepEqual(ops[0].Action, wantK) {
+	if ops := binds.Resolve("K"); len(ops) != 1 || !reflect.DeepEqual(ops[0].Action, wantK) {
 		t.Errorf("confirm_before encoded as %v, want %v", ops, wantK)
 	}
 }
@@ -149,7 +149,7 @@ gtmux.bind("M", function() gtmux.display_menu("go", "new", "new-window", "kill",
 	_, binds := LoadClient(path)
 	defer binds.Close()
 	want := []string{"display-menu", "-T", "go", "--", "new", "new-window", "kill", "kill-pane"}
-	if ops := binds.Resolve('M'); len(ops) != 1 || !reflect.DeepEqual(ops[0].Action, want) {
+	if ops := binds.Resolve("M"); len(ops) != 1 || !reflect.DeepEqual(ops[0].Action, want) {
 		t.Errorf("display_menu encoded as %v, want %v", ops, want)
 	}
 }

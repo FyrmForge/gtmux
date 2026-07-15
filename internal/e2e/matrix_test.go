@@ -1833,3 +1833,32 @@ func TestListSessions(t *testing.T) {
 		t.Errorf("work line = %q, want work:1:1", got["work"])
 	}
 }
+
+// TestKillWindowTarget: kill-window -t must kill the TARGET window, not the
+// active one (the -t-ignored bug killed whichever window was current).
+func TestKillWindowTarget(t *testing.T) {
+	c := harness.Start(t)
+	c.WaitForStatus("1:")
+	c.Run("run", "default", "new-window", "-n", "keepme") // now active; base-index 1 → zsh is :1
+	c.WaitForStatus("keepme")
+	c.Run("run", "default", "kill-window", "-t", ":1") // kill the OTHER (non-active) window
+	out := c.Run("run", "default", "list-windows", "-F", "#{window_name}")
+	if !strings.Contains(out, "keepme") {
+		t.Fatalf("kill-window -t :0 killed the active window; list-windows = %q, want it to still contain keepme", out)
+	}
+	if strings.Count(strings.TrimSpace(out), "\n") != 0 {
+		t.Fatalf("expected exactly one window left, got: %q", out)
+	}
+}
+
+// TestNewSession: the runtime new-session command creates a detached session
+// visible in the registry.
+func TestNewSession(t *testing.T) {
+	c := harness.Start(t)
+	c.WaitForStatus("1:")
+	c.Run("run", "default", "new-session", "-s", "spawned")
+	out := c.Run("run", "default", "list-sessions", "-F", "#{session_name}")
+	if !strings.Contains(out, "spawned") {
+		t.Fatalf("new-session -s spawned not in list-sessions: %q", out)
+	}
+}

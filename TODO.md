@@ -159,6 +159,19 @@ item, agree approach, implement + test, tick it.
   `send-keys -X` routing — the keytable stays hardcoded. OSC 52 already sets the
   clipboard, so the only real gap was arbitrary-command piping, which this
   covers. Add the rebindable tables if anyone actually needs to remap movement.
+- [x] Copy-mode `f/F/t/T` char-motions + numeric count prefix (client): `f`/`t`
+  jump forward onto/just-before a char on the current line, `F`/`T` backward;
+  digits build a count (`3j`, `2fc`) that carries across the find operator to its
+  target, and count-`G` goes to that line (lone `0` stays line-start). New
+  `pending`/`count` fields + `charMotion`/`takeCount` in `copymode.go`. Test:
+  `TestCopyModeCharMotionAndCount` (drives the real `feed` byte path). Live tmux
+  verification caught a panic: `charMotion` searched the `lineRunes` (trailing-
+  blank-trimmed) view while `$`/`clamp` leave `cx` in the raw padded line, so a
+  backward find with `cx` past the trimmed length indexed out of range and
+  crashed the client — fixed by searching the raw padded glyph line (cursor's
+  own coordinate space); regression case in the same test. Skipped: `;`/`,`
+  repeat-last-find (add when wanted); in emacs mode plain digits also build a
+  count (vi-oriented, shadows no emacs binding).
 - [x] `remain-on-exit` (`off`/`on`/`failed`): a window option (config default +
   per-window `setw`, mirroring synchronize-panes) resolved at pane-exit time in
   the `ptyOutput` error handler. When it keeps the pane, `pane.markDead` reaps
@@ -296,23 +309,31 @@ item, agree approach, implement + test, tick it.
 - Renderer check done (this is real work, not lying no-ops — the renderer
   consults styles throughout). Already-existing, not re-added: `status-style`
   (`status_style`), copy-mode selection style (`copy_selection_fg/bg`).
+- [x] **Loader provenance** (unblocks the aliases below): the client loader ran
+  all `gtmux.options.X` entries from one merged table via `opts.ForEach` (random
+  order), so two option names writing the same field raced non-deterministically.
+  Fixed in `LoadClientWith`: `gtmux.options` is swapped to a fresh table before
+  the user file runs, and default-file opts apply first, then user-file opts —
+  so a user's aliasing option deterministically wins over a default seeding the
+  same field. Guarded by `TestLoadClientOverrides` (user `mouse=false` /
+  `status_style=fg=red` beat the bundled defaults). ponytail: file-level
+  provenance only; two aliases in the *same* file still race (needs an ordered
+  replay via a `__newindex` metatable) — nobody aliases within one file.
 - [ ] Option families — remaining, deferred with reasons:
-  - `mode-style` — dropped as an alias: the copy-selection style already exists
-    as `copy_selection_fg/bg`, and `default_client.lua` seeds those into the Lua
-    opts table, so a second option writing the same field races it under the
-    loader's `opts.ForEach` (random map order). A same-field alias can't work
-    without loader provenance tracking (user-file > default-file); not worth it.
+  - `mode-style` — **now unblocked** by the loader-provenance fix above. It
+    aliases the existing `copy_selection_fg/bg` (seeded by `default_client.lua`);
+    a user `mode-style` now wins deterministically. Wire it (alias → the copy-
+    selection style fields) when wanted — the loader wall is gone.
   - `pane-border-style` — **done (inactive).** New `InactiveBorderFG/BG/Attr`
     (config/client.go) via the `applyStyle` helper; the compositor's border
     rendering (both the divider ring and the pane-border-status label) now reads
     them instead of a hardcoded `DarkGrey`. Default keeps `DarkGrey` so it's a
     no-op until set. Unique fields → no loader-alias trap. Tests:
     `TestCompositorPaneBorderStyle` (render, discrimination-checked),
-    `TestLoadClientStyleOptions` (loader round-trip). Still deferred:
-    `pane-active-border-style` (full fg/bg/attr) — aliases the existing
-    `active_border_fg`, so it hits the loader-provenance root cause (same wall as
-    `mode-style`). Unblock both together with the loader fix (user-file opts
-    applied after default-file opts) if the active-border bg/attr is wanted.
+    `TestLoadClientStyleOptions` (loader round-trip). `pane-active-border-style`
+    (full fg/bg/attr) — aliases the existing `active_border_fg`; **now unblocked**
+    by the loader-provenance fix. Wire it (alias → active-border style fields)
+    when the active-border bg/attr is wanted.
   - multi-line status (`status 2..5`) — **done.** `status` N reserves N rows.
     The count rides in Attach/Resize (`proto.Attach/Resize.StatusLines`), so the
     server sizes the window grid `rows - statusLines` (`winRows`, tracked via a
@@ -324,9 +345,9 @@ item, agree approach, implement + test, tick it.
     (`status_format_2..5` → `renderExtraStatus`). Tests: `TestMultiLineStatus`
     (e2e — asserts the extra line renders AND `#{pane_height}` = rows − N, so it
     discriminates the server sizing; discrimination-checked), `TestCompositorMultiLineStatus`
-    (render), `TestLoadClientMultiLineStatus` (loader). ponytail: `status off`
-    (hide bar) clamps to 1 — gtmux has no hide-bar today, so not a regression;
-    runtime `set status N` takes effect on reattach (read at attach), not live.
+    (render), `TestLoadClientMultiLineStatus` (loader). `status off` now hides
+    the bar (see Cheap three below); runtime `set status N` takes effect on
+    reattach (read at attach), not live.
 
 ### Config-parity wave (gaps found cross-referencing ~/.tmux.conf)
 
@@ -368,6 +389,68 @@ Seven `.tmux.conf` features gtmux couldn't express, closed together:
   survives). Verified live via grim (blue `ls` dirs + colored prompt in the
   preview). ponytail: frozen at open, not live (tmux's follows keystrokes); a
   live version needs per-move round-trips.
+
+### Cheap three (further gaps)
+
+- [x] **`window-status-style`**: inactive window entries in the status bar take
+  their own fg/bg/attr instead of inheriting `status-style`. New
+  `WindowStatusFG/BG/Attr` + `WindowStatusStyleSet` (config/client.go, via
+  `applyStyle`); `renderBar` uses them for non-active entries, keeps
+  active-window colors for the current one. No-op until set → no loader-alias
+  trap (unique fields). `window-status-current-style` (aliases `active_window_*`)
+  is now unblocked by the loader-provenance fix — wire it when wanted.
+- [x] **`status off`**: `status off`/`0` hides the bar (`StatusLines` can be 0),
+  `status N` (1..5) sets line count. `statusLines()` returns 0 when off; the
+  compositor overlays copy-mode help / prompt / transient messages on the last
+  content row so they stay reachable with no bar. Tests: loader + `renderPromptLine`.
+- [x] **`new-session` (runtime)**: `new-session [-d] [-s name] [-c dir]` creates
+  a detached shell session via `reg.resolveGroup` (auto-names on empty, errors
+  on dupes). Always detached (can't move the acting client mid-command). Test:
+  `TestNewSession` (e2e). Skipped: `[command]` arg + `-A` attach-or-create — add
+  when spawn-with-command or one-shot attach is wanted.
+
+### Keybind refactor (multi-byte keys)
+
+- [x] **Binds keyed on a canonical key string, not a single `byte`**: unlocks
+  Meta (`M-h`), function keys (`F1`–`F12`), and named keys (`Up`/`Home`/`PgUp`/…)
+  as bindable keys, both prefix and root (`bind -n`). `parseKey` split into
+  `parseKeyByte` (prefix — always one byte) and `parseKeyName` (canonical token:
+  `"C-b"`,`"M-h"`,`"F5"`,`"Up"`,`" "`, folding aliases `Tab`/`Enter`/`Space`/`BSpace`).
+  All four bind maps (`Binds`/`RootBinds`/`Repeat`/`Tables`) + overrides went
+  `map[byte]`→`map[string]`; `Resolve*`/`SetOverride`/`ParseKey` sigs follow.
+  Client input machine: a unified ESC collector (`ESC [`=CSI / `ESC O`=SS3 /
+  printable=Meta) canonicalizes bytes to the same token, routed through the same
+  tables; `byteKey`/`csiKeyName`/`ss3KeyName` mirror `parseKeyName` exactly
+  (pinned by `TestReaderParserAgree`). Control folding stays byte-identical to
+  before, incl. non-letters `C-\`/`C-]`/`C-^`/`C-_` (0x1c–0x1f) — a live user
+  bind (`bind_root C-\`) that a naive a–z guard would have silently dropped.
+  Tests: `TestParseKeyName`, `TestReaderParserAgree`. Live-verified via tmux:
+  root `M-n` fires, prefix `F5` fires, and an unbound `Home` forwards its raw
+  bytes to the focused app (the one trap of adding a root escape path). The
+  hardcoded prefix+arrow/resize/PgUp fallbacks are unchanged (a user prefix-bind
+  for the same named key now overrides them). Excluded: full modifier matrix
+  (`C-S-x` / CSI-u — terminal-dependent); `C-[`==ESC unbindable (escape lead);
+  `Ctrl`+digit (terminals emit no distinct byte). ponytail ceiling: root escape
+  sequences are recognized only within one read chunk (terminals deliver them
+  atomically) — a bind only misses if its sequence splits across reads;
+  passthrough stays correct either way. Real disambiguation of a lone `ESC` vs an
+  `ESC`-prefixed sequence needs tmux's `escape-time` timer — the knob to add if
+  split sequences ever bite.
+
+### Client hardening
+
+- [x] **Terminal restore on goroutine panic**: raw-mode/mouse cleanup lived only
+  in the main goroutine's `defer`s, which the runtime skips when a *spawned*
+  goroutine panics — so a client crash left the pane wedged (raw mode + mouse
+  reporting on). Fixed in `RunGroup`: an idempotent (`sync.Once`) `restoreTerm`
+  (disable mouse, leave raw mode) called from both the exit defer and a package-
+  level `guardPanic(restore)` deferred at the top of each spawned goroutine
+  (input + SIGWINCH) — it restores, then re-raises so the crash still surfaces.
+  Tests: `TestGuardPanicRestoresThenReraises` (restore-before-reraise, panic
+  value preserved); live-verified by crashing the input goroutine via an
+  env-gated trigger and confirming the pane returned to a cooked shell
+  (`stty` icanon/echo). Defense-in-depth — the `charMotion` panic that first hit
+  this is already fixed. Title/kitty restore stays main-only (cosmetic).
 
 Skipped deliberately: `customize-mode`, `lock-server`, `server-access`,
 `list-commands`, `terminal-features`/`terminal-overrides`: introspection/

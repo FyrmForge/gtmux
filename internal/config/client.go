@@ -43,6 +43,12 @@ type ClientConfig struct {
 	StatusAttr         int16 // status-style attributes (bold/reverse/italics) for the bar
 	MessageAttr        int16 // message-style attributes
 	InactiveBorderAttr int16 // pane-border-style attributes for inactive dividers
+	// window-status-style: style for inactive window-list entries. Inherits the
+	// status style unless WindowStatusStyleSet. (window-status-current-style is
+	// deferred: it would alias active_window_fg/bg — the loader-provenance trap.)
+	WindowStatusFG, WindowStatusBG emu.Color
+	WindowStatusAttr               int16
+	WindowStatusStyleSet           bool
 	StatusLeftLength   int   // status-left-length: max cells for status-left (0 = unlimited)
 	StatusRightLength  int   // status-right-length: max cells for status-right (0 = unlimited)
 	StatusLines        int   // tmux `status` 1..5: number of status rows (the client reserves them)
@@ -199,8 +205,12 @@ func applyOption(cfg *ClientConfig, binds *ClientBinds, name, value string) bool
 	}
 	switch name {
 	case "prefix":
-		if b, ok := parseKey(value); ok {
+		if b, ok := parseKeyByte(value); ok {
 			binds.Prefix = b
+		}
+	case "prefix2":
+		if b, ok := parseKeyByte(value); ok {
+			binds.Prefix2 = b // secondary prefix; 0 = unset
 		}
 	case "status_left":
 		cfg.StatusLeft = value
@@ -245,6 +255,9 @@ func applyOption(cfg *ClientConfig, binds *ClientBinds, name, value string) bool
 		cfg.LockPassword = value
 	case "status_style":
 		applyStyle(value, &cfg.StatusFG, &cfg.StatusBG, &cfg.StatusAttr)
+	case "window_status_style":
+		applyStyle(value, &cfg.WindowStatusFG, &cfg.WindowStatusBG, &cfg.WindowStatusAttr)
+		cfg.WindowStatusStyleSet = true
 	case "message_style":
 		applyStyle(value, &cfg.MessageFG, &cfg.MessageBG, &cfg.MessageAttr)
 	case "status_left_length":
@@ -256,10 +269,11 @@ func applyOption(cfg *ClientConfig, binds *ClientBinds, name, value string) bool
 			cfg.StatusRightLength = n
 		}
 	case "status":
-		// tmux `status`: on/off/1..5 status lines. ponytail: `off` (hide the bar)
-		// isn't modeled — gtmux has no hide-bar today — so it clamps to 1 line.
+		// tmux `status`: off (hide the bar), on, or 1..5 status lines.
 		switch value {
-		case "", "on", "off", "0", "1":
+		case "off", "0":
+			cfg.StatusLines = 0
+		case "", "on", "1":
 			cfg.StatusLines = 1
 		default:
 			if n, err := strconv.Atoi(value); err == nil && n >= 1 && n <= 5 {
@@ -381,17 +395,18 @@ type BindOp struct {
 // exits.
 type ClientBinds struct {
 	l         *lua.LState
-	Binds     map[byte]*lua.LFunction
-	RootBinds map[byte]*lua.LFunction            // no-prefix binds (tmux bind -n)
-	Repeat    map[byte]bool                      // prefix keys that repeat (tmux bind -r)
-	Tables    map[string]map[byte]*lua.LFunction // custom key tables (tmux bind -T <table>)
+	Binds     map[string]*lua.LFunction
+	RootBinds map[string]*lua.LFunction            // no-prefix binds (tmux bind -n)
+	Repeat    map[string]bool                      // prefix keys that repeat (tmux bind -r)
+	Tables    map[string]map[string]*lua.LFunction // custom key tables (tmux bind -T <table>)
 	Prefix    byte
+	Prefix2   byte // tmux prefix2: optional secondary prefix key; 0 = unset
 	ops       []BindOp // accumulated by the primitives while one bind runs
 	// oBinds/oRoot are runtime overrides (tmux bind-key/unbind-key at runtime):
 	// a key present here shadows the Lua bind — non-nil ops run instead, nil ops
 	// mean unbound. Mutated from the server-message goroutine (SetOverride) and
 	// read from the input goroutine (Resolve), so guarded by mu.
-	oBinds, oRoot map[byte][]BindOp
+	oBinds, oRoot map[string][]BindOp
 	mu            sync.Mutex
 }
 
@@ -399,25 +414,25 @@ func (c *ClientBinds) Close() { c.l.Close() }
 
 // SetOverride installs a runtime bind for key (root = tmux bind -n table); ops
 // nil marks it unbound, shadowing any Lua bind. tmux bind-key / unbind-key.
-func (c *ClientBinds) SetOverride(key byte, root bool, ops []BindOp) {
+func (c *ClientBinds) SetOverride(key string, root bool, ops []BindOp) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if root {
 		if c.oRoot == nil {
-			c.oRoot = map[byte][]BindOp{}
+			c.oRoot = map[string][]BindOp{}
 		}
 		c.oRoot[key] = ops
 		return
 	}
 	if c.oBinds == nil {
-		c.oBinds = map[byte][]BindOp{}
+		c.oBinds = map[string][]BindOp{}
 	}
 	c.oBinds[key] = ops
 }
 
 // Resolve runs the Lua function bound to key and returns the BindOps its
 // primitives recorded. A runtime override wins (nil = unbound). Nil if unbound.
-func (c *ClientBinds) Resolve(key byte) []BindOp {
+func (c *ClientBinds) Resolve(key string) []BindOp {
 	c.mu.Lock()
 	ops, ok := c.oBinds[key]
 	c.mu.Unlock()
@@ -428,7 +443,7 @@ func (c *ClientBinds) Resolve(key byte) []BindOp {
 }
 
 // ResolveRoot is Resolve for the no-prefix (bind -n) table.
-func (c *ClientBinds) ResolveRoot(key byte) []BindOp {
+func (c *ClientBinds) ResolveRoot(key string) []BindOp {
 	c.mu.Lock()
 	ops, ok := c.oRoot[key]
 	c.mu.Unlock()
@@ -438,13 +453,13 @@ func (c *ClientBinds) ResolveRoot(key byte) []BindOp {
 	return c.run(c.RootBinds[key])
 }
 
-// ParseKey exposes the bind-key parser (single char or "C-x") to the client
-// package for runtime bind-key.
-func ParseKey(s string) (byte, bool) { return parseKey(s) }
+// ParseKey exposes the canonical bind-key parser to the client package for
+// runtime bind-key: single char, "C-x", "M-x", or a named/function key.
+func ParseKey(s string) (string, bool) { return parseKeyName(s) }
 
 // ResolveTable runs the bind for key in a custom key table (tmux bind -T), or
 // nil if the table or key is unbound.
-func (c *ClientBinds) ResolveTable(table string, key byte) []BindOp {
+func (c *ClientBinds) ResolveTable(table string, key string) []BindOp {
 	if t := c.Tables[table]; t != nil {
 		return c.run(t[key])
 	}
@@ -484,16 +499,16 @@ func LoadClientWith(path string, overrides [][2]string) (ClientConfig, *ClientBi
 	L := lua.NewState()
 	binds := &ClientBinds{
 		l:         L,
-		Binds:     map[byte]*lua.LFunction{},
-		RootBinds: map[byte]*lua.LFunction{},
-		Repeat:    map[byte]bool{},
-		Tables:    map[string]map[byte]*lua.LFunction{},
+		Binds:     map[string]*lua.LFunction{},
+		RootBinds: map[string]*lua.LFunction{},
+		Repeat:    map[string]bool{},
+		Tables:    map[string]map[string]*lua.LFunction{},
 		Prefix:    0x02,
 	}
 
 	tbl := L.NewTable()
-	opts := L.NewTable()
-	L.SetField(tbl, "options", opts)
+	defOpts := L.NewTable() // gtmux.options while the bundled default config runs
+	L.SetField(tbl, "options", defOpts)
 
 	// Each primitive records a fixed BindOp; the key→action mapping lives here,
 	// not on the server, so binds are configured entirely client-side.
@@ -689,7 +704,7 @@ func LoadClientWith(path string, overrides [][2]string) (ClientConfig, *ClientBi
 		return 0
 	}))
 	L.SetField(tbl, "bind", L.NewFunction(func(l *lua.LState) int {
-		if b, ok := parseKey(l.CheckString(1)); ok {
+		if b, ok := parseKeyName(l.CheckString(1)); ok {
 			binds.Binds[b] = l.CheckFunction(2)
 		}
 		return 0
@@ -697,7 +712,7 @@ func LoadClientWith(path string, overrides [][2]string) (ClientConfig, *ClientBi
 	// bind_repeat is bind + tmux's -r: after firing, the key repeats without
 	// re-pressing the prefix until the repeat window (client-side) lapses.
 	L.SetField(tbl, "bind_repeat", L.NewFunction(func(l *lua.LState) int {
-		if b, ok := parseKey(l.CheckString(1)); ok {
+		if b, ok := parseKeyName(l.CheckString(1)); ok {
 			binds.Binds[b] = l.CheckFunction(2)
 			binds.Repeat[b] = true
 		}
@@ -705,7 +720,7 @@ func LoadClientWith(path string, overrides [][2]string) (ClientConfig, *ClientBi
 	}))
 	// bind_root is tmux's bind -n: no prefix, the bare key fires it.
 	L.SetField(tbl, "bind_root", L.NewFunction(func(l *lua.LState) int {
-		if b, ok := parseKey(l.CheckString(1)); ok {
+		if b, ok := parseKeyName(l.CheckString(1)); ok {
 			binds.RootBinds[b] = l.CheckFunction(2)
 		}
 		return 0
@@ -714,9 +729,9 @@ func LoadClientWith(path string, overrides [][2]string) (ClientConfig, *ClientBi
 	// table, reachable by first switching into it (key_table below).
 	L.SetField(tbl, "bind_table", L.NewFunction(func(l *lua.LState) int {
 		table := l.CheckString(1)
-		if b, ok := parseKey(l.CheckString(2)); ok {
+		if b, ok := parseKeyName(l.CheckString(2)); ok {
 			if binds.Tables[table] == nil {
-				binds.Tables[table] = map[byte]*lua.LFunction{}
+				binds.Tables[table] = map[string]*lua.LFunction{}
 			}
 			binds.Tables[table][b] = l.CheckFunction(3)
 		}
@@ -741,6 +756,14 @@ func LoadClientWith(path string, overrides [][2]string) (ClientConfig, *ClientBi
 	if err := L.DoString(defaultClientLua); err != nil {
 		log.Fatalf("gtmux: embedded default client config is broken: %v", err)
 	}
+	// Swap gtmux.options to a fresh table so the user file's entries are tracked
+	// separately from the defaults (provenance). Applied after the defaults
+	// below, a user option deterministically wins over a default option that
+	// writes the same config field (e.g. a future mode-style aliasing
+	// copy_selection_fg) — the ForEach order within one table is otherwise
+	// random, which made same-field aliases flaky.
+	userOpts := L.NewTable()
+	L.SetField(tbl, "options", userOpts)
 	if data, err := os.ReadFile(path); err == nil {
 		if err := L.DoString(string(data)); err != nil {
 			log.Printf("gtmux: %s: %v (ignoring, using defaults)", path, err)
@@ -748,19 +771,24 @@ func LoadClientWith(path string, overrides [][2]string) (ClientConfig, *ClientBi
 	}
 
 	// gtmux.options.X = Y entries feed the same registry: read each as a string
-	// and applyOption it (unknown names are ignored).
-	opts.ForEach(func(k, v lua.LValue) {
-		name, ok := k.(lua.LString)
-		if !ok {
-			return
-		}
-		switch val := v.(type) {
-		case lua.LString:
-			applyOption(&cfg, binds, string(name), string(val))
-		case lua.LBool:
-			applyOption(&cfg, binds, string(name), boolStr(bool(val)))
-		}
-	})
+	// and applyOption it (unknown names are ignored). Default-file opts first,
+	// then user-file opts, so a user option wins any same-field alias.
+	applyOpts := func(t *lua.LTable) {
+		t.ForEach(func(k, v lua.LValue) {
+			name, ok := k.(lua.LString)
+			if !ok {
+				return
+			}
+			switch val := v.(type) {
+			case lua.LString:
+				applyOption(&cfg, binds, string(name), string(val))
+			case lua.LBool:
+				applyOption(&cfg, binds, string(name), boolStr(bool(val)))
+			}
+		})
+	}
+	applyOpts(defOpts)
+	applyOpts(userOpts)
 
 	// Runtime set-option overrides, applied last so they win over the file.
 	for _, o := range overrides {

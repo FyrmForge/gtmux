@@ -133,14 +133,19 @@ func (c *compositor) renderBar() emu.Line {
 		if i > 0 {
 			wlist = append(wlist, styled(cfg.WindowStatusSeparator, fg, bg)...)
 		}
-		f, b := fg, bg
+		// Inactive entries take window-status-style (inherits the status style
+		// unless set); the current entry keeps the active-window colors.
+		f, b, a := fg, bg, attr
+		if cfg.WindowStatusStyleSet {
+			f, b, a = cfg.WindowStatusFG, cfg.WindowStatusBG, cfg.WindowStatusAttr
+		}
 		fmtStr := cfg.WindowStatusFormat
 		if w.Active {
-			f, b, fmtStr = cfg.ActiveWindowFG, cfg.ActiveWindowBG, cfg.WindowStatusCurrentFormat
+			f, b, a, fmtStr = cfg.ActiveWindowFG, cfg.ActiveWindowBG, attr, cfg.WindowStatusCurrentFormat
 		}
 		label := c.expander.expand(fmtStr, windowVars(w), c.status.ServerShell)
 		start := len(wlist)
-		wlist = append(wlist, styled(label, f, b)...)
+		wlist = append(wlist, styleRun(label, f, b, a)...)
 		spans = append(spans, span{w.Index, start, len(wlist)})
 	}
 

@@ -107,6 +107,60 @@ func TestCopyModeEmacsKeys(t *testing.T) {
 	}
 }
 
+// f/F/t/T char-motions and numeric count prefixes, driven through feed (the
+// real per-byte path). A count carries across the operator to its target char.
+func TestCopyModeCharMotionAndCount(t *testing.T) {
+	cm := mkCopyMode(10, "abcabcabc", "line two", "line three", "line four")
+
+	cm.cy, cm.cx = 0, 0
+	cm.feed([]byte("fc")) // f c: onto the first 'c' (index 2)
+	if cm.cx != 2 {
+		t.Fatalf("fc cx = %d, want 2", cm.cx)
+	}
+	cm.feed([]byte("2fc")) // 2f c: skip to the 3rd 'c' overall (index 8)
+	if cm.cx != 8 {
+		t.Fatalf("2fc cx = %d, want 8", cm.cx)
+	}
+	cm.feed([]byte("Ta")) // T a: just after the previous 'a' (index 6+1=7)
+	if cm.cx != 7 {
+		t.Fatalf("Ta cx = %d, want 7", cm.cx)
+	}
+	cm.feed([]byte("tb")) // t b: just before next 'b' — none ahead, no-op
+	if cm.cx != 7 {
+		t.Fatalf("tb (no match) cx = %d, want 7 (unchanged)", cm.cx)
+	}
+
+	cm.cy = 0
+	cm.feed([]byte("3j")) // count applies to j: down 3 rows
+	if cm.cy != 3 {
+		t.Fatalf("3j cy = %d, want 3", cm.cy)
+	}
+	cm.feed([]byte("2G")) // count G = go to line 2 (0-based index 1)
+	if cm.cy != 1 {
+		t.Fatalf("2G cy = %d, want 1", cm.cy)
+	}
+	// A lone 0 is still line-start, not a count digit.
+	cm.cx = 5
+	cm.feed([]byte("0"))
+	if cm.cx != 0 {
+		t.Fatalf("0 cx = %d, want 0 (line-start)", cm.cx)
+	}
+
+	// Regression: cursor cx past the line's trimmed content (real panes pad
+	// lines to full width, so `$`/clamp leave cx in the padded region) must not
+	// panic on a backward find — charMotion indexes the raw padded line.
+	padded := make(emu.Line, 40)
+	for i, r := range []rune("1a2a3a") {
+		padded[i] = emu.Glyph{Char: r}
+	} // indices 6..39 stay zero-value glyphs (blanks)
+	cm2 := &copyMode{rows: 10, lines: []emu.Line{padded}}
+	cm2.cy, cm2.cx = 0, 39 // cursor in the padded tail, well past 'a' at index 5
+	cm2.feed([]byte("Fa"))
+	if cm2.cx != 5 {
+		t.Fatalf("Fa from padded tail cx = %d, want 5 (last 'a')", cm2.cx)
+	}
+}
+
 // Word motions honor word-separators: with punctuation as a boundary,
 // "alpha.beta gamma" is three words; without, the dot is part of one word.
 func TestCopyModeWordSeparators(t *testing.T) {

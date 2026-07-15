@@ -28,6 +28,9 @@ type copyMode struct {
 	lineSel    bool
 	rectSel    bool // rectangle (block) selection, C-v
 
+	pending    byte // f/F/t/T awaiting its target char on the next keystroke
+	count      int  // numeric prefix (1-9[0-9]*) multiplying the next motion
+
 	searching  bool
 	searchFwd  bool // direction of the active search: / forward, ? reverse
 	searchBuf  []byte
@@ -226,6 +229,48 @@ func lineRunes(line emu.Line) []rune {
 // not landed on — matching tmux's next-word.
 func (cm *copyMode) isBoundary(r rune) bool {
 	return r == ' ' || r == '\t' || strings.ContainsRune(cm.wordSep, r)
+}
+
+// takeCount returns the pending numeric prefix (default 1) and clears it.
+func (cm *copyMode) takeCount() int {
+	n := cm.count
+	cm.count = 0
+	if n < 1 {
+		return 1
+	}
+	return n
+}
+
+// charMotion moves within the current line to target per the vi find operator:
+// f=onto next, t=just-before next, F=onto prev, T=just-after prev. No-op if the
+// target isn't on the line. ponytail: target matched by rune, ASCII in practice.
+func (cm *copyMode) charMotion(op byte, target rune) {
+	// Search the raw padded line, matching the cursor's coordinate space (clamp
+	// and `$` index cm.lines[cm.cy] directly) — lineRunes trims trailing blanks,
+	// which would put cx past the trimmed slice and panic.
+	line := cm.lines[cm.cy]
+	switch op {
+	case 'f', 't':
+		for x := cm.cx + 1; x < len(line); x++ {
+			if line[x].Char == target {
+				cm.cx = x
+				if op == 't' {
+					cm.cx--
+				}
+				return
+			}
+		}
+	case 'F', 'T':
+		for x := cm.cx - 1; x >= 0 && x < len(line); x-- {
+			if line[x].Char == target {
+				cm.cx = x
+				if op == 'T' {
+					cm.cx++
+				}
+				return
+			}
+		}
+	}
 }
 
 func (cm *copyMode) wordForward() {
@@ -462,17 +507,42 @@ func (cm *copyMode) dispatch(b byte) copyResult {
 		}
 		return copyResult{}
 	}
+	// Pending f/F/t/T: this keystroke is the search target (count applies here).
+	if cm.pending != 0 {
+		op := cm.pending
+		cm.pending = 0
+		for n := cm.takeCount(); n > 0; n-- {
+			cm.charMotion(op, rune(b))
+		}
+		cm.clamp()
+		cm.scroll()
+		return copyResult{}
+	}
+	// Numeric prefix: 1-9 always builds a count; 0 extends only a count already
+	// building (a lone 0 stays line-start).
+	if (b >= '1' && b <= '9') || (b == '0' && cm.count > 0) {
+		cm.count = cm.count*10 + int(b-'0')
+		return copyResult{}
+	}
+	// Find operators defer to their target keystroke; leave count intact for it.
+	switch b {
+	case 'f', 'F', 't', 'T':
+		cm.pending = b
+		return copyResult{}
+	}
+	hadCount := cm.count > 0
+	n := cm.takeCount()
 	switch b {
 	case 'q', 0x1b:
 		return copyResult{exit: true}
 	case 'h':
-		cm.cx--
+		cm.cx -= n
 	case 'l':
-		cm.cx++
+		cm.cx += n
 	case 'j':
-		cm.cy++
+		cm.cy += n
 	case 'k':
-		cm.cy--
+		cm.cy -= n
 	case '0':
 		cm.cx = 0
 	case '$':
@@ -483,7 +553,11 @@ func (cm *copyMode) dispatch(b byte) copyResult {
 	case 'g':
 		cm.cy = 0
 	case 'G':
-		cm.cy = len(cm.lines) - 1
+		if hadCount { // count G = go to that (1-based) line, like vi
+			cm.cy = n - 1
+		} else {
+			cm.cy = len(cm.lines) - 1
+		}
 	case 0x04: // Ctrl-d
 		cm.cy += cm.rows / 2
 	case 0x15: // Ctrl-u
@@ -493,11 +567,17 @@ func (cm *copyMode) dispatch(b byte) copyResult {
 	case 0x02: // Ctrl-b, full page up
 		cm.cy -= cm.rows
 	case 'w':
-		cm.wordForward()
+		for i := 0; i < n; i++ {
+			cm.wordForward()
+		}
 	case 'b':
-		cm.wordBack()
+		for i := 0; i < n; i++ {
+			cm.wordBack()
+		}
 	case 'e':
-		cm.wordEnd()
+		for i := 0; i < n; i++ {
+			cm.wordEnd()
+		}
 	case 'v', 'V':
 		sameKind := cm.lineSel == (b == 'V')
 		if cm.selecting && sameKind {

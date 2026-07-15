@@ -1189,14 +1189,14 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 		}
 	}
 
-	closeActivePane := func() {
-		w := activeWindow()
-		p := w.active
+	// closePaneAt kills pane p in window w (index idx). tmux's kill-pane honors
+	// -t, so the target comes from resolveTarget, not always the active pane.
+	closePaneAt := func(w *windowActor, p *pane, idx int) {
 		p.Close()
 		survived := false
 		actorDo(w, func() { survived = w.closePane(p) })
 		if !survived {
-			removeWindowAt(active)
+			removeWindowAt(idx)
 			return
 		}
 		send(fullSync())
@@ -1682,11 +1682,6 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 		}
 	}
 
-	killWindow := func() {
-		// kill-window destroys the window everywhere it's linked, unlike
-		// unlink-window (which just drops this session's view).
-		destroyWindow(windows[active])
-	}
 
 	// linkWindow links a window from another session into this one: it obtains
 	// that window's actor from the source session (a request on the source's event
@@ -2063,6 +2058,29 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 		case "new-window":
 			dir, command, name, _ := parseSpawn(args)
 			createWindow(command, dir, name)
+		case "new-session":
+			// new-session [-d] [-s name] [-c dir]: always detached (the acting
+			// client can't be moved mid-command). ponytail: no [command] arg
+			// (first pane is a shell) and no -A attach-or-create.
+			nsName, nsDir := "", ""
+			for i := 0; i < len(args); i++ {
+				switch args[i] {
+				case "-s":
+					if i+1 < len(args) {
+						nsName, i = args[i+1], i+1
+					}
+				case "-c":
+					if i+1 < len(args) {
+						nsDir, i = args[i+1], i+1
+					}
+				}
+			}
+			if nsDir == "" {
+				nsDir = activeWindow().active.cwd()
+			}
+			if _, err := reg.resolveGroup(nsName, true, cols, rows, nsDir, ""); err != nil {
+				cmdOut = "new-session: " + err.Error()
+			}
 		case "next-window":
 			switchToWindow((active + 1) % len(windows))
 		case "previous-window":
@@ -2463,12 +2481,16 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 			}
 			switchToSession(target, -1)
 		case "kill-pane":
-			closeActivePane()
+			tw, tp, twi, _, _ := resolveTarget(args)
+			closePaneAt(tw, tp, twi)
 			if !done {
 				fireHook("after-kill-pane")
 			}
 		case "kill-window":
-			killWindow()
+			// kill-window destroys the window everywhere it's linked (unlike
+			// unlink-window). Honors -t; defaults to the active window.
+			_, _, twi, _, _ := resolveTarget(args)
+			destroyWindow(windows[twi])
 			if !done {
 				fireHook("after-kill-window")
 			}

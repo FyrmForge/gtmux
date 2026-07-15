@@ -21,6 +21,58 @@ import (
 	"github.com/FyrmForge/gtmux/internal/proto"
 )
 
+// byteKey canonicalizes a single non-escape input byte into the bind token that
+// config.parseKeyName also produces: control bytes 0x01-0x1a → "C-a".."C-z"
+// (folded exactly like the config side, so C-a and C-A collapse as they always
+// have), DEL → "BSpace", a printable char → itself. "" means the byte has no
+// bind token (NUL, other C0) and the caller forwards it raw. ESC (0x1b) never
+// reaches here — the escape collector owns it.
+func byteKey(b byte) string {
+	switch {
+	case b >= 0x01 && b <= 0x1a:
+		return "C-" + string(rune('a'+b-1))
+	case b >= 0x1c && b <= 0x1f: // C-\ C-] C-^ C-_ (0x1b = ESC is the escape lead)
+		return "C-" + string(rune(b|0x40))
+	case b == 0x7f:
+		return "BSpace"
+	case b >= 0x20 && b <= 0x7e:
+		return string(b)
+	}
+	return ""
+}
+
+// csiKeyName maps a CSI sequence body (bytes after "ESC [") to a bind token.
+// Modified forms (e.g. "1;5D" = C-Left) are intentionally absent — the full
+// modifier matrix (CSI-u / modifyOtherKeys) is out of scope; they fall through
+// to raw passthrough (or the hardcoded prefix-resize fallback).
+var csiKeyName = map[string]string{
+	"A": "Up", "B": "Down", "C": "Right", "D": "Left", "H": "Home", "F": "End",
+	"1~": "Home", "2~": "Insert", "3~": "Delete", "4~": "End",
+	"5~": "PgUp", "6~": "PgDn", "7~": "Home", "8~": "End",
+	"11~": "F1", "12~": "F2", "13~": "F3", "14~": "F4", "15~": "F5",
+	"17~": "F6", "18~": "F7", "19~": "F8", "20~": "F9", "21~": "F10",
+	"23~": "F11", "24~": "F12",
+}
+
+// ss3KeyName maps an SS3 final byte (after "ESC O") to a bind token: F1–F4 and
+// the application-cursor-mode arrow/Home/End keys.
+var ss3KeyName = map[string]string{
+	"P": "F1", "Q": "F2", "R": "F3", "S": "F4",
+	"A": "Up", "B": "Down", "C": "Right", "D": "Left", "H": "Home", "F": "End",
+}
+
+// guardPanic is deferred at the top of each client goroutine: on a panic it
+// runs restore (undo raw mode / mouse reporting so the pane isn't left wedged),
+// then re-raises so the crash still surfaces its message and stack. A panic in
+// a spawned goroutine bypasses the main goroutine's cleanup defers, so this is
+// the only hook that can restore the terminal before the process dies.
+func guardPanic(restore func()) {
+	if r := recover(); r != nil {
+		restore()
+		panic(r)
+	}
+}
+
 // Attach is `gtmux attach [-r]`: read-only when ro is set.
 func Attach(session string, ro bool) error { return RunGroup(session, false, "", ro) }
 
@@ -35,7 +87,20 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 	if err != nil {
 		return err
 	}
-	defer term.Restore(int(os.Stdin.Fd()), oldState)
+	// restoreTerm undoes raw mode and mouse reporting so the pane stays usable.
+	// Idempotent (sync.Once): the main-goroutine exit defer calls it, and so does
+	// each spawned goroutine's panic recover (guardPanic) — a panic in a goroutine
+	// bypasses main's defers, so without this a crash left the pane in raw mode
+	// with mouse reporting on (wedged). Skips compMu on purpose: a panicking
+	// goroutine may hold it, and a torn stdout write while crashing is harmless.
+	var restoreOnce sync.Once
+	restoreTerm := func() {
+		restoreOnce.Do(func() {
+			os.Stdout.Write([]byte("\x1b[?1002l\x1b[?1006l")) // disable mouse (no-op if off)
+			term.Restore(int(os.Stdin.Fd()), oldState)
+		})
+	}
+	defer restoreTerm()
 
 	cwd, _ := os.Getwd()
 	// The client owns all input: cliCfg is chrome; binds is the prefix key +
@@ -226,19 +291,24 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 	// coordinates), mirroring the user's `set -g mouse on`. The server
 	// parses clicks/drags out of the input stream for focus and copy-mode.
 	if cliCfg.Mouse {
-		os.Stdout.Write([]byte("\x1b[?1002h\x1b[?1006h"))
-		defer os.Stdout.Write([]byte("\x1b[?1002l\x1b[?1006l"))
+		os.Stdout.Write([]byte("\x1b[?1002h\x1b[?1006h")) // restoreTerm disables it on exit/panic
 	}
 
 	go func() {
+		defer guardPanic(restoreTerm) // a crash here must not leave the pane wedged
 		buf := make([]byte, 4096)
 		var mp mouseParser
 		// Prefix state machine (client owns input). Persist across reads: a
 		// prefix key and its follow byte can land in separate Stdin.Read chunks.
 		prefixPending := false
 		curTable := "" // active custom key table (tmux switch-client -T); one key, then reverts
-		escStage := 0  // 0 none, 1 saw ESC after prefix, 2 collecting CSI
-		var csiBuf []byte
+		// Escape-sequence collector, shared by the root and post-prefix paths.
+		// escStage: 0 none, 1 saw ESC (kind undecided), 2 collecting CSI (ESC [),
+		// 3 SS3 (ESC O). escPrefixed = the ESC followed the prefix. escRaw holds
+		// the exact bytes from ESC on, forwarded verbatim if nothing binds them.
+		escStage := 0
+		escPrefixed := false
+		var escRaw []byte
 		// tmux's -r: after a repeatable bind, the bare key keeps firing until
 		// this window lapses. Checked at the next byte, so no timer/goroutine.
 		// ponytail: captured once at attach; a runtime `set repeat-time` reload
@@ -273,44 +343,90 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 		processInput := func(pass []byte) {
 			bd := curBinds() // snapshot the live bind table for this input batch
 			var fwd []byte
+
+			// finishEsc routes a fully-decoded escape sequence. name is the
+			// canonical bind token ("" if the bytes have no token); csiSeq is the
+			// CSI body, used only by the hardcoded prefix-navigation fallback; raw
+			// is the exact input bytes, forwarded verbatim when nothing consumes
+			// them (so a focused app still receives arrows/F-keys/Meta it doesn't
+			// bind — the one trap of adding a root-level escape path).
+			finishEsc := func(name, csiSeq string, prefixed bool, raw []byte) {
+				if prefixed {
+					if name != "" {
+						if ops := bd.Resolve(name); ops != nil {
+							runOps(ops)
+							if bd.Repeat[name] {
+								repeatActive, repeatDeadline = true, time.Now().Add(repeatWindow)
+							}
+							return
+						}
+					}
+					// Hardcoded prefix+navigation (unchanged): arrow selects a pane,
+					// C-/M-arrow resizes, PgUp enters copy-mode. A user prefix-bind
+					// for the same named key (checked above) overrides these.
+					switch {
+					case len(csiSeq) == 1 && arrowFlag[csiSeq[0]] != "":
+						runOps([]config.BindOp{{Action: []string{"select-pane", arrowFlag[csiSeq[0]]}}})
+					case len(csiSeq) == 4 && csiSeq[:3] == "1;5" && arrowFlag[csiSeq[3]] != "":
+						runOps([]config.BindOp{{Action: []string{"resize-pane", arrowFlag[csiSeq[3]], "1"}}})
+					case len(csiSeq) == 4 && csiSeq[:3] == "1;3" && arrowFlag[csiSeq[3]] != "":
+						runOps([]config.BindOp{{Action: []string{"resize-pane", arrowFlag[csiSeq[3]], "5"}}})
+					case csiSeq == "5~": // prefix+PgUp: copy-mode a page up
+						runOps([]config.BindOp{{Action: []string{"copy-mode", "-u"}}})
+					}
+					return
+				}
+				// Root (bind -n): fire a root bind, else forward the raw bytes.
+				if name != "" {
+					if ops := bd.ResolveRoot(name); ops != nil {
+						runOps(ops)
+						return
+					}
+				}
+				fwd = append(fwd, raw...)
+			}
+
 			for i := 0; i < len(pass); i++ {
 				b := pass[i]
-				if escStage == 1 {
-					if b == '[' {
-						escStage, csiBuf = 2, nil
-					} else {
+				// Escape-sequence collector (Meta / CSI / SS3).
+				if escStage != 0 {
+					escRaw = append(escRaw, b)
+					switch escStage {
+					case 1: // b decides the sequence kind
+						switch b {
+						case '[':
+							escStage = 2
+						case 'O':
+							escStage = 3
+						default:
+							escStage = 0
+							name := "" // ESC + printable = Meta; else no token
+							if b >= 0x20 && b <= 0x7e {
+								name = "M-" + string(b)
+							}
+							finishEsc(name, "", escPrefixed, escRaw)
+						}
+					case 2: // CSI body until a final byte 0x40-0x7e
+						if b >= 0x40 && b <= 0x7e {
+							escStage = 0
+							seq := string(escRaw[2:]) // bytes after "ESC ["
+							finishEsc(csiKeyName[seq], seq, escPrefixed, escRaw)
+						}
+					case 3: // SS3: single final byte after "ESC O"
 						escStage = 0
-					}
-					continue
-				}
-				if escStage == 2 {
-					if b < 0x40 || b > 0x7e {
-						csiBuf = append(csiBuf, b)
-						continue
-					}
-					escStage = 0
-					seq := string(append(csiBuf, b))
-					csiBuf = nil
-					switch {
-					case len(seq) == 1 && arrowFlag[seq[0]] != "":
-						runOps([]config.BindOp{{Action: []string{"select-pane", arrowFlag[seq[0]]}}})
-					case len(seq) == 4 && seq[:3] == "1;5" && arrowFlag[seq[3]] != "":
-						runOps([]config.BindOp{{Action: []string{"resize-pane", arrowFlag[seq[3]], "1"}}})
-					case len(seq) == 4 && seq[:3] == "1;3" && arrowFlag[seq[3]] != "":
-						runOps([]config.BindOp{{Action: []string{"resize-pane", arrowFlag[seq[3]], "5"}}})
-					case seq == "5~": // prefix+PgUp: copy-mode a page up
-						runOps([]config.BindOp{{Action: []string{"copy-mode", "-u"}}})
+						finishEsc(ss3KeyName[string(b)], "", escPrefixed, escRaw)
 					}
 					continue
 				}
 				// A custom key table (switch-client -T) claims the next key: look it
 				// up there, revert to root first so the bind can chain into another
 				// table. An unbound key in the table is simply swallowed (tmux does
-				// the same — the table consumed the key).
+				// the same — the table consumed the key). ESC-sequence keys in a
+				// table aren't supported (byteKey("") → unbound).
 				if curTable != "" {
 					t := curTable
 					curTable = ""
-					runOps(bd.ResolveTable(t, b))
+					runOps(bd.ResolveTable(t, byteKey(b)))
 					continue
 				}
 				// Repeat window: a bare key resolves as if the prefix were held.
@@ -318,14 +434,16 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 				// and is reprocessed normally below.
 				if repeatActive {
 					if time.Now().Before(repeatDeadline) {
-						if ops := bd.Resolve(b); ops != nil {
-							runOps(ops)
-							if bd.Repeat[b] {
-								repeatDeadline = time.Now().Add(repeatWindow)
-							} else {
-								repeatActive = false
+						if k := byteKey(b); k != "" {
+							if ops := bd.Resolve(k); ops != nil {
+								runOps(ops)
+								if bd.Repeat[k] {
+									repeatDeadline = time.Now().Add(repeatWindow)
+								} else {
+									repeatActive = false
+								}
+								continue
 							}
-							continue
 						}
 					}
 					repeatActive = false
@@ -334,26 +452,46 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 					prefixPending = false
 					switch {
 					case b == 0x1b:
-						escStage = 1
-					case b == bd.Prefix:
-						fwd = append(fwd, b) // prefix twice = literal prefix
+						escStage, escPrefixed, escRaw = 1, true, []byte{b}
+					case b == bd.Prefix || (bd.Prefix2 != 0 && b == bd.Prefix2):
+						fwd = append(fwd, bd.Prefix) // prefix twice = literal prefix
 					default:
-						runOps(bd.Resolve(b))
-						if bd.Repeat[b] {
+						k := byteKey(b)
+						runOps(bd.Resolve(k))
+						if bd.Repeat[k] {
 							repeatActive, repeatDeadline = true, time.Now().Add(repeatWindow)
 						}
 					}
 					continue
 				}
-				if b == bd.Prefix {
+				if b == bd.Prefix || (bd.Prefix2 != 0 && b == bd.Prefix2) {
 					prefixPending = true
 					continue
 				}
-				if ops := bd.ResolveRoot(b); ops != nil { // tmux bind -n
-					runOps(ops)
+				if b == 0x1b {
+					// Root escape sequence: collect, then bind-or-forward-raw.
+					escStage, escPrefixed, escRaw = 1, false, []byte{b}
 					continue
 				}
+				if k := byteKey(b); k != "" {
+					if ops := bd.ResolveRoot(k); ops != nil { // tmux bind -n
+						runOps(ops)
+						continue
+					}
+				}
 				fwd = append(fwd, b)
+			}
+			// A dangling root ESC at chunk end flushes raw, so a lone Escape isn't
+			// held waiting on a key that may never arrive (apps need ESC promptly).
+			// ponytail: root escape sequences are recognized only within one read
+			// chunk — terminals deliver them atomically, so a bind only misses if
+			// its sequence is split across reads (rare); passthrough stays correct
+			// either way. A prefixed dangling ESC carries over (preserves the old
+			// prefix+arrow behavior). Real disambiguation needs tmux's escape-time
+			// timer — the knob to add if split sequences ever bite.
+			if escStage != 0 && !escPrefixed {
+				fwd = append(fwd, escRaw...)
+				escStage, escRaw = 0, nil
 			}
 			if len(fwd) > 0 {
 				send(&proto.ClientMsg{Input: &proto.Input{Data: fwd}})
@@ -493,6 +631,7 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 	signal.Notify(winch, syscall.SIGWINCH)
 	defer signal.Stop(winch)
 	go func() {
+		defer guardPanic(restoreTerm) // a crash here must not leave the pane wedged
 		for range winch {
 			cols, rows, err := term.GetSize(int(os.Stdout.Fd()))
 			if err != nil {

@@ -159,9 +159,11 @@ func ServerConfigPath() string {
 	return filepath.Join(dir, "gtmux", "server.lua")
 }
 
-// parseKey turns a bind()/set_option() key string into a byte: either a
-// single literal character, or "C-x" for a control code.
-func parseKey(s string) (byte, bool) {
+// parseKeyByte turns a prefix key string into its single input byte: "C-x" for
+// a control code or a lone character. Prefix keys are always single bytes
+// (C-b, C-a, backtick, ...), so this stays byte-valued while binds went
+// canonical-string (parseKeyName).
+func parseKeyByte(s string) (byte, bool) {
 	if len(s) == 3 && s[0] == 'C' && s[1] == '-' {
 		return s[2] & 0x1f, true
 	}
@@ -169,6 +171,62 @@ func parseKey(s string) (byte, bool) {
 		return s[0], true
 	}
 	return 0, false
+}
+
+// namedKeys maps a config key name (and common aliases) to the canonical token
+// the client's input reader also produces from raw bytes, so a bind and a
+// keystroke compare equal. Kept here (not the client package) because parsing
+// is config-side; the reader must produce the same right-hand values.
+var namedKeys = map[string]string{
+	"Up": "Up", "Down": "Down", "Left": "Left", "Right": "Right",
+	"Home": "Home", "End": "End",
+	"Insert": "Insert", "Ins": "Insert", "Delete": "Delete", "Del": "Delete",
+	"PgUp": "PgUp", "PageUp": "PgUp", "PPage": "PgUp",
+	"PgDn": "PgDn", "PageDown": "PgDn", "NPage": "PgDn",
+	"F1": "F1", "F2": "F2", "F3": "F3", "F4": "F4", "F5": "F5", "F6": "F6",
+	"F7": "F7", "F8": "F8", "F9": "F9", "F10": "F10", "F11": "F11", "F12": "F12",
+}
+
+// parseKeyName canonicalizes a bind key string into the token the client's
+// input reader also produces from raw bytes, so binds match. Forms: a lone
+// char ("a"), a control key ("C-a", folded like the reader), Meta ("M-h",
+// case-sensitive), a function/named key (see namedKeys), or the folding
+// aliases Space/Tab/Enter/BSpace. "" if unrecognized.
+func parseKeyName(s string) (string, bool) {
+	switch s {
+	case "Space":
+		return " ", true
+	case "Tab":
+		return "C-i", true // Tab folds onto C-i, matching the 0x09 byte
+	case "Enter", "Return":
+		return "C-m", true // Enter folds onto C-m (0x0d)
+	case "BSpace", "Backspace":
+		return "BSpace", true
+	}
+	if c, ok := namedKeys[s]; ok {
+		return c, true
+	}
+	// C-x: fold to the control byte like the reader (0x01-0x1a -> "C-a".."C-z",
+	// 0x1c-0x1f -> "C-\\","C-]","C-^","C-_"). C-[ folds to ESC (0x1b), which is
+	// the escape-sequence lead and never matches a bind — unbindable, as it
+	// effectively was before too.
+	if len(s) == 3 && s[0] == 'C' && s[1] == '-' {
+		b := s[2] & 0x1f
+		if b >= 0x01 && b <= 0x1a {
+			return "C-" + string(rune('a'+b-1)), true
+		}
+		if b >= 0x1c && b <= 0x1f {
+			return "C-" + string(rune(b|0x40)), true
+		}
+	}
+	// M-x: any single following char, case preserved (M-h vs M-H = Shift).
+	if len(s) == 3 && s[0] == 'M' && s[1] == '-' {
+		return "M-" + string(s[2]), true
+	}
+	if len(s) == 1 {
+		return s, true
+	}
+	return "", false
 }
 
 // LoadServer reads the server's options from the bundled defaults, then the

@@ -29,7 +29,7 @@ gtmux.set_option("session_name", "win%d")`
 	}
 }
 
-func TestParseKey(t *testing.T) {
+func TestParseKeyByte(t *testing.T) {
 	cases := []struct {
 		in   string
 		want byte
@@ -42,9 +42,42 @@ func TestParseKey(t *testing.T) {
 		{"abc", 0, false},
 	}
 	for _, c := range cases {
-		got, ok := parseKey(c.in)
+		got, ok := parseKeyByte(c.in)
 		if ok != c.ok || (ok && got != c.want) {
-			t.Errorf("parseKey(%q) = %#x, %v; want %#x, %v", c.in, got, ok, c.want, c.ok)
+			t.Errorf("parseKeyByte(%q) = %#x, %v; want %#x, %v", c.in, got, ok, c.want, c.ok)
+		}
+	}
+}
+
+// parseKeyName must produce the same canonical token the client's input reader
+// derives from raw bytes, so a config bind and a keystroke compare equal.
+func TestParseKeyName(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+		ok   bool
+	}{
+		{"a", "a", true},
+		{"C-b", "C-b", true},
+		{"C-B", "C-b", true},     // control folds case, matching the byte reader
+		{"C-\\", "C-\\", true},   // C-\ (byte 0x1c) — non-letter control key
+		{"C-]", "C-]", true},     // byte 0x1d
+		{"M-h", "M-h", true},
+		{"M-H", "M-H", true}, // Meta preserves case (Shift)
+		{"F5", "F5", true},
+		{"Up", "Up", true},
+		{"PageUp", "PgUp", true}, // alias normalizes
+		{"Tab", "C-i", true},     // folds onto the 0x09 byte token
+		{"Enter", "C-m", true},
+		{"Space", " ", true},
+		{"BSpace", "BSpace", true},
+		{"", "", false},
+		{"Nope", "", false},
+	}
+	for _, c := range cases {
+		got, ok := parseKeyName(c.in)
+		if ok != c.ok || got != c.want {
+			t.Errorf("parseKeyName(%q) = %q, %v; want %q, %v", c.in, got, ok, c.want, c.ok)
 		}
 	}
 }

@@ -116,8 +116,8 @@ func (c *compositor) cols() int {
 // statusLines is how many rows the status bar occupies (tmux `status` 1..5),
 // clamped to a sane range.
 func (c *compositor) statusLines() int {
-	if c.cfg.StatusLines < 1 {
-		return 1
+	if c.cfg.StatusLines < 0 {
+		return 0 // status off: bar hidden, window gets the full height
 	}
 	if c.cfg.StatusLines > 5 {
 		return 5
@@ -381,6 +381,19 @@ func (c *compositor) emit(dirty map[int]bool) []byte {
 // buildRow composites one physical row: the status bar, or borders + pane
 // content + the display-panes number overlay for a window row.
 func (c *compositor) buildRow(row int) emu.Line {
+	// status off: no reserved row, but the command prompt / copy-mode help still
+	// needs somewhere to show — overlay it on the bottom physical row (like tmux).
+	if c.statusLines() == 0 && c.layout != nil && row == c.totalRows()-1 {
+		if c.copy != nil {
+			return renderPromptLine(c.cols(), "copy-mode", c.copy.helpText(), c.cfg)
+		}
+		if c.prompt != nil {
+			return renderPromptLine(c.cols(), c.prompt.label(), string(c.prompt.buf), c.cfg)
+		}
+		if c.status != nil && c.status.PromptLabel != "" {
+			return renderPromptLine(c.cols(), c.status.PromptLabel, c.status.PromptText, c.cfg)
+		}
+	}
 	if isStatus, extra := c.statusRowKind(row); isStatus {
 		if extra >= 0 {
 			return c.renderExtraStatus(extra)
