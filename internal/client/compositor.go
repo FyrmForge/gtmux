@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	lua "github.com/yuin/gopher-lua"
+
 	"github.com/FyrmForge/gtmux/internal/config"
 	"github.com/FyrmForge/gtmux/internal/emu"
 	"github.com/FyrmForge/gtmux/internal/proto"
@@ -52,13 +54,10 @@ type compositor struct {
 	locked  bool          // lock overlay (unlocks on any key, or on the configured password)
 	lockBuf []byte        // typed password so far while locked (never rendered)
 
-	// expander turns the client-owned status_left/status_right formats into
-	// text against the server's Vars + ServerShell; stLeft/stRight cache the
-	// last expansion so buildRow and the status-click hit-test share one result.
-	expander        *statusExpander
-	stLeft, stRight string
-	stExtra         [4]string   // expanded ExtraStatusFormats (status lines 2..5)
-	windowHits      []windowHit // per-window status click spans, set by renderBar
+	// expander expands #{...} formats for status components that call
+	// gtmux.expand() (via the client's Expand hook); it also serves #client/
+	// #server shell caching.
+	expander *statusExpander
 	// set-titles: lastTitle dedupes the outer-terminal title OSC (only emit on
 	// change); titlePushed records that we saved the original title on the
 	// terminal's title stack (\e[22;2t) so restoreTitle can pop it on detach.
@@ -81,6 +80,141 @@ type compositor struct {
 	dcRow, dcCol int
 	dcArmed      bool
 	dcActive     bool
+
+	// overlays are user-registered floating widgets composited on top of window
+	// content, the same way popup/picker/clock/lock are (they'll migrate here).
+	overlays []widget
+	// docks are user-registered widgets that reserve a column strip on the left
+	// or right edge (textBox.dock). They shrink the window content the client
+	// reports to the server; content flows in the middle. Horizontal (top/bottom)
+	// docking is still the status bar's job.
+	docks []*textBox
+	// statusWidget, if set, is a component that paints the status rows (a widget
+	// registered with dock="status"). It replaces the bespoke renderBar content
+	// while the scaffolding (statusLines/status_position + the copy-mode/prompt/
+	// message overrides) stays put. nil = the built-in renderBar path. Held in its
+	// own slot, not c.docks, so those overrides keep anchoring to statusRow().
+	statusWidget *textBox
+	// modal, if set, is a modal keyboard widget (gtmux.open{...}): a centered
+	// component overlay that grabs every key via its on_key until it closes.
+	// Mutually exclusive with the other input modes; rendered topmost.
+	modal    *textBox
+	modalPos string // "center" (default) | "status" (renders on the status line)
+	// snapshot is the whole-server state the server pushes on each status tick when
+	// this client uses widget queries; the Lua primitives (gtmux.sessions/panes/…)
+	// read it. Nil until the first snapshot arrives.
+	snapshot *proto.StateSnapshot
+	// alertPrev holds the last-seen [bell,activity,silence] flags per window
+	// (keyed session\x00index) so apply() can fire gtmux.on callbacks on a
+	// false→true edge only. alertSeeded gates the first snapshot: it primes
+	// alertPrev without firing, so pre-existing alerts don't fire on attach.
+	alertPrev     map[string][3]bool
+	alertSeeded   bool
+	pendingAlerts []config.AlertEvent
+	// paneBorderColor overrides a pane's border color (pane:set_border, e.g. from
+	// gtmux.on("command-exited")). Keyed by pane ID; cleared when the pane gains
+	// focus. Empty map = no overrides.
+	paneBorderColor map[int]emu.Color
+	// prevCommand tracks each pane's last-seen foreground command (from the
+	// snapshot) so apply() can fire gtmux.on("program-changed") on a change.
+	// progSeeded gates the first snapshot (prime without firing), like alerts.
+	prevCommand     map[int]string
+	progSeeded      bool
+	pendingProgram  []programChange
+	// borderRunes maps a window-space border cell (row,col) to its box-drawing
+	// glyph for pane_borders="joined": junctions (┼├┤┬┴) computed from the divider
+	// segments, so crossings connect instead of overwriting. Rebuilt on layout/
+	// config change; empty (nil) for "simple" mode.
+	borderRunes map[[2]int]rune
+}
+
+// rebuildBorders recomputes the joined-mode junction glyphs from the current
+// layout's divider segments. A cell's glyph is chosen from which of its four
+// neighbors also carry a border stroke (vertical above/below, horizontal
+// left/right). No-op (clears the map) unless pane_borders is joined/framed.
+func (c *compositor) rebuildBorders() {
+	c.borderRunes = nil
+	if c.layout == nil || (c.cfg.PaneBorders != "joined" && c.cfg.PaneBorders != "framed") {
+		return
+	}
+	vset := map[[2]int]bool{} // cells carrying a vertical stroke
+	hset := map[[2]int]bool{} // cells carrying a horizontal stroke
+	for _, b := range c.layout.Borders {
+		if b.Vertical {
+			for r := b.Start; r < b.End; r++ {
+				vset[[2]int{r, b.Fixed}] = true
+			}
+		} else {
+			for col := b.Start; col < b.End; col++ {
+				hset[[2]int{b.Fixed, col}] = true
+			}
+		}
+	}
+	// framed: add the outer frame as border segments in content space (top row -1,
+	// bottom row H, left col -1, right col W), so interior dividers reaching an edge
+	// form a proper ┬/┴/├/┤ into the frame instead of a plain corner.
+	W, H := c.layout.Cols, c.layout.Rows
+	if c.frameInset() > 0 {
+		for col := -1; col <= W; col++ {
+			hset[[2]int{-1, col}] = true
+			hset[[2]int{H, col}] = true
+		}
+		for r := -1; r <= H; r++ {
+			vset[[2]int{r, -1}] = true
+			vset[[2]int{r, W}] = true
+		}
+	}
+	runes := make(map[[2]int]rune, len(vset)+len(hset))
+	mark := func(cell [2]int) {
+		r, col := cell[0], cell[1]
+		up := vset[[2]int{r - 1, col}]
+		down := vset[[2]int{r + 1, col}]
+		left := hset[[2]int{r, col - 1}]
+		right := hset[[2]int{r, col + 1}]
+		runes[cell] = boxRune(up, down, left, right)
+	}
+	for cell := range vset {
+		mark(cell)
+	}
+	for cell := range hset {
+		mark(cell)
+	}
+	if c.frameInset() > 0 && c.cfg.PaneBorderRounded {
+		runes[[2]int{-1, -1}] = '╭'
+		runes[[2]int{-1, W}] = '╮'
+		runes[[2]int{H, -1}] = '╰'
+		runes[[2]int{H, W}] = '╯'
+	}
+	c.borderRunes = runes
+}
+
+// boxRune picks the box-drawing glyph for a border cell from which of its four
+// sides connect to another border cell.
+func boxRune(up, down, left, right bool) rune {
+	switch {
+	case up && down && left && right:
+		return '┼'
+	case up && down && right:
+		return '├'
+	case up && down && left:
+		return '┤'
+	case down && left && right:
+		return '┬'
+	case up && left && right:
+		return '┴'
+	case down && right:
+		return '┌'
+	case down && left:
+		return '┐'
+	case up && right:
+		return '└'
+	case up && left:
+		return '┘'
+	case up || down:
+		return '│'
+	default:
+		return '─'
+	}
 }
 
 // fillGlyph is the dot painted in the area a larger client has beyond the
@@ -138,18 +272,335 @@ func (c *compositor) totalRows() int {
 	return c.layout.Rows + c.statusLines()
 }
 
-// contentOffset is the number of physical rows above the window content: the
-// status-line count when the bar sits at the top, else 0. Window row R draws at
-// physical row R+contentOffset.
-func (c *compositor) contentOffset() int {
+// statusTopRows/statusBottomRows are the status bar's rows on each edge (all of
+// statusLines on whichever edge status-position picks, 0 on the other).
+func (c *compositor) statusTopRows() int {
 	if c.cfg.StatusPosition == "top" {
 		return c.statusLines()
 	}
 	return 0
 }
 
+func (c *compositor) statusBottomRows() int {
+	if c.cfg.StatusPosition != "top" {
+		return c.statusLines()
+	}
+	return 0
+}
+
+// topDockRows/bottomDockRows are the rows reserved by top/bottom docked widgets,
+// stacked just inward of the status bar (status keeps the screen edge).
+func (c *compositor) topDockRows() int {
+	n := 0
+	for _, d := range c.docks {
+		if d.dock == "top" {
+			n += d.size
+		}
+	}
+	return n
+}
+
+func (c *compositor) bottomDockRows() int {
+	n := 0
+	for _, d := range c.docks {
+		if d.dock == "bottom" {
+			n += d.size
+		}
+	}
+	return n
+}
+
+// frameInset is 1 when pane_borders="framed": an outer frame reserved on every
+// window edge (just inside any docks/status), so the pane content shrinks by it
+// on all four sides and the compositor draws the enclosing box in the reserve.
+func (c *compositor) frameInset() int {
+	if c.cfg.PaneBorders == "framed" {
+		return 1
+	}
+	return 0
+}
+
+// bottomReserve is the rows the compositor holds below the window content:
+// bottom docks, a bottom status bar, and the framed outer border.
+func (c *compositor) bottomReserve() int {
+	return c.statusBottomRows() + c.bottomDockRows() + c.frameInset()
+}
+
+// contentOffset is the number of physical rows above the window content: a top
+// status bar, any top docks, and the framed outer border. Window row R draws at
+// physical row R+contentOffset.
+func (c *compositor) contentOffset() int {
+	return c.statusTopRows() + c.topDockRows() + c.frameInset()
+}
+
+// topBottomDockRow returns the top/bottom dock occupying physical row `row` and
+// the row's index within that dock, or nil. Top docks stack downward from just
+// inside a top status bar; bottom docks stack upward from just inside a bottom
+// status bar.
+func (c *compositor) topBottomDockRow(row int) (*textBox, int) {
+	start := c.statusTopRows()
+	for _, d := range c.docks {
+		if d.dock == "top" {
+			if row >= start && row < start+d.size {
+				return d, row - start
+			}
+			start += d.size
+		}
+	}
+	start = c.totalRows() - c.bottomReserve()
+	for _, d := range c.docks {
+		if d.dock == "bottom" {
+			if row >= start && row < start+d.size {
+				return d, row - start
+			}
+			start += d.size
+		}
+	}
+	return nil, 0
+}
+
+// optionValue reads a client option by name for gtmux.get_option(). Covers the
+// options a widget is likely to want; unknown names return "". ponytail: a small
+// switch, not reflection — extend as widgets need more.
+func (c *compositor) optionValue(name string) string {
+	switch name {
+	case "status_interval":
+		return strconv.Itoa(c.cfg.StatusInterval)
+	case "status_left":
+		return c.cfg.StatusLeft
+	case "status_right":
+		return c.cfg.StatusRight
+	case "status_position":
+		return c.cfg.StatusPosition
+	case "mouse":
+		if c.cfg.Mouse {
+			return "on"
+		}
+		return "off"
+	}
+	return ""
+}
+
+// clickWidget maps a mouse position to the docked/float widget under it that has
+// an on_click handler, returning the widget, the clicked line's index within it,
+// that line's text, and the column within the line. nil if nothing clickable is
+// there. Column bands mirror composeContentRow's left/right stacking exactly.
+func (c *compositor) clickWidget(me proto.MouseEvent) (*textBox, *lua.LFunction, int, string, int) {
+	row, col := me.Y-1, me.X-1
+	// Resolve the fn to run: a component region under the point (widget-local
+	// x=col, y=row) wins; otherwise the widget's flat onClick. Nil = no handler.
+	hit := func(b *textBox, i, cc int) (*textBox, *lua.LFunction, int, string, int) {
+		if fn := b.regionAt(cc, i); fn != nil {
+			return b, fn, i, b.lineText(i), cc
+		}
+		if b.onClick == nil {
+			return nil, nil, 0, "", 0
+		}
+		return b, b.onClick, i, b.lineText(i), cc
+	}
+	// Status rows: a mounted status component owns them (window-list clicks etc.
+	// route through its regions instead of resolveMouse/windowHits).
+	if c.statusWidget != nil {
+		if is, extra := c.statusRowKind(row); is {
+			crow := 0
+			if extra >= 0 {
+				crow = extra + 1
+			}
+			return hit(c.statusWidget, crow, col)
+		}
+	}
+	// Top/bottom dock strips (full width).
+	if d, lr := c.topBottomDockRow(row); d != nil {
+		return hit(d, lr, col)
+	}
+	winRow := row - c.contentOffset()
+	contentH := c.totalRows() - c.contentOffset() - c.bottomReserve()
+	if winRow >= 0 && winRow < contentH {
+		x := 0 // left docks fill [0, leftInset) in c.docks order
+		for _, d := range c.docks {
+			if d.dock == "left" {
+				if col >= x && col < x+d.size {
+					return hit(d, winRow, col-x)
+				}
+				x += d.size
+			}
+		}
+		rx := c.cols() - c.rightInset() // right docks fill [cols-rightInset, cols)
+		for _, d := range c.docks {
+			if d.dock == "right" {
+				if col >= rx && col < rx+d.size {
+					return hit(d, winRow, col-rx)
+				}
+				rx += d.size
+			}
+		}
+	}
+	// Float overlays, topmost first.
+	for i := len(c.overlays) - 1; i >= 0; i-- {
+		b, ok := c.overlays[i].(*textBox)
+		if !ok || (b.onClick == nil && len(b.regions) == 0) {
+			continue
+		}
+		li, cc := winRow-b.row, col-b.col
+		w := b.w
+		if b.canvas == nil {
+			w = len([]rune(b.lineText(li)))
+		}
+		if li >= 0 && li < b.rowCount() && cc >= 0 && cc < w {
+			return hit(b, li, cc)
+		}
+	}
+	return nil, nil, 0, "", 0
+}
+
+// leftInset/rightInset are the columns reserved by docked widgets on each edge.
+// contentColOffset is the horizontal mirror of contentOffset: window column C
+// draws at physical column C+contentColOffset. contentCols is the window content
+// width (physical minus both docks). With no docks all three are the trivial
+// values and every path reduces byte-identically to the pre-dock code.
+func (c *compositor) leftInset() int {
+	n := 0
+	for _, d := range c.docks {
+		if d.dock == "left" {
+			n += d.size
+		}
+	}
+	return n
+}
+
+func (c *compositor) rightInset() int {
+	n := 0
+	for _, d := range c.docks {
+		if d.dock == "right" {
+			n += d.size
+		}
+	}
+	return n
+}
+
+func (c *compositor) contentColOffset() int { return c.leftInset() + c.frameInset() }
+
+func (c *compositor) contentCols() int {
+	if w := c.cols() - c.leftInset() - c.rightInset() - 2*c.frameInset(); w > 0 {
+		return w
+	}
+	return 1
+}
+
 // statusRow is the physical row of the MAIN bar (status line 1: left + window
 // list + right). Extra lines stack inward from it (see statusRowKind).
+// openModal opens a modal keyboard widget from a gtmux.open{...} request: build
+// the component textBox, render it once (which also creates its state table), and
+// store it. A fresh modal each open — state starts empty (selection at 0).
+func (c *compositor) openModal(m *config.ModalOpen, binds *config.ClientBinds) {
+	c.modalPos = m.Position
+	if c.modalPos == "" {
+		c.modalPos = "center"
+	}
+	b := &textBox{
+		component: m.Component, onKey: m.OnKey, binds: binds,
+		w: m.Width, h: m.Height,
+		fg: c.cfg.StatusFG, bg: c.cfg.StatusBG,
+	}
+	switch c.modalPos {
+	case "status": // a one-line prompt on the status/message row
+		b.w, b.h = c.cols(), 1
+	case "full": // cover the whole content area (e.g. a lock screen)
+		b.w, b.h = c.cols(), c.totalRows()-c.contentOffset()-c.bottomReserve()
+	}
+	b.rerender() // paints its canvas + creates the persistent state table
+	c.modal = b
+}
+
+// modalKey feeds one key name to the open modal's on_key and reports whether it
+// asked to close. The handler shares the modal's state table (RunKey mutates it
+// in place), so a following rerender reflects the change.
+func (c *compositor) modalKey(key string) ([]config.BindOp, bool) {
+	if c.modal == nil {
+		return nil, false
+	}
+	return c.modal.binds.RunKey(c.modal.onKey, key, c.modal.state)
+}
+
+// modalOffset centers the modal box in the content area (over panes, inside the
+// status/dock reserves).
+func (c *compositor) modalOffset() (ox, oy int) {
+	b := c.modal
+	if c.modalPos == "full" {
+		return 0, c.contentOffset()
+	}
+	ox = (c.cols() - b.w) / 2
+	contentH := c.totalRows() - c.contentOffset() - c.bottomReserve()
+	oy = c.contentOffset() + (contentH-b.h)/2
+	if ox < 0 {
+		ox = 0
+	}
+	if oy < 0 {
+		oy = 0
+	}
+	return ox, oy
+}
+
+// modalRow blits the centered modal's canvas slice for one physical row.
+func (c *compositor) modalRow(row int, line emu.Line) {
+	if c.modal == nil || c.modal.canvas == nil || c.layout == nil || c.modalPos == "status" {
+		return // status-position modal is drawn on the status row, not centered
+	}
+	ox, oy := c.modalOffset()
+	cr := row - oy
+	if cr < 0 || cr >= c.modal.canvas.H {
+		return
+	}
+	for x := 0; x < c.modal.canvas.W; x++ {
+		col := ox + x
+		if col < 0 || col >= len(line) {
+			continue
+		}
+		if g, ok := c.modal.canvas.At(x, cr); ok {
+			line[col] = g
+		}
+	}
+}
+
+// statusModalLine blits a status-position modal's single row (a prompt/input
+// widget) full-width onto the status row, overriding the status component.
+func (c *compositor) statusModalLine() emu.Line {
+	b := c.modal
+	line := make(emu.Line, c.cols())
+	for x := range line {
+		if b.canvas != nil {
+			if g, ok := b.canvas.At(x, 0); ok {
+				line[x] = g
+				continue
+			}
+		}
+		line[x] = emu.Glyph{Char: ' ', FG: b.fg, BG: b.bg, Mode: b.attr}
+	}
+	return line
+}
+
+// statusRowLine blits the status component's canvas row for a physical status
+// row. Canvas row 0 is the main bar (the screen edge); rows 1.. are the extra
+// lines stacking toward content, matching statusRowKind's extra (-1 = main).
+func (c *compositor) statusRowLine(row, extra int) emu.Line {
+	crow := 0
+	if extra >= 0 {
+		crow = extra + 1
+	}
+	b := c.statusWidget
+	line := make(emu.Line, c.cols())
+	for x := range line {
+		if b.canvas != nil {
+			if g, ok := b.canvas.At(x, crow); ok {
+				line[x] = g
+				continue
+			}
+		}
+		line[x] = emu.Glyph{Char: ' ', FG: b.fg, BG: b.bg, Mode: b.attr}
+	}
+	return line
+}
+
 func (c *compositor) statusRow() int {
 	if c.cfg.StatusPosition == "top" {
 		return 0
@@ -202,18 +653,19 @@ func (c *compositor) activeCursor() (row, col int, visible bool) {
 	// contentOffset (status-at-top pushes content down). A row is visible only
 	// if it lands inside the window content, not the status/dot-fill slack.
 	off := c.contentOffset()
+	coff := c.contentColOffset() // window column C sits at physical col C+coff (left dock)
 	inContent := func(rWin int) bool { return rWin >= 0 && rWin < c.layout.Rows }
 	// A popup grabs the cursor: place it inside the box at the popup's cursor.
 	if c.popup != nil {
 		if sr, sc, ok := c.popupBounds(); ok {
-			r, col := sr+c.popup.cursor.R, sc+c.popup.cursor.C
+			r, col := sr+c.popup.cursor.R, sc+c.popup.cursor.C+coff
 			return r + off, col, c.popup.cursorVisible && inContent(r) && col >= 0 && col < c.cols()
 		}
 	}
 	if c.copy != nil {
 		if pr, ok := c.rectFor(c.copy.paneID); ok {
 			r := pr.Row + (c.copy.cy - c.copy.top)
-			col := pr.Col + c.copy.cx
+			col := pr.Col + c.copy.cx + coff
 			return r + off, col, inContent(r) && col >= 0 && col < c.cols()
 		}
 	}
@@ -222,7 +674,7 @@ func (c *compositor) activeCursor() (row, col int, visible bool) {
 			continue
 		}
 		m := c.meta[pr.ID]
-		r, col := pr.Row+m.cursor.R, pr.Col+m.cursor.C
+		r, col := pr.Row+m.cursor.R, pr.Col+m.cursor.C+coff
 		visible := m.visible && inContent(r) && col >= 0 && col < c.cols()
 		return r + off, col, visible
 	}
@@ -238,6 +690,126 @@ func (c *compositor) markAll(dirty map[int]bool) {
 
 // apply folds one ServerMsg into the compositor's state and returns the
 // ANSI bytes needed to bring the real terminal up to date.
+// programChange is a pane whose foreground command changed between snapshots,
+// fed to gtmux.on("program-changed").
+type programChange struct {
+	session       string
+	window, pane  int
+	command, from string
+}
+
+// detectProgramChanges queues a programChange for every pane whose foreground
+// command changed since the last snapshot. The first snapshot only primes the
+// map (progSeeded) so nothing fires for commands already running at attach.
+func (c *compositor) detectProgramChanges(snap *proto.StateSnapshot) {
+	if c.prevCommand == nil {
+		c.prevCommand = map[int]string{}
+	}
+	seen := map[int]bool{}
+	for _, s := range snap.Sessions {
+		for _, w := range s.Windows {
+			for _, p := range w.Panes {
+				seen[p.ID] = true
+				from, had := c.prevCommand[p.ID]
+				c.prevCommand[p.ID] = p.Command
+				if c.progSeeded && had && from != p.Command {
+					c.pendingProgram = append(c.pendingProgram, programChange{
+						session: s.Name, window: w.Index, pane: p.ID,
+						command: p.Command, from: from,
+					})
+				}
+			}
+		}
+	}
+	for id := range c.prevCommand {
+		if !seen[id] {
+			delete(c.prevCommand, id)
+		}
+	}
+	c.progSeeded = true
+}
+
+// drainProgramChanges returns and clears the queued program changes.
+func (c *compositor) drainProgramChanges() []programChange {
+	if len(c.pendingProgram) == 0 {
+		return nil
+	}
+	out := c.pendingProgram
+	c.pendingProgram = nil
+	return out
+}
+
+// detectAlerts queues an AlertEvent for every window whose bell/activity/
+// silence flag rose since the last snapshot. The first snapshot only primes
+// the map (alertSeeded) so alerts already standing at attach don't fire.
+func (c *compositor) detectAlerts(snap *proto.StateSnapshot) {
+	if c.alertPrev == nil {
+		c.alertPrev = map[string][3]bool{}
+	}
+	seen := map[string]bool{}
+	for _, s := range snap.Sessions {
+		for _, w := range s.Windows {
+			key := s.Name + "\x00" + strconv.Itoa(w.Index)
+			seen[key] = true
+			cur := [3]bool{w.Bell, w.Activity, w.Silence}
+			prev := c.alertPrev[key]
+			c.alertPrev[key] = cur
+			if !c.alertSeeded {
+				continue
+			}
+			cmd, title := "", ""
+			for _, p := range w.Panes {
+				if p.Active {
+					cmd, title = p.Command, p.Title
+					break
+				}
+			}
+			names := [3]string{"alert-bell", "alert-activity", "alert-silence"}
+			for i, name := range names {
+				if cur[i] && !prev[i] {
+					c.pendingAlerts = append(c.pendingAlerts, config.AlertEvent{
+						Event: name, Session: s.Name, Window: w.Index,
+						Name: w.Name, Command: cmd, Title: title,
+					})
+				}
+			}
+		}
+	}
+	// Drop windows that vanished so a reused index doesn't inherit stale flags.
+	for key := range c.alertPrev {
+		if !seen[key] {
+			delete(c.alertPrev, key)
+		}
+	}
+	c.alertSeeded = true
+}
+
+// setPaneBorder overrides pane id's border color (pane:set_border). An empty
+// or unknown color clears the override. Returns the bytes to repaint the
+// affected border rows. Caller holds compMu.
+func (c *compositor) setPaneBorder(id int, color string) []byte {
+	if c.paneBorderColor == nil {
+		c.paneBorderColor = map[int]emu.Color{}
+	}
+	if col, ok := config.ColorByName(color); ok {
+		c.paneBorderColor[id] = col
+	} else {
+		delete(c.paneBorderColor, id)
+	}
+	return c.redraw()
+}
+
+// drainAlerts returns and clears the queued alert edges. Called by the client
+// after apply, so gtmux.on callbacks run outside compMu.
+func (c *compositor) drainAlerts() []config.AlertEvent {
+	if len(c.pendingAlerts) == 0 {
+		return nil
+	}
+	out := c.pendingAlerts
+	c.pendingAlerts = nil
+	return out
+}
+
 func (c *compositor) apply(msg *proto.ServerMsg) []byte {
 	dirty := map[int]bool{}
 	var titleOut []byte // set-titles OSC, prepended to the emitted diff below
@@ -245,6 +817,14 @@ func (c *compositor) apply(msg *proto.ServerMsg) []byte {
 
 	if msg.Layout != nil {
 		c.layout = msg.Layout
+		// Focusing a pane clears any border override on it (pane:set_border):
+		// visiting the flagged pane acknowledges it, like the bell ! flag.
+		for _, pr := range msg.Layout.Panes {
+			if pr.Active && c.paneBorderColor != nil {
+				delete(c.paneBorderColor, pr.ID)
+			}
+		}
+		c.rebuildBorders() // recompute joined-mode junctions for the new arrangement
 		// A new arrangement can change the dot-filled slack too, so redraw
 		// every physical row, not just the window's.
 		c.markAll(dirty)
@@ -291,6 +871,11 @@ func (c *compositor) apply(msg *proto.ServerMsg) []byte {
 
 	if msg.Status != nil {
 		c.status = msg.Status
+		if msg.Status.Snapshot != nil {
+			c.snapshot = msg.Status.Snapshot
+			c.detectAlerts(msg.Status.Snapshot)
+			c.detectProgramChanges(msg.Status.Snapshot)
+		}
 		if c.expander == nil {
 			iv := c.cfg.StatusInterval
 			if iv <= 0 {
@@ -298,10 +883,73 @@ func (c *compositor) apply(msg *proto.ServerMsg) []byte {
 			}
 			c.expander = newStatusExpander(time.Duration(iv) * time.Second)
 		}
-		c.stLeft = c.expander.expand(c.cfg.StatusLeft, msg.Status.Vars, msg.Status.ServerShell)
-		c.stRight = c.expander.expand(c.cfg.StatusRight, msg.Status.Vars, msg.Status.ServerShell)
-		for i := range c.cfg.ExtraStatusFormats {
-			c.stExtra[i] = c.expander.expand(c.cfg.ExtraStatusFormats[i], msg.Status.Vars, msg.Status.ServerShell)
+		// Format-driven widgets re-expand on the same tick; mark their rows (old
+		// and new span, in case the line count changed) dirty so the repaint shows
+		// the new content and clears any vacated rows.
+		off := c.contentOffset()
+		markWidget := func(start, count int) {
+			for i := 0; i < count; i++ {
+				dirty[start+i+off] = true
+			}
+		}
+		for _, w := range c.overlays {
+			fw, ok := w.(formatWidget)
+			if !ok {
+				continue
+			}
+			markWidget(fw.dirtyRows())
+			fw.reexpand(c.expander, msg.Status.Vars, msg.Status.ServerShell)
+			markWidget(fw.dirtyRows())
+		}
+		// Docked widgets re-expand too. Left/right span the content height; mark
+		// those rows. Top/bottom own their reserve strips; mark those.
+		if len(c.docks) > 0 && c.layout != nil {
+			for _, d := range c.docks {
+				// A draw widget needs its region size to build the canvas: left/right
+				// docks are size × content-height, top/bottom are full-width × size.
+				if d.dock == "top" || d.dock == "bottom" {
+					d.w, d.h = c.cols(), d.size
+				} else {
+					d.w, d.h = d.size, c.layout.Rows
+				}
+				d.reexpand(c.expander, msg.Status.Vars, msg.Status.ServerShell)
+			}
+			for r := 0; r < c.layout.Rows; r++ {
+				dirty[r+off] = true
+			}
+			for r := c.statusTopRows(); r < c.contentOffset(); r++ {
+				dirty[r] = true
+			}
+			for r := c.totalRows() - c.bottomReserve(); r < c.totalRows()-c.statusBottomRows(); r++ {
+				dirty[r] = true
+			}
+		}
+		// The status component (if mounted) re-renders like a dock, sized
+		// full-width × statusLines; its rows are marked dirty just below.
+		if c.statusWidget != nil && c.layout != nil {
+			c.statusWidget.w, c.statusWidget.h = c.cols(), c.statusLines()
+			c.statusWidget.reexpand(c.expander, msg.Status.Vars, msg.Status.ServerShell)
+		}
+		// An open modal re-renders on the tick too, so live data (e.g. a picker's
+		// cross-session list) reflects fresh snapshots while it's open, not just on
+		// keypress. Mark its centered band dirty.
+		if c.modal != nil && c.layout != nil {
+			switch c.modalPos {
+			case "status":
+				c.modal.w = c.cols() // full width; status rows are marked dirty below
+			case "full":
+				c.modal.w = c.cols()
+				c.modal.h = c.totalRows() - c.contentOffset() - c.bottomReserve()
+			}
+			c.modal.rerender()
+			if c.modalPos != "status" {
+				_, oy := c.modalOffset()
+				for r := oy; r < oy+c.modal.h && r < c.totalRows(); r++ {
+					if r >= 0 {
+						dirty[r] = true
+					}
+				}
+			}
 		}
 		// Repaint the whole status block (every status line re-expands per tick).
 		for r := 0; r < c.totalRows(); r++ {
@@ -395,35 +1043,58 @@ func (c *compositor) buildRow(row int) emu.Line {
 		}
 	}
 	if isStatus, extra := c.statusRowKind(row); isStatus {
-		if extra >= 0 {
-			return c.renderExtraStatus(extra)
+		// Main bar row: client-owned input modes draw their own line, taking
+		// precedence over status content (component or bespoke bar alike).
+		if extra < 0 {
+			if c.copy != nil {
+				return renderPromptLine(c.cols(), "copy-mode", c.copy.helpText(), c.cfg)
+			}
+			if c.prompt != nil {
+				return renderPromptLine(c.cols(), c.prompt.label(), string(c.prompt.buf), c.cfg)
+			}
+			if c.status != nil && c.status.PromptLabel != "" {
+				return renderPromptLine(c.cols(), c.status.PromptLabel, c.status.PromptText, c.cfg)
+			}
+			// A status-position modal (a prompt/input widget) overrides the status
+			// content on the main bar row, above the status component.
+			if c.modal != nil && c.modalPos == "status" && c.modal.canvas != nil {
+				return c.statusModalLine()
+			}
 		}
-		// Main bar. Client-owned input modes draw their own status line, taking
-		// precedence over the server's status.
-		if c.copy != nil {
-			return renderPromptLine(c.cols(), "copy-mode", c.copy.helpText(), c.cfg)
+		// Status content is a component (dock="status", the default config ships
+		// one). No component configured => a blank styled bar.
+		if c.statusWidget != nil {
+			return c.statusRowLine(row, extra)
 		}
-		if c.prompt != nil {
-			return renderPromptLine(c.cols(), c.prompt.label(), string(c.prompt.buf), c.cfg)
-		}
-		if c.status == nil {
-			return make(emu.Line, c.cols())
-		}
-		// A transient server message (run-shell output, errors) borrows the
-		// prompt layout; otherwise draw the normal bar from the expanded formats.
-		if c.status.PromptLabel != "" {
-			return renderPromptLine(c.cols(), c.status.PromptLabel, c.status.PromptText, c.cfg)
-		}
-		return c.renderBar()
+		return make(emu.Line, c.cols())
 	}
 
-	// Below the status branch, work in window-row space: with the bar at the top
-	// the window content is shifted down by contentOffset physical rows.
+	// Top/bottom docked widgets own full-width rows just inside the status bar.
+	if d, lr := c.topBottomDockRow(row); d != nil {
+		line := make(emu.Line, c.cols())
+		d.paintStrip(lr, 0, c.cols(), line)
+		return line
+	}
+
+	// framed: the top and bottom outer-frame rows (just inside the docks/status).
+	if c.frameInset() > 0 && c.layout != nil {
+		if row == c.contentOffset()-1 {
+			return c.buildFrameRow(true)
+		}
+		if row == c.totalRows()-c.bottomReserve() {
+			return c.buildFrameRow(false)
+		}
+	}
+
+	// Below the status/dock branches, work in window-row space: the window
+	// content is shifted down by contentOffset physical rows.
 	row -= c.contentOffset()
 
 	// Cells inside the window rectangle start as window background; cells
-	// outside it (a larger client's slack) are dot-filled.
-	line := make(emu.Line, c.cols())
+	// outside it (a larger client's slack) are dot-filled. The canvas is the
+	// window content width (physical minus docks); composeContentRow wraps it
+	// into the full physical row with the dock strips at the end.
+	line := make(emu.Line, c.contentCols())
 	inWindowRow := c.layout != nil && row >= 0 && row < c.layout.Rows
 	for i := range line {
 		if c.layout != nil && !(inWindowRow && i < c.layout.Cols) {
@@ -433,7 +1104,7 @@ func (c *compositor) buildRow(row int) emu.Line {
 		}
 	}
 	if c.layout == nil {
-		return line
+		return c.composeContentRow(line, row)
 	}
 
 	var activeRect, markedRect *proto.PaneRect
@@ -459,16 +1130,36 @@ func (c *compositor) buildRow(row int) emu.Line {
 		if markedRect != nil && onPaneRing(*markedRect, col, row) {
 			g.FG, g.BG, g.Mode = c.cfg.MarkedBorderFG, emu.DefaultBG, 0
 		}
+		// pane:set_border override (e.g. command-exited flagging a pane): paint
+		// this cell in the override color if it lies on that pane's ring.
+		for id, col2 := range c.paneBorderColor {
+			if pr, ok := c.rectFor(id); ok && onPaneRing(pr, col, row) {
+				g.FG, g.BG, g.Mode = col2, emu.DefaultBG, 0
+			}
+		}
 		return g
 	}
+	joined := c.borderRunes != nil // joined/framed: use precomputed junction glyphs
 	for _, bd := range c.layout.Borders {
 		if bd.Vertical {
-			if row >= bd.Start && row < bd.End && bd.Fixed >= 0 && bd.Fixed < c.cols() {
-				line[bd.Fixed] = borderGlyph('│', bd.Fixed)
+			if row >= bd.Start && row < bd.End && bd.Fixed >= 0 && bd.Fixed < c.contentCols() {
+				ch := '│'
+				if joined {
+					if r, ok := c.borderRunes[[2]int{row, bd.Fixed}]; ok {
+						ch = r
+					}
+				}
+				line[bd.Fixed] = borderGlyph(ch, bd.Fixed)
 			}
 		} else if row == bd.Fixed {
-			for col := bd.Start; col < bd.End && col < c.cols(); col++ {
-				line[col] = borderGlyph('─', col)
+			for col := bd.Start; col < bd.End && col < c.contentCols(); col++ {
+				ch := '─'
+				if joined {
+					if r, ok := c.borderRunes[[2]int{row, col}]; ok {
+						ch = r
+					}
+				}
+				line[col] = borderGlyph(ch, col)
 			}
 		}
 	}
@@ -487,7 +1178,7 @@ func (c *compositor) buildRow(row int) emu.Line {
 		buf := c.panes[pr.ID]
 		for x := 0; x < pr.Cols; x++ {
 			col := pr.Col + x
-			if col < 0 || col >= c.cols() {
+			if col < 0 || col >= c.contentCols() {
 				continue
 			}
 			g := emu.EmptyGlyph()
@@ -508,12 +1199,12 @@ func (c *compositor) buildRow(row int) emu.Line {
 		if pr.Active {
 			fg, bg, mode = c.cfg.ActiveBorderFG, emu.DefaultBG, int16(0)
 		}
-		for col := pr.Col; col < pr.Col+pr.Cols && col < c.cols(); col++ {
+		for col := pr.Col; col < pr.Col+pr.Cols && col < c.contentCols(); col++ {
 			line[col] = emu.Glyph{Char: '─', FG: fg, BG: bg, Mode: mode}
 		}
 		col := pr.Col + 1
 		for _, r := range pr.BorderLabel {
-			if col >= pr.Col+pr.Cols || col >= c.cols() {
+			if col >= pr.Col+pr.Cols || col >= c.contentCols() {
 				break
 			}
 			line[col] = emu.Glyph{Char: r, FG: fg, BG: bg, Mode: mode}
@@ -538,11 +1229,17 @@ func (c *compositor) buildRow(row int) emu.Line {
 		}
 	}
 
+	for _, w := range c.overlays {
+		w.paintRow(row, c.contentCols(), line)
+	}
 	if c.picker != nil {
 		c.overlayRow(row, line)
 	}
 	if c.popup != nil {
 		c.popupRow(row, line)
+	}
+	if c.modal != nil {
+		c.modalRow(row, line)
 	}
 	// clock-mode / lock: over the window's middle. Lock is a single centered
 	// line; clock is tmux-style big ASCII digits (5 rows) centered vertically.
@@ -575,7 +1272,118 @@ func (c *compositor) buildRow(row int) emu.Line {
 		}
 	}
 
+	return c.composeContentRow(line, row)
+}
+
+// composeContentRow wraps a content-width row (window content drawn in
+// window-column space) into a full physical row, painting the docked column
+// strips on the left/right edges. winRow selects each dock's own line. With no
+// docks it returns content unchanged — the byte-identical pre-dock path.
+func (c *compositor) composeContentRow(content emu.Line, winRow int) emu.Line {
+	left, right, frame := c.leftInset(), c.rightInset(), c.frameInset()
+	if left == 0 && right == 0 && frame == 0 {
+		return content
+	}
+	phys := make(emu.Line, c.cols())
+	colStart := 0
+	for _, d := range c.docks {
+		if d.dock == "left" {
+			d.paintStrip(winRow, colStart, d.size, phys)
+			colStart += d.size
+		}
+	}
+	coff := c.contentColOffset() // content col 0 draws at physical coff (= left + frame)
+	for i, g := range content {
+		if col := coff + i; col >= 0 && col < len(phys) {
+			phys[col] = g
+		}
+	}
+	// framed: the left and right outer-frame columns bracket the content on every
+	// window row (│, or ├/┤ where an interior horizontal divider meets the frame).
+	if frame > 0 && c.layout != nil && winRow >= 0 && winRow < c.layout.Rows {
+		fg, bg, attr := c.cfg.InactiveBorderFG, c.cfg.InactiveBorderBG, c.cfg.InactiveBorderAttr
+		if l := coff - 1; l >= 0 && l < len(phys) {
+			phys[l] = emu.Glyph{Char: c.borderRuneAt(winRow, -1, '│'), FG: fg, BG: bg, Mode: attr}
+		}
+		if r := coff + c.contentCols(); r >= 0 && r < len(phys) {
+			phys[r] = emu.Glyph{Char: c.borderRuneAt(winRow, c.contentCols(), '│'), FG: fg, BG: bg, Mode: attr}
+		}
+	}
+	colStart = c.cols() - right
+	for _, d := range c.docks {
+		if d.dock == "right" {
+			d.paintStrip(winRow, colStart, d.size, phys)
+			colStart += d.size
+		}
+	}
+	return phys
+}
+
+// borderRuneAt returns the precomputed joined/framed glyph for a content-space
+// border cell, or the fallback if none.
+func (c *compositor) borderRuneAt(r, col int, fallback rune) rune {
+	if ch, ok := c.borderRunes[[2]int{r, col}]; ok {
+		return ch
+	}
+	return fallback
+}
+
+// buildFrameRow renders one of the two horizontal outer-frame rows (top or
+// bottom) for pane_borders="framed": the ─ line with corners and ┬/┴ tees where
+// interior vertical dividers meet it, plus the frame title at its anchor.
+func (c *compositor) buildFrameRow(top bool) emu.Line {
+	line := make(emu.Line, c.cols())
+	for i := range line {
+		line[i] = c.fillGlyph()
+	}
+	fg, bg, attr := c.cfg.InactiveBorderFG, c.cfg.InactiveBorderBG, c.cfg.InactiveBorderAttr
+	coff := c.contentColOffset()
+	rc := -1 // content-row coord of the top frame
+	if !top {
+		rc = c.layout.Rows
+	}
+	for cc := -1; cc <= c.contentCols(); cc++ {
+		if phys := coff + cc; phys >= 0 && phys < len(line) {
+			line[phys] = emu.Glyph{Char: c.borderRuneAt(rc, cc, '─'), FG: fg, BG: bg, Mode: attr}
+		}
+	}
+	c.drawFrameTitle(line, top, coff, emu.Glyph{FG: fg, BG: bg, Mode: attr})
 	return line
+}
+
+// drawFrameTitle embeds the outer-frame title (window identity) on the given
+// frame line if pane_border_title anchors to this edge. Placement mirrors the
+// widget box titles: edge × left/centre/right, plus pane_border_offset.
+func (c *compositor) drawFrameTitle(line emu.Line, top bool, coff int, style emu.Glyph) {
+	at := c.cfg.PaneBorderTitle
+	if at == "" || c.expander == nil || c.status == nil {
+		return
+	}
+	if top != strings.HasPrefix(at, "top") {
+		return
+	}
+	text := c.expander.expand("#{window_index}:#{window_name}", c.status.Vars, c.status.ServerShell)
+	if text == "" {
+		return
+	}
+	rs := []rune(" " + text + " ")
+	inner := c.contentCols() // cells between the two frame corners
+	start := coff            // left (default): just after the left corner
+	switch {
+	case strings.HasSuffix(at, "centre"), strings.HasSuffix(at, "center"):
+		start = coff + (inner-len(rs))/2
+	case strings.HasSuffix(at, "right"):
+		start = coff + inner - len(rs)
+	}
+	start += c.cfg.PaneBorderOffset
+	lo, hi := coff, coff+inner-1 // stay strictly between the corners
+	for i, r := range rs {
+		if col := start + i; col >= lo && col <= hi && col < len(line) {
+			g := style
+			g.Char = r
+			line[col] = g
+		}
+	}
 }
 
 // clockText is the time shown in clock-mode — the status bar's clock var, or a
@@ -658,16 +1466,16 @@ func (c *compositor) feedLock(data []byte) bool {
 	return false
 }
 
-// drawCentered writes text centered on a window row.
+// drawCentered writes text centered on a window row (content-width canvas).
 func (c *compositor) drawCentered(text string, line emu.Line) {
 	runes := []rune(text)
-	start := (c.cols() - len(runes)) / 2
+	start := (c.contentCols() - len(runes)) / 2
 	if start < 0 {
 		start = 0
 	}
 	for i, r := range runes {
 		col := start + i
-		if col >= 0 && col < c.cols() {
+		if col >= 0 && col < c.contentCols() {
 			line[col] = emu.Glyph{Char: r, FG: c.cfg.StatusFG, BG: c.cfg.StatusBG, Mode: emu.AttrBold}
 		}
 	}
@@ -684,7 +1492,7 @@ func (c *compositor) buildCopyRow(pr proto.PaneRect, localRow int, line emu.Line
 	}
 	for x := 0; x < pr.Cols; x++ {
 		col := pr.Col + x
-		if col < 0 || col >= c.cols() {
+		if col < 0 || col >= c.contentCols() {
 			continue
 		}
 		g := emu.EmptyGlyph()
@@ -758,15 +1566,15 @@ func (c *compositor) overlayRowSimple(row int, line emu.Line) {
 		width = len(rows[filterRow])
 	}
 	width += 4 // two cells of padding each side
-	if width > c.cols() {
-		width = c.cols()
+	if width > c.contentCols() {
+		width = c.contentCols()
 	}
 	height := len(rows)
 	startRow := (c.layout.Rows - height) / 2
 	if startRow < 0 {
 		startRow = 0
 	}
-	startCol := (c.cols() - width) / 2
+	startCol := (c.contentCols() - width) / 2
 	boxRow := row - startRow
 	if boxRow < 0 || boxRow >= height {
 		return
@@ -781,7 +1589,7 @@ func (c *compositor) overlayRowSimple(row int, line emu.Line) {
 	runes := []rune(text)
 	for x := 0; x < width; x++ {
 		col := startCol + x
-		if col < 0 || col >= c.cols() {
+		if col < 0 || col >= c.contentCols() {
 			continue
 		}
 		g := emu.Glyph{Char: ' ', FG: fg, BG: bg}
@@ -832,7 +1640,7 @@ func (c *compositor) overlayRowSplit(row int, line emu.Line) {
 	if pk.filterable && len([]rune(left[0])) > leftW {
 		leftW = len([]rune(left[0]))
 	}
-	if maxL := c.cols() / 4; maxL > 8 && leftW > maxL {
+	if maxL := c.contentCols() / 4; maxL > 8 && leftW > maxL {
 		leftW = maxL
 	}
 
@@ -842,7 +1650,7 @@ func (c *compositor) overlayRowSplit(row int, line emu.Line) {
 	if len(right) > previewMax {
 		right = right[:previewMax]
 	}
-	width := c.cols() - 4
+	width := c.contentCols() - 4
 	if min := leftW + 12; width < min {
 		width = min
 	}
@@ -862,7 +1670,7 @@ func (c *compositor) overlayRowSplit(row int, line emu.Line) {
 	if startRow < 0 {
 		startRow = 0
 	}
-	startCol := (c.cols() - width) / 2
+	startCol := (c.contentCols() - width) / 2
 	boxRow := row - startRow
 	if boxRow < 0 || boxRow >= height {
 		return
@@ -959,32 +1767,10 @@ func (c *compositor) overlayRowSplit(row int, line emu.Line) {
 	}
 
 	for x := 0; x < width; x++ {
-		if col := startCol + x; col >= 0 && col < c.cols() {
+		if col := startCol + x; col >= 0 && col < c.contentCols() {
 			line[col] = cells[x]
 		}
 	}
-}
-
-// resolveMouse turns a mouse event into a client-side action, or nil to forward
-// it to the server. Only status-bar window clicks resolve locally (the client
-// has the labels + widths); interior focus-clicks and border drags stay
-// server-side, where the live pane mouse-mode and layout geometry are — the
-// plan's sanctioned Stage-5 fallback for the events that need server state.
-func (c *compositor) resolveMouse(me proto.MouseEvent) []string {
-	if c.layout == nil || c.status == nil {
-		return nil
-	}
-	row, col := me.Y-1, me.X-1
-	// A plain left press on a window label in the status row selects it, using
-	// the click spans renderBar recorded (so justify/format/position all match).
-	if row == c.statusRow() && me.Press && me.Cb&0x60 == 0 && me.Cb&3 == 0 {
-		for _, h := range c.windowHits {
-			if col >= h.start && col < h.end {
-				return []string{"select-window", strconv.Itoa(h.index)}
-			}
-		}
-	}
-	return nil
 }
 
 // mouseResult is what the client should do with a mouse event after the
@@ -1004,10 +1790,8 @@ type mouseResult struct {
 // holds. Only an event over a pane whose app requested mouse tracking is
 // forwarded to the server for that app.
 func (c *compositor) mouseAction(me proto.MouseEvent) mouseResult {
-	// Status-bar window-label click (resolveMouse owns the labels + hit spans).
-	if a := c.resolveMouse(me); a != nil {
-		return mouseResult{actions: [][]string{a}}
-	}
+	// Status-bar window-label clicks are handled earlier via the status
+	// component's regions (clickWidget), not here.
 	if c.layout == nil || c.status == nil {
 		return mouseResult{forward: true} // no layout yet: forward raw, as before
 	}
@@ -1015,7 +1799,7 @@ func (c *compositor) mouseAction(me proto.MouseEvent) mouseResult {
 	isMotion := me.Cb&0x20 != 0
 	isWheel := me.Cb&0x40 != 0
 	isLeft := me.Cb&3 == 0
-	winRow, winCol := me.Y-1-c.contentOffset(), me.X-1
+	winRow, winCol := me.Y-1-c.contentOffset(), me.X-1-c.contentColOffset()
 
 	// Border drag: a left-press grabs the divider under the pointer; each motion
 	// moves it (ResizeBorder to the server); release lets go.
@@ -1105,7 +1889,7 @@ func (c *compositor) copyMouse(me proto.MouseEvent) ([]byte, copyResult) {
 	if !ok {
 		return c.redraw(), copyResult{}
 	}
-	row, col := me.Y-1, me.X-1
+	row, col := me.Y-1, me.X-1-c.contentColOffset()
 	isWheel := me.Cb&0x40 != 0
 	isMotion := me.Cb&0x20 != 0
 	isLeft := me.Cb&3 == 0
@@ -1149,6 +1933,7 @@ func (c *compositor) copyMouse(me proto.MouseEvent) ([]byte, copyResult) {
 // server status tick; colors/borders take effect on this redraw.
 func (c *compositor) reload(cfg config.ClientConfig) []byte {
 	c.cfg = cfg
+	c.rebuildBorders() // pane_borders may have changed
 	// ponytail: no extended-keys renegotiation here — every path that changes the
 	// option produces a Layout that reconciles; a source-file with no following
 	// output self-heals on the next Layout event. Add back if that ever bites.
@@ -1266,7 +2051,7 @@ func (c *compositor) popupBounds() (startRow, startCol int, ok bool) {
 	if p.x >= 0 {
 		startCol = p.x + 1
 	} else {
-		startCol = (c.cols() - p.cols) / 2
+		startCol = (c.contentCols() - p.cols) / 2
 	}
 	if p.y >= 0 {
 		startRow = p.y + 1
@@ -1297,7 +2082,7 @@ func (c *compositor) popupRow(row int, line emu.Line) {
 	}
 	border := emu.Glyph{Char: '─', FG: c.cfg.ActiveBorderFG, BG: emu.DefaultBG}
 	put := func(col int, g emu.Glyph) {
-		if col >= 0 && col < c.cols() {
+		if col >= 0 && col < c.contentCols() {
 			line[col] = g
 		}
 	}

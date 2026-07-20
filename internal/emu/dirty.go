@@ -94,6 +94,11 @@ func (d *Dirty) GetSemanticPrompts() []SemanticPromptEvent {
 	return d.SemanticPrompts
 }
 
+// ClearSemanticPrompts drops queued OSC 133 events without touching line
+// dirtiness — the server drains command-exit events on their own cadence,
+// before the per-view content diff calls Reset().
+func (d *Dirty) ClearSemanticPrompts() { d.SemanticPrompts = d.SemanticPrompts[:0] }
+
 // Reset the change mask and dirtiness.
 func (d *Dirty) Reset() {
 	d.Lines = make(map[int]bool)

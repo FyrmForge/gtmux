@@ -1,10 +1,41 @@
 package client
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/FyrmForge/gtmux/internal/config"
 )
+
+// decodeKeys is the modal widget's byte→key-name decoder; it's the load-bearing
+// piece (one read can carry several keys). Reuses csiKeyName/ss3KeyName/byteKey.
+func TestDecodeKeys(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{"\x1b[A", []string{"Up"}},
+		{"\x1b[B", []string{"Down"}},
+		{"\x1b[5~", []string{"PgUp"}},
+		{"\x1bOP", []string{"F1"}}, // SS3 (application cursor mode)
+		{"\x1b[H", []string{"Home"}},
+		{"\r", []string{"Enter"}},
+		{"\n", []string{"Enter"}},
+		{"\t", []string{"Tab"}},
+		{"\x7f", []string{"BSpace"}},
+		{"\x1b", []string{"Escape"}},
+		{"a", []string{"a"}},
+		{"\x03", []string{"C-c"}},
+		{"jk\r", []string{"j", "k", "Enter"}},    // multi-key chunk
+		{"\x1b[Aj", []string{"Up", "j"}},          // arrow + char in one read
+		{"ab\x1b[B", []string{"a", "b", "Down"}},  // printables then arrow
+	}
+	for _, tc := range cases {
+		if got := decodeKeys([]byte(tc.in)); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("decodeKeys(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
 
 // guardPanic must run the restore (terminal cleanup) before re-raising, so a
 // goroutine crash never leaves the pane in raw mode / mouse-reporting.

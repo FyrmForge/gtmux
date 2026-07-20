@@ -38,6 +38,9 @@ gtmux.options.marked_border_fg = "magenta"
 -- pane-border-style: the INACTIVE pane dividers' style (fg/bg/attr as one
 -- tmux-style string). Active/marked borders keep active_border_fg/marked_border_fg.
 -- gtmux.options.pane_border_style = "fg=dark_grey"
+-- pane-borders: "simple" (default; straight │/─ like tmux) | "joined" (box-drawing
+-- junctions ┼├┤┬┴ where dividers cross) | "framed" (every pane fully enclosed).
+-- gtmux.options.pane_borders = "joined"
 gtmux.options.fill_fg = "dark_grey"
 
 gtmux.options.copy_cursor_fg = "black"
@@ -45,14 +48,35 @@ gtmux.options.copy_cursor_bg = "yellow"
 gtmux.options.copy_selection_fg = "black"
 gtmux.options.copy_selection_bg = "light_cyan"
 
--- Status bar format strings. The client owns and expands these. Variables:
---   #{host} #{session} #{window_name} #{git_branch} #{clock} #{pane_path}
---   #{pane_command}, plus #{?var,then,else} conditionals.
--- Shell output: #client(cmd) runs on this client's host, #server(cmd) runs on
--- the server; both cache their output for status_interval seconds.
-gtmux.set_option("status_left", "[#{host}][#{session}]")
-gtmux.set_option("status_right", "#{?git_branch,[git:#{git_branch}] ,}#{clock}")
+-- status_interval: refresh cadence (structural) — how often the bar re-renders
+-- and #client/#server shell output is cached, in seconds.
 gtmux.set_option("status_interval", "15")
+
+-- Status bar: a component (dock="status"). gtmux composes the bar in Lua rather
+-- than from format-string options — reshape it by editing this. It reads
+-- gtmux.windows()/expand()/context() and paints:
+--   left = [host][session], a clickable window list (click selects; w.flags is
+--   tmux's * # ! ~ Z), right = git branch + clock. #{...} still expands via
+--   gtmux.expand; the window list is a child per window (its own on_click).
+gtmux.widget{ dock = "status", component = function(props, ui)
+  local BAR = "fg=white,bg=dark_grey" -- inactive / bar background (status-style)
+  local CUR = "fg=black,bg=green"      -- active window (active-window colors)
+  ui:fill(BAR)
+  local left = "[" .. gtmux.expand("#{host}") .. "][" .. gtmux.expand("#{session}") .. "]"
+  ui:text(0, 0, left, BAR)
+  local x = #left + 1
+  for i, w in ipairs(gtmux.windows()) do
+    if i > 1 then x = x + 1 end -- separator
+    local label = w.index .. ":" .. w.name .. w.flags
+    ui:child(x, 0, #label, 1, function(p, cell)
+      cell:text(0, 0, p.label, p.style)
+      cell:on_click(function() gtmux.select_window(p.idx) end)
+    end, { label = label, style = (w.active and CUR or BAR), idx = w.index })
+    x = x + #label
+  end
+  local right = gtmux.expand("#{?git_branch,[git:#{git_branch}] ,}") .. gtmux.expand("#{clock}")
+  ui:text(ui.w - #right, 0, right, BAR)
+end }
 
 -- Cap status-left / status-right to N cells (tmux status-left-length /
 -- status-right-length). 0 = unlimited (gtmux default; tmux's 10/40 would cut
@@ -63,6 +87,11 @@ gtmux.set_option("status_interval", "15")
 -- Style (fg=/bg=/attr) of transient status messages + the command prompt
 -- (tmux message-style). The copy-mode selection style is copy_selection_fg/bg.
 -- gtmux.options.message_style = "fg=black,bg=yellow"
+
+-- Widgets: gtmux can composite custom overlay/dock elements (status bars on any
+-- edge, live data panels, clickable UIs driven by Lua queries, and 2D drawing —
+-- boxes/borders/separators via a canvas `draw` fn). Off by default; not a tmux
+-- feature. See gtmux.widget / gtmux.sessions / find_panes / draw docs.
 
 -- Prefix key and keybinds. The client owns all input: it tracks the prefix,
 -- resolves the bound key to an action, and either sends that action to the
@@ -77,8 +106,34 @@ gtmux.bind("\"", function() gtmux.split_h() end)
 gtmux.bind("x", function() gtmux.kill_pane() end)
 gtmux.bind("d", function() gtmux.detach() end)
 gtmux.bind("q", function() gtmux.show_pane_numbers() end)
-gtmux.bind("$", function() gtmux.rename_session_prompt() end)
-gtmux.bind(",", function() gtmux.rename_window_prompt() end)
+-- prompt: a one-line text-input widget on the status/message line (position =
+-- "status" — placeable elsewhere via gtmux.open). Type to edit, Enter submits
+-- the text to on_submit, Esc cancels. Basis for rename (and command-prompt).
+local function prompt(label, initial, on_submit)
+  gtmux.open{
+    position = "status",
+    component = function(props, ui)
+      local st = ui:state(); if st.text == nil then st.text = initial or "" end
+      ui:fill("fg=black,bg=yellow") -- message-style
+      ui:text(0, 0, "(" .. label .. ") " .. st.text, "fg=black,bg=yellow")
+    end,
+    on_key = function(key, ui)
+      local st = ui:state(); if st.text == nil then st.text = initial or "" end
+      if key == "Enter" then on_submit(st.text); ui:close()
+      elseif key == "Escape" then ui:close()
+      elseif key == "BSpace" then st.text = st.text:sub(1, -2)
+      elseif #key == 1 then st.text = st.text .. key
+      end
+    end,
+  }
+end
+
+gtmux.bind("$", function()
+  prompt("rename-session", gtmux.expand("#{session}"), function(t) gtmux.rename_session(t) end)
+end)
+gtmux.bind(",", function()
+  prompt("rename-window", gtmux.expand("#{window_name}"), function(t) gtmux.rename_window(t) end)
+end)
 gtmux.bind("z", function() gtmux.zoom() end)
 gtmux.bind(" ", function() gtmux.next_layout() end)       -- prefix+Space cycles presets
 gtmux.bind("C-o", function() gtmux.rotate_window() end)   -- prefix+C-o rotates panes
@@ -89,10 +144,168 @@ gtmux.bind(">", function() gtmux.swap_window("next") end)
 gtmux.bind("!", function() gtmux.break_pane() end)
 gtmux.bind("m", function() gtmux.mark_pane() end)
 gtmux.bind("J", function() gtmux.join_marked() end)
-gtmux.bind("w", function() gtmux.choose_tree() end)       -- session+window tree (tmux prefix+w)
-gtmux.bind("W", function() gtmux.choose_window() end)     -- this session's windows only
-gtmux.bind("s", function() gtmux.choose_session() end)
-gtmux.bind(":", function() gtmux.command_prompt() end)
+-- choose-tree (prefix+w): a cross-session tree (every session's windows), type
+-- to filter, arrows to move, Enter switches to that session AND focuses that
+-- window. Composed in Lua over gtmux.sessions()/windows() + switch_session(name,idx).
+gtmux.bind("w", function()
+  -- Recomputed on demand (not stashed): a multi-key chunk like "WTARGET<Enter>"
+  -- updates the filter then selects, so on_key must see the CURRENT filter's rows.
+  local function tree_rows(filter)
+    local rows = {}
+    for _, s in ipairs(gtmux.sessions()) do
+      for _, w in ipairs(gtmux.windows({ session = s.name })) do
+        local label = s.name .. ":" .. w.index .. ":" .. w.name
+        if filter == "" or label:find(filter, 1, true) then
+          rows[#rows + 1] = { session = s.name, index = w.index, label = label }
+        end
+      end
+    end
+    return rows
+  end
+  gtmux.open{
+    width = 46, height = 16,
+    component = function(props, ui)
+      local st = ui:state(); st.sel = st.sel or 1; st.filter = st.filter or ""
+      ui:fill("bg=black")
+      ui:box(0, 0, ui.w, ui.h, { style = "fg=cyan", title = "choose tree" })
+      ui:text(2, 1, "filter: " .. st.filter, "fg=yellow")
+      local rows = tree_rows(st.filter)
+      if st.sel > #rows then st.sel = math.max(1, #rows) end
+      for i, r in ipairs(rows) do
+        local y = i + 2
+        if y < ui.h - 1 then
+          ui:text(2, y, (i == st.sel and "> " or "  ") .. r.label,
+            (i == st.sel) and "fg=black,bg=green" or "fg=white")
+        end
+      end
+    end,
+    on_key = function(key, ui)
+      local st = ui:state(); st.sel = st.sel or 1; st.filter = st.filter or ""
+      if key == "Down" then st.sel = math.min(#tree_rows(st.filter), st.sel + 1)
+      elseif key == "Up" then st.sel = math.max(1, st.sel - 1)
+      elseif key == "Enter" then
+        local r = tree_rows(st.filter)[st.sel]
+        if r then gtmux.switch_session(r.session, r.index) end
+        ui:close()
+      elseif key == "Escape" then ui:close()
+      elseif key == "BSpace" then st.filter = st.filter:sub(1, -2); st.sel = 1
+      elseif #key == 1 then st.filter = st.filter .. key; st.sel = 1
+      end
+    end,
+  }
+end)
+-- Pickers are modal components (built on gtmux.open) now, not server overlays —
+-- composed in Lua so you can restyle/extend them. simple_picker is a reusable
+-- list picker: j/k or arrows move, Enter selects, Esc/q cancels. rows_fn returns
+-- the items, label_fn the display string, select_fn acts on the chosen one.
+local function simple_picker(title, rows_fn, label_fn, select_fn)
+  gtmux.open{
+    width = 34, height = 12,
+    component = function(props, ui)
+      local st = ui:state(); st.sel = st.sel or 1
+      ui:fill("bg=black")
+      ui:box(0, 0, ui.w, ui.h, { style = "fg=cyan", title = title })
+      local rows = rows_fn()
+      if st.sel > #rows then st.sel = math.max(1, #rows) end
+      for i, it in ipairs(rows) do
+        if i < ui.h - 1 then
+          ui:text(2, i, (i == st.sel and "> " or "  ") .. label_fn(it),
+            (i == st.sel) and "fg=black,bg=green" or "fg=white")
+        end
+      end
+    end,
+    on_key = function(key, ui)
+      local st = ui:state(); st.sel = st.sel or 1
+      local rows = rows_fn()
+      if key == "Down" or key == "j" then st.sel = math.min(#rows, st.sel + 1)
+      elseif key == "Up" or key == "k" then st.sel = math.max(1, st.sel - 1)
+      elseif key == "Enter" then
+        if rows[st.sel] then select_fn(rows[st.sel]) end
+        ui:close()
+      elseif key == "Escape" or key == "q" then ui:close()
+      end
+    end,
+  }
+end
+
+gtmux.bind("s", function()
+  simple_picker("choose session", gtmux.sessions,
+    function(s) return s.name .. (s.attached and " (attached)" or "") end,
+    function(s) gtmux.switch_session(s.name) end)
+end)
+gtmux.bind("W", function()
+  simple_picker("choose window", gtmux.windows,
+    function(w) return w.index .. ":" .. w.name .. w.flags end,
+    function(w) gtmux.select_window(w.index) end)
+end)
+
+-- display-menu as a component (overrides the server verb): (title, label1, cmd1,
+-- label2, cmd2, ...) — a modal list of labels; Enter runs the selected command
+-- via run_command. Composed over simple_picker.
+function gtmux.display_menu(title, ...)
+  local args = { ... }
+  local items = {}
+  for i = 1, #args, 2 do
+    items[#items + 1] = { label = args[i], cmd = args[i + 1] }
+  end
+  simple_picker(title, function() return items end,
+    function(it) return it.label end,
+    function(it) gtmux.run_command(it.cmd) end)
+end
+
+-- choose-buffer as a component (overrides the server verb): pick a paste buffer,
+-- Enter pastes it into the active pane. prefix+= opens it (tmux-faithful).
+function gtmux.choose_buffer()
+  simple_picker("choose buffer", gtmux.buffers,
+    function(b) return b.name .. ": " .. b.preview end,
+    function(b) gtmux.paste_buffer(b.name) end)
+end
+gtmux.bind("=", function() gtmux.choose_buffer() end)
+
+-- clock (prefix+t): a live clock overlay; any key dismisses. Re-renders on the
+-- status tick, so #{clock} stays current.
+gtmux.bind("t", function()
+  gtmux.open{
+    width = 16, height = 5,
+    component = function(props, ui)
+      ui:fill("bg=black")
+      ui:box(0, 0, ui.w, ui.h, { style = "fg=green" })
+      ui:text(3, 2, gtmux.expand("#{clock}"), "fg=green")
+    end,
+    on_key = function(key, ui) ui:close() end, -- any key dismisses
+  }
+end)
+
+-- lock (overrides the server verb): a full-screen cover that hides content and
+-- grabs all keys. Unlocks on the lock_password (or any key if none is set).
+function gtmux.lock()
+  gtmux.open{
+    position = "full",
+    component = function(props, ui)
+      local st = ui:state(); st.buf = st.buf or ""
+      ui:fill("bg=black")
+      local pw = gtmux.get_option("lock_password")
+      local msg = (pw ~= nil and pw ~= "")
+        and ("-- locked --  password: " .. string.rep("*", #st.buf))
+        or "-- locked --  (press any key)"
+      ui:text(2, math.floor(ui.h / 2), msg, "fg=red")
+    end,
+    on_key = function(key, ui)
+      local st = ui:state(); st.buf = st.buf or ""
+      local pw = gtmux.get_option("lock_password")
+      if pw == nil or pw == "" then ui:close()
+      elseif key == "Enter" then if st.buf == pw then ui:close() else st.buf = "" end
+      elseif key == "BSpace" then st.buf = st.buf:sub(1, -2)
+      elseif #key == 1 then st.buf = st.buf .. key end
+    end,
+  }
+end
+-- command-prompt: type a tmux command, Enter runs it (reuses the prompt widget +
+-- gtmux.run_command). The richer gtmux.command_prompt() (templates, multi-stage
+-- -p prompts) still exists for binds that need %1 substitution.
+gtmux.bind(":", function()
+  prompt(":", "", function(t) gtmux.run_command(t) end)
+end)
 gtmux.bind("[", function() gtmux.enter_copy_mode() end)
 gtmux.bind("]", function() gtmux.paste() end)
 
@@ -136,3 +349,36 @@ gtmux.bind_root("C-\\", function() gtmux.select_pane_vim("last") end)
 -- gtmux.bind("g", function() gtmux.key_table("mygroup") end)
 -- gtmux.bind_table("mygroup", "n", function() gtmux.next_window() end)
 -- gtmux.bind_table("mygroup", "p", function() gtmux.prev_window() end)
+
+-- Alert hooks (tmux's alert-bell / alert-activity / alert-silence): gtmux fires
+-- the callback when a window's flag rises (edge, not every tick), with a table
+-- {event, session, window, name, command, title}. Needs monitor-bell /
+-- monitor-activity / monitor-silence on for the window to set the flag.
+--
+-- Command awareness for agents: coding agents (Claude Code, Codex, opencode…)
+-- ring the terminal bell when a turn finishes / they need you. This surfaces
+-- that as a desktop notification so you know across windows. Edit the pattern
+-- or the action (notify-send is Linux; use terminal-notifier on macOS).
+local agent = "claude codex opencode aider"
+gtmux.on("alert-bell", function(w)
+	if w.command == "" or not agent:find(w.command, 1, true) then return end
+	os.execute(string.format(
+		"notify-send 'gtmux' '%s: %s is done' 2>/dev/null &",
+		w.name, w.command))
+end)
+
+-- Command-exit awareness (OSC 133 shell integration): fires when a command run
+-- in a pane finishes, with a pane object {session, window, id, exit_code} and a
+-- pane:set_border(color) method. The red border clears when you focus the pane.
+-- Needs shell integration emitting OSC 133 (starship, or a manual PROMPT_COMMAND).
+-- Opt-in — uncomment to flag failed commands:
+-- gtmux.on("command-exited", function(p)
+--   if p.exit_code ~= 0 then p:set_border("red") end
+-- end)
+
+-- Program-aware hook: fires when a pane's foreground program changes (shell →
+-- vim, → an agent, etc.), with a pane object {session, window, id, command,
+-- from} + pane:set_border(color). Opt-in — uncomment to tint borders per program:
+-- gtmux.on("program-changed", function(p)
+--   if p.command == "nvim" or p.command == "vim" then p:set_border("blue") end
+-- end)

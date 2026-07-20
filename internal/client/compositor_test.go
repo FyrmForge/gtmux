@@ -18,6 +18,87 @@ func lineOf(s string) emu.Line {
 	return line
 }
 
+// detectAlerts primes silently on the first snapshot (no fire for alerts
+// already standing at attach), then fires on a false→true flag edge only.
+func TestDetectAlertsEdgeAndSeed(t *testing.T) {
+	c := newCompositor()
+	snap := func(bell bool) *proto.StateSnapshot {
+		return &proto.StateSnapshot{Sessions: []proto.SnapSession{{
+			Name:    "work",
+			Windows: []proto.SnapWindow{{Index: 1, Name: "w1", Bell: bell, Panes: []proto.PaneInfo{{Active: true, Command: "claude"}}}},
+		}}}
+	}
+	// First snapshot with the bell already set: seeded, no fire.
+	c.detectAlerts(snap(true))
+	if a := c.drainAlerts(); a != nil {
+		t.Fatalf("first snapshot fired %+v, want nil (seed only)", a)
+	}
+	// Flag stays high: no new edge.
+	c.detectAlerts(snap(true))
+	if a := c.drainAlerts(); a != nil {
+		t.Fatalf("steady flag fired %+v, want nil", a)
+	}
+	// Falls then rises: that's the edge that fires.
+	c.detectAlerts(snap(false))
+	c.detectAlerts(snap(true))
+	a := c.drainAlerts()
+	if len(a) != 1 || a[0].Event != "alert-bell" || a[0].Session != "work" || a[0].Command != "claude" {
+		t.Fatalf("edge fired %+v, want one alert-bell for work/claude", a)
+	}
+	if a := c.drainAlerts(); a != nil {
+		t.Fatalf("drain not cleared: %+v", a)
+	}
+}
+
+// setPaneBorder sets an override, an unknown color clears it, and focusing the
+// pane (a Layout with it Active) clears it — the acknowledge-on-visit rule.
+func TestPaneBorderOverride(t *testing.T) {
+	c := newCompositor()
+	c.setPaneBorder(7, "red")
+	if c.paneBorderColor[7] != emu.Red {
+		t.Fatalf("override = %v, want red", c.paneBorderColor[7])
+	}
+	// Unknown color clears.
+	c.setPaneBorder(7, "chartreuse")
+	if _, ok := c.paneBorderColor[7]; ok {
+		t.Fatal("unknown color should clear the override")
+	}
+	// Re-flag, then focus the pane via a Layout: override clears.
+	c.setPaneBorder(7, "red")
+	c.apply(&proto.ServerMsg{Layout: &proto.Layout{
+		Cols: 3, Rows: 1,
+		Panes: []proto.PaneRect{{ID: 7, Row: 0, Col: 0, Rows: 1, Cols: 3, Active: true}},
+	}})
+	if _, ok := c.paneBorderColor[7]; ok {
+		t.Fatal("focusing the pane should clear its border override")
+	}
+}
+
+// detectProgramChanges primes silently on the first snapshot, then fires only
+// when a pane's foreground command actually changes.
+func TestDetectProgramChanges(t *testing.T) {
+	c := newCompositor()
+	snap := func(cmd string) *proto.StateSnapshot {
+		return &proto.StateSnapshot{Sessions: []proto.SnapSession{{
+			Name:    "work",
+			Windows: []proto.SnapWindow{{Index: 1, Panes: []proto.PaneInfo{{ID: 9, Command: cmd}}}},
+		}}}
+	}
+	c.detectProgramChanges(snap("zsh"))
+	if p := c.drainProgramChanges(); p != nil {
+		t.Fatalf("first snapshot fired %+v, want nil (seed only)", p)
+	}
+	c.detectProgramChanges(snap("zsh")) // unchanged
+	if p := c.drainProgramChanges(); p != nil {
+		t.Fatalf("unchanged command fired %+v, want nil", p)
+	}
+	c.detectProgramChanges(snap("vim")) // zsh → vim
+	p := c.drainProgramChanges()
+	if len(p) != 1 || p[0].command != "vim" || p[0].from != "zsh" || p[0].pane != 9 {
+		t.Fatalf("change fired %+v, want one zsh->vim on pane 9", p)
+	}
+}
+
 // TestCompositorPlacesTwoPanes verifies the client recombines two panes'
 // content plus a vertical divider into one physical row — the thing that
 // used to be the server's buildRow, now done here from Layout+PaneContent
@@ -102,10 +183,12 @@ func rowText(row emu.Line) string {
 // TestCompositorMultiLineStatus verifies tmux `status` N reserves N rows: the
 // main bar sits at the screen edge and the extra lines render their own
 // expanded formats, stacking inward.
+// status=N reserves N status rows (structural). Their CONTENT is now a
+// component's job (statusRowLine maps each row to the widget's canvas); the
+// bespoke ExtraStatusFormats path is retired (B2).
 func TestCompositorMultiLineStatus(t *testing.T) {
 	c := newCompositor()
 	c.cfg.StatusLines = 2
-	c.cfg.ExtraStatusFormats[0] = "LINE2"
 	c.apply(&proto.ServerMsg{
 		Layout: &proto.Layout{
 			Cols: 10, Rows: 3,
@@ -125,9 +208,6 @@ func TestCompositorMultiLineStatus(t *testing.T) {
 	}
 	if is, _ := c.statusRowKind(2); is {
 		t.Errorf("row 2 should be a window row, not status")
-	}
-	if got := rowText(c.buildRow(3)); !strings.HasPrefix(got, "LINE2") {
-		t.Errorf("extra status row = %q, want it to start with LINE2", got)
 	}
 }
 
@@ -276,37 +356,9 @@ func TestCompositorClipsSmallerClient(t *testing.T) {
 	}
 }
 
-// TestResolveMouseStatusClick verifies a click on a window label in the status
-// row resolves to a select-window action, using the same label widths the
-// client renders. status_left expands to "[h][s]" (6 cols), then " 1:a" (win
-// 1), " 2:b*" (win 2).
-func TestResolveMouseStatusClick(t *testing.T) {
-	c := newCompositor()
-	c.cfg.StatusLeft = "[#{host}][#{session}]" // expands to "[h][s]" below
-	c.cfg.StatusRight = ""
-	c.apply(&proto.ServerMsg{
-		Layout: &proto.Layout{Cols: 20, Rows: 1, Panes: []proto.PaneRect{{ID: 1, Rows: 1, Cols: 20, Active: true}}},
-		Status: &proto.StatusInfo{Vars: map[string]string{"host": "h", "session": "s"}, Windows: []proto.WindowInfo{
-			{Index: 1, Name: "a"}, {Index: 2, Name: "b", Active: true},
-		}},
-	})
-	sr := c.statusRow()
-	// col 8 falls in "1:a" (cols 7..9); col 12 in "2:b*" (cols 11..14).
-	cases := []struct {
-		col  int
-		want string
-	}{{8, "1"}, {12, "2"}}
-	for _, tc := range cases {
-		got := c.resolveMouse(proto.MouseEvent{Cb: 0, X: tc.col + 1, Y: sr + 1, Press: true})
-		if len(got) != 2 || got[0] != "select-window" || got[1] != tc.want {
-			t.Errorf("click col %d = %v, want [select-window %s]", tc.col, got, tc.want)
-		}
-	}
-	// A click off any label forwards (nil).
-	if got := c.resolveMouse(proto.MouseEvent{Cb: 0, X: 1, Y: sr + 1, Press: true}); got != nil {
-		t.Errorf("click on Left prefix = %v, want nil (forward)", got)
-	}
-}
+// Status-bar window-label clicks are now handled by the status component's
+// regions (see TestStatusComponentOwnsStatusRow); the bespoke resolveMouse/
+// windowHits path is retired (B2).
 
 // TestCopyMouseDragSelect verifies a mouse press-drag-release in copy-mode
 // anchors, extends, and yanks the selection mapped through the pane rect.
@@ -351,38 +403,6 @@ func TestCompositorStatusRow(t *testing.T) {
 	}
 }
 
-// TestCompositorStatusJustify verifies right-justify positions the window list
-// against the right edge and records matching click spans in windowHits.
-func TestCompositorStatusJustify(t *testing.T) {
-	c := newCompositor()
-	c.cfg = config.DefaultClientConfig()
-	c.cfg.StatusJustify = "right"
-	c.cfg.WindowStatusFormat = "#{window_index}"
-	c.cfg.WindowStatusCurrentFormat = "#{window_index}"
-	c.phyCols, c.phyRows = 10, 2 // 10-wide bar, no left/right formats
-	c.cfg.StatusLeft, c.cfg.StatusRight = "", ""
-	msg := &proto.ServerMsg{
-		Layout: &proto.Layout{Cols: 10, Rows: 1},
-		Status: &proto.StatusInfo{Windows: []proto.WindowInfo{{Index: 1}, {Index: 2, Active: true}}},
-	}
-	c.stLeft, c.stRight = "", ""
-	c.apply(msg)
-
-	// list is "1 2" (separator " "), 3 wide, right-justified in 10 cols → cols 7..9.
-	line := c.renderBar()
-	got := make([]rune, len(line))
-	for i, g := range line {
-		got[i] = g.Char
-	}
-	if string(got) != "       1 2" {
-		t.Errorf("right-justified bar = %q, want %q", string(got), "       1 2")
-	}
-	// windowHits must point at the actual label columns: '1' at 7, '2' at 9.
-	if len(c.windowHits) != 2 || c.windowHits[0].start != 7 || c.windowHits[1].start != 9 {
-		t.Errorf("windowHits = %+v, want entries starting at cols 7 and 9", c.windowHits)
-	}
-}
-
 // TestCompositorSetTitles verifies set-titles: apply emits an OSC 0/2 title
 // (expanded from set-titles-string) on the first status, pushes the title
 // stack once, dedupes an unchanged title, and re-emits when it changes.
@@ -415,32 +435,6 @@ func TestCompositorSetTitles(t *testing.T) {
 	}
 	if r := c.restoreTitle(); !bytes.Equal(r, []byte("\x1b[23;2t")) {
 		t.Errorf("restoreTitle() = %q, want pop \\e[23;2t", r)
-	}
-}
-
-// status-left-length caps the status-left segment before the window list.
-func TestCompositorStatusLeftLength(t *testing.T) {
-	c := newCompositor()
-	c.cfg = config.DefaultClientConfig()
-	c.cfg.StatusLeft = "ABCDEFGH" // literal (no format vars): expands to itself
-	c.cfg.StatusRight = ""
-	c.cfg.StatusLeftLength = 4
-	c.phyCols, c.phyRows = 40, 2
-	msg := &proto.ServerMsg{
-		Layout: &proto.Layout{Cols: 40, Rows: 1},
-		Status: &proto.StatusInfo{},
-	}
-	c.apply(msg)
-	line := c.renderBar()
-	got := make([]rune, 5)
-	for i := 0; i < 5; i++ {
-		got[i] = line[i].Char
-	}
-	if string(got[:4]) != "ABCD" {
-		t.Fatalf("status-left missing/wrong; first 4 = %q", string(got[:4]))
-	}
-	if got[4] == 'E' {
-		t.Fatalf("status-left-length 4 did not truncate: cell 5 = %q", got[4])
 	}
 }
 

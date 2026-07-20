@@ -471,7 +471,156 @@ Details to be fleshed out per item before work starts.
   (surface TBD).
 - [ ] **Pluggable client frontend**: fully customizable status bar:
   user-defined items/widgets, multiple status bars, plugin-style extension
-  points. Pluggable as fuck.
+  points. Pluggable as fuck. Concrete backbone = the Widget system below.
+- [ ] **Widget / overlay system** (the frontend "ecosystem"): user-definable
+  UI elements composited by the client, waybar/eww-style. Backbone for the
+  pluggable frontend, custom UIs, and "draw more elements on top".
+  - **Model**: a widget = `source` (where content comes from) + `anchor`
+    (where it sits) + `style`. Three independent axes.
+  - **Render** *(proof-of-concept DONE)*: `widget` interface
+    (`paintRow(row,cols,line)`) + `compositor.overlays []widget`, composited in
+    `buildRow` the same way popup/picker/clock/lock already are — one render
+    path, no second. `textBox` is the seed widget. Live-verified.
+    - popup/picker/clock/lock should migrate onto `overlays` later.
+    - the **status bar is a different kind** — reserved-region (shifts content
+      via `contentOffset`/`statusRowKind`), not an overlay. Migrate only when it
+      earns it; don't let it shape the overlay interface.
+  - **Anchor**: floating (fixed coords) / pane-attached (rect derived from the
+    pane's layout rect, tracks resize) / window / docked (reserves space, the
+    status-bar kind). Pane/window anchoring is pure client-side geometry — the
+    compositor already holds the layout.
+  - **Source types**: static · gtmux-internal vars (client/server state) ·
+    external script (interval-poll or persistent stdout-tail) · lua fn.
+  - **Update**: no render loop exists; everything is event-driven diff `emit`.
+    Each source owns its own cadence (waybar model) and funnels through the
+    existing `compMu.Lock → mark dirty rows → os.Stdout.Write(emit)` path that
+    the input/SIGWINCH goroutines already use — a source is just one more
+    well-behaved writer. Server-fed sources ride the decode loop; client-local
+    sources get their own goroutine/ticker. `notify()` is the one shared prim.
+  - **Locality is ALWAYS explicit, never inferred**: every source declares
+    client-vs-server. Server-side script = client sends a directive, server runs
+    it and streams output back (rides existing command/run plumbing).
+  - **Generic data bus** *(DEFERRED — revisit)*: config-defined transport so new
+    data types are config, not new Go proto fields. Two primitives: **event**
+    (server→client push, `subscribe(name)`) and **query** (client→server
+    request→reply, `on_query(name,fn)`), both over one `UserMsg{Name,Payload}`
+    gob envelope. Server must then hold per-client subscription lists (cleaned on
+    detach) + a cadence guard (throttle chatty emitters). Payload = **dynamic
+    structured tables** (JSON-shaped, via a gopher-lua JSON bridge), NOT static
+    Go types — config-defined data has no compile-time Go type. gtmux's own
+    messages (Layout/PaneContent) stay static structs.
+  - **First slice** *(DONE)*: `gtmux.widget{row,col,text,fg,bg,bold}` →
+    `ClientConfig.Widgets` → registered into `overlays` on attach. `text` is a
+    status-format string expanded through the existing `statusExpander` each
+    Status tick — so `#{vars}`, `#client(cmd)`, `#server(cmd)` (explicit
+    locality) and the update cadence all come for free. Live-verified: vars +
+    client-script expand, and the widget repaints on the tick alone.
+  - **Status reservation moved client-side** *(DONE)*: the client subtracts its
+    own status rows and reports the window (content) height to the server; the
+    server no longer knows the status bar exists (`StatusLines` gone from proto +
+    server). `winRows()` returns rows as-is. This is the enabling step for docked
+    widgets — reservation is now a pure client concern, ready to generalize from
+    "1 status block, top/bottom" to an N-edge inset. One visible consequence:
+    `list-clients` now reports content height (80x23), not terminal height.
+  - **Docked widget geometry** *(DONE — left/right)*: `gtmux.widget{dock="left"|
+    "right", size=N, text=...}` reserves N columns on that edge; the window
+    content insets and the client reports the reduced width to the server.
+    Implemented as the horizontal mirror of the status `contentOffset`:
+    `contentColOffset`/`contentCols`, applied once at `composeContentRow` so all
+    window-drawing stays 0-based; `activeCursor`/mouse add the col offset. With no
+    docks every path reduces byte-identically (guarded by the zero-inset fast
+    path). Live-verified: content, divider, and cursor all shift by the dock
+    width; status bar stays full-width. Docks re-expand their format on the
+    Status tick like floats.
+    - Scope cut taken: left/right only (the new capability); **status bar stays
+      the top/bottom reservation, not yet a dock**. Unifying status-as-a-bottom-
+      dock reuses this same machinery — do it when it earns it.
+    - Known gap: mouse events *forwarded* to a mouse-tracking pane app still carry
+      physical X (dock offset not subtracted on the forward path) — same class as
+      the pre-existing top-status forward offset. Fix when it bites.
+  - **Docked widget geometry** *(DONE — top/bottom)*: row mirror of the above.
+    `dock="top"|"bottom"` reserves N full-width rows on that edge; the window
+    content insets vertically. `contentOffset` absorbs top docks (stacked below
+    the top status if any), `bottomReserve` absorbs bottom docks (stacked above
+    the bottom status); `buildRow` intercepts a dock row via `topBottomDockRow`
+    and paints a full-width strip. Client reports the reduced height (rows minus
+    status minus top+bottom docks). Zero-dock still byte-identical. Live-verified:
+    top bar + left bar together, bottom status bar unchanged.
+    - Scope kept: **status bar stays special** (its own top/bottom reservation +
+      rendering), NOT unified as a dock. The dock machinery now covers all four
+      edges, so status-as-a-dock is a pure refactor — do it only if multiple
+      stacked bars per edge are wanted.
+  - **Lua query primitives + dynamic/interactive widgets** *(DONE)*: a widget's
+    `text` may be a Lua function (run client-side each refresh) that reads live
+    gtmux state and returns a string; `on_click = fn` makes it interactive.
+    - **Transport**: query-shaped in Lua, push-fed in transport. The server
+      assembles a cross-session `StateSnapshot` (every session self-reports its
+      windows/panes summary into the registry on its 1s tick, so detached
+      sessions stay visible) and stamps it on `StatusInfo` — only when a client
+      set `Attach.WantSnapshot` (any function-widget), gated by a registry
+      counter so no-widget clients pay nothing. The client caches it; the Lua
+      primitives read the cache synchronously. No separate data bus.
+    - **Primitives**: `gtmux.sessions/windows/panes/find_panes/clients/context/
+      expand/get_option`; targeted verbs `switch_session/kill_pane/send_keys`
+      (+ existing `select_window`). All in `config/client.go`, reading
+      `ClientBinds.Hooks` (installed by the client post-load).
+    - **Function-widget**: `textBox.textFn` run via `ClientBinds.RunText`
+      (NRet=1); `on_click` via `RunClick` (records BindOps like a keybind).
+      `interval` throttles re-runs. `clickWidget` hit-tests dock/overlay rects
+      in the mouse path (client.go, under compMu).
+    - **Concurrency**: the Lua VM isn't goroutine-safe; text fns run on the
+      decode goroutine, on_click on the input goroutine — both under `compMu`,
+      with an inner `vmMu` in `ClientBinds` serializing every CallByParam.
+      Hooks read compositor state without locking (always called under compMu).
+    - Live-verified: left dock = all sessions (current marked, window counts,
+      cross-session), right dock = active-window panes, click a session → switch.
+    - **Canvas draw API** *(DONE)*: `draw = function(c)` gives a widget a 2D glyph
+      grid (`config.Canvas`, `RunDraw`) with `c:set/text/box/hline/vline/fill`,
+      each taking an optional tmux-style string (reuses `applyStyle`). Per-cell
+      color + box-drawing, so bordered boxes, separators, nested boxes, positioned
+      styled text. Region size: docks = size × content-extent (compositor sets
+      `w,h` per tick); floats = spec `width,height`. `paintRow`/`paintStrip` blit
+      from the canvas when set; `clickWidget` reconstructs `line_text` from the
+      canvas row. Live-verified with a bordered SESSIONS box + nested box +
+      separators (grim pixel check).
+    - Known gaps (not fixed): (1) a mouse event *forwarded* to a mouse-tracking
+      pane app behind a left/right dock still carries physical X — the forward
+      path subtracts Y offset but not `contentColOffset` (client.go, `me.X`).
+      (2) reload doesn't `L.Close()` the old bind VM (leak; reloads are rare)
+      and widgets keep their original VM (no hot-reload). (3) `gtmux.expand`
+      with `#client(...)`/`#server(...)` runs shell I/O synchronously under
+      compMu — a text fn using it isn't "pure"; keep such widgets on a slow
+      `interval`.
+  - **Pane border modes + titles** *(DONE)*: `pane_borders` = `simple` (default,
+    tmux-faithful straight │/─), `joined` (box-drawing junctions ┼├┤┬┴ on the
+    shared dividers, client-side, no geometry change), `framed` (every pane
+    enclosed by an outer window frame; content shrinks 1 cell/side).
+    - **joined**: `compositor.rebuildBorders` computes a junction glyph per border
+      cell from which neighbors carry a stroke (`boxRune`); the border loop uses
+      it instead of straight │/─. Rebuilt on layout/reload.
+    - **framed**: `frameInset()=1` threads through the inset accessors
+      (contentOffset/bottomReserve/contentColOffset/contentCols) + client size
+      reporting (`frameReserve`), exactly like the dock inset. The frame's 4 sides
+      are added to `rebuildBorders` in content coords (-1/W/H) so interior
+      dividers tee into it; `buildFrameRow` draws the top/bottom lines,
+      composeContentRow draws the left/right columns. `pane_border_rounded` →
+      ╭╮╰╯ outer corners.
+    - **Titles**: `pane_border_title` anchor (top/bottom × left/centre/right) +
+      `pane_border_offset`; the frame title shows window identity, drawn by
+      `drawFrameTitle`. Widget boxes get the same via `c:box(x,y,w,h,{style,
+      title,title_at})`. The 6-anchor vocabulary is shared.
+    - Live-verified: joined junctions on a 4-pane grid; framed rounded frame with
+      centred title, interior dividers teeing into the frame (┴/├/┤), every pane
+      enclosed. Unit tests pin joined ┼, framed ┌─┐, box title. e2e green (framed
+      is opt-in; simple default keeps frameReserve=0, byte-identical).
+    - Known gaps: framed + docks together may glitch the dock cells on the frame
+      rows (rare combo); per-pane titles on shared interior dividers deferred (use
+      tmux's reserved-row `pane-border-status` for those); the frame uses inactive
+      border style (active-pane edge highlight not extended to the outer frame).
+  - **Next**: status-as-a-dock unification (if multiple bars needed); anchors
+    (pane/window-attached); migrate popup/picker onto `overlays`; persistent
+    stdout-tail script sources; `gtmux.capture_pane` + an event/subscribe bus
+    (both deferred: polling covers v1).
 - [ ] **Theming**: theme system: colors/styles as a swappable set, beyond
   the current per-option fg/bg. Likely two built-in themes in ONE client (not
   two binaries): tmux-classic vs a modern lipgloss-powered look — a value/glyph
@@ -479,10 +628,14 @@ Details to be fleshed out per item before work starts.
   (`mode-style`, `pane-active-border-style`): keep their *parsing* for tmux-
   config compat, but point them at the theme struct, not standalone ClientConfig
   fields — doing them standalone now would just get rewritten by this.
-- [ ] **Program-aware Lua hooks**: detect the foreground program in a pane
-  (cli/tui, e.g. Claude Code) and fire a Lua callback with real context on
-  program change. Grows into a general hook/callback system for config Lua:
-  richer than tmux-style `set-hook` (fixed events, command strings only).
+- [x] **Program-aware Lua hooks**: `gtmux.on("program-changed", fn)` fires when
+  a pane's foreground command changes (shell→vim→agent), with a pane object
+  {session, window, id, command, from} + pane:set_border. Client-side per-pane
+  edge detection off the pushed snapshot (compositor.detectProgramChanges),
+  seeded silently on attach. Part of the general gtmux.on hook system (alerts,
+  command-exited, program-changed share RunPaneEvent + set_border) — richer than
+  tmux's set-hook (fixed events, command strings only). Tests: TestProgram
+  ChangedCallback, TestDetectProgramChanges.
 - [ ] **Frontend rewrite exploration**: evaluate moving client rendering to
   the lipgloss/Charm ecosystem for a properly polished look.
 - [ ] **Session persistence across reboots**: save/restore sessions

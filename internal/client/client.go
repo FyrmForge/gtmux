@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -71,6 +72,87 @@ func guardPanic(restore func()) {
 		restore()
 		panic(r)
 	}
+}
+
+// statusReserve is how many rows the status bar occupies for a StatusLines
+// setting (tmux `status` 0..5), matching compositor.statusLines(). The client
+// reserves these locally and reports only the *content* height to the server —
+// status-bar reservation is entirely client-side.
+func statusReserve(sl int) int {
+	switch {
+	case sl < 0:
+		return 0
+	case sl > 5:
+		return 5
+	}
+	return sl
+}
+
+// dockInset sums the size of docked widgets on the given edges (used to shrink
+// the window size the client reports to the server).
+func dockInset(widgets []config.WidgetSpec, edges ...string) int {
+	n := 0
+	for _, w := range widgets {
+		for _, e := range edges {
+			if w.Dock == e {
+				n += w.Size
+			}
+		}
+	}
+	return n
+}
+
+// frameReserve is the cells reserved on each window edge by pane_borders="framed"
+// (the outer frame): 1 per side, so 2 off each dimension. 0 otherwise.
+func frameReserve(borders string) int {
+	if borders == "framed" {
+		return 2
+	}
+	return 0
+}
+
+// contentRows is the window height the client reports to the server: physical
+// rows minus the status rows, any top/bottom docks, and the framed border (never
+// below 1).
+func contentRows(rows, sl int, widgets []config.WidgetSpec, borders string) int {
+	if r := rows - statusReserve(sl) - dockInset(widgets, "top", "bottom") - frameReserve(borders); r > 0 {
+		return r
+	}
+	return 1
+}
+
+// contentCols is the window width the client reports to the server: physical
+// cols minus the columns reserved by left/right docks and the framed border
+// (never below 1).
+func contentCols(cols int, widgets []config.WidgetSpec, borders string) int {
+	if c := cols - dockInset(widgets, "left", "right") - frameReserve(borders); c > 0 {
+		return c
+	}
+	return 1
+}
+
+// wantSnapshot reports whether any widget uses a Lua function (text or on_click),
+// which needs the server's state snapshot. Static-text widgets don't, so the
+// server skips the snapshot work for the common case.
+func wantSnapshot(widgets []config.WidgetSpec) bool {
+	for _, w := range widgets {
+		if w.TextFn != nil || w.OnClick != nil || w.Draw != nil || w.Component != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// prefixLabel formats a prefix key byte as a tmux-style name (0x02 → "C-b") for
+// gtmux.context().
+func prefixLabel(b byte) string {
+	if b == 0 {
+		return ""
+	}
+	if b < 0x20 {
+		return "C-" + string(rune(b+0x60))
+	}
+	return string(rune(b))
 }
 
 // Attach is `gtmux attach [-r]`: read-only when ro is set.
@@ -150,6 +232,48 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 		}
 	}()
 
+	// installHooks wires a bind VM's widget query primitives to live compositor
+	// state. Called under compMu (from RunText/RunClick), so the closures read
+	// comp fields directly, no locking. Set on binds0 here and on every reload's
+	// fresh VM (applyCfg).
+	installHooks := func(b *config.ClientBinds) {
+		b.Hooks = config.WidgetHooks{
+			Snapshot: func() *proto.StateSnapshot {
+				if comp != nil {
+					return comp.snapshot
+				}
+				return nil
+			},
+			Context: func() map[string]string {
+				m := map[string]string{}
+				if comp != nil && comp.status != nil {
+					m["session"] = comp.status.Vars["session"]
+					m["window"] = comp.status.Vars["window_index"]
+					m["pane"] = comp.status.Vars["pane_id"]
+				}
+				if comp != nil {
+					m["prefix"] = prefixLabel(curBinds().Prefix)
+					m["width"] = strconv.Itoa(comp.phyCols)
+					m["height"] = strconv.Itoa(comp.phyRows)
+				}
+				return m
+			},
+			Expand: func(s string) string {
+				if comp != nil && comp.expander != nil && comp.status != nil {
+					return comp.expander.expand(s, comp.status.Vars, comp.status.ServerShell)
+				}
+				return s
+			},
+			Option: func(name string) string {
+				if comp != nil {
+					return comp.optionValue(name)
+				}
+				return ""
+			},
+		}
+	}
+	installHooks(binds0)
+
 	// Live config state, shared by the stdin goroutine (local :set / source-file)
 	// and the decode goroutine (a server-pushed set-option). cfgMu guards the
 	// override list + path; binds is the atomic pointer above; comp.cfg swaps
@@ -163,6 +287,7 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 	// applyCfg swaps in a freshly-derived config and repaints. Caller holds
 	// cfgMu; takes compMu for the compositor swap (order: cfgMu → compMu).
 	applyCfg := func(newCfg config.ClientConfig, newBinds *config.ClientBinds) {
+		installHooks(newBinds)
 		bindsPtr.Store(newBinds)
 		compMu.Lock()
 		if comp != nil {
@@ -332,6 +457,17 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 						os.Stdout.Write(comp.openLocal(op.Local))
 					}
 					compMu.Unlock()
+				} else if op.Modal != nil {
+					compMu.Lock()
+					if comp != nil {
+						comp.openModal(op.Modal, curBinds())
+						os.Stdout.Write(comp.redraw())
+					}
+					compMu.Unlock()
+				} else if op.Command != "" {
+					if argv := tokenize(op.Command); len(argv) > 0 {
+						dispatch(argv)
+					}
 				} else if len(op.Action) > 0 {
 					dispatch(op.Action)
 				}
@@ -532,9 +668,25 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 							}
 							send(&proto.ClientMsg{SetPaste: &proto.SetPasteBuffer{Text: res.yank, Pipe: true}})
 						}
-					case comp != nil && (comp.prompt != nil || comp.picker != nil):
-						compMu.Unlock() // overlay swallows mouse
+					case comp != nil && (comp.prompt != nil || comp.picker != nil || comp.modal != nil):
+						compMu.Unlock() // overlay swallows mouse (modal is keyboard-only for now)
 					default:
+						// A left-press on a widget with an on_click runs it (like a
+						// keybind) and consumes the click. Runs under compMu so the
+						// query hooks read consistent compositor state.
+						if comp != nil && me.Press && me.Cb&3 == 0 && me.Cb&0x20 == 0 {
+							if b, fn, li, lt, cc := comp.clickWidget(me); fn != nil {
+								ops := b.binds.RunClick(fn, li, lt, cc)
+								// The handler may have mutated ui:state(); re-render this
+								// widget and repaint now so the change is immediate,
+								// instead of waiting for the next server tick.
+								b.rerender()
+								os.Stdout.Write(comp.redraw())
+								compMu.Unlock()
+								runOps(ops)
+								continue
+							}
+						}
 						var mr mouseResult
 						offset := 0
 						if comp != nil {
@@ -588,6 +740,28 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 						// prefix machine. The popup closes when its process exits.
 						compMu.Unlock()
 						send(&proto.ClientMsg{Input: &proto.Input{Data: pass}})
+					case comp != nil && comp.modal != nil:
+						// A modal keyboard widget grabs every key: decode the chunk to
+						// key names, feed each to on_key, re-render once. Actions the
+						// handler recorded (e.g. switch_session) run after.
+						var mops []config.BindOp
+						closed := false
+						for _, name := range decodeKeys(pass) {
+							o, cl := comp.modalKey(name)
+							mops = append(mops, o...)
+							if cl {
+								closed = true
+								break
+							}
+						}
+						if closed {
+							comp.modal = nil
+						} else if comp.modal != nil {
+							comp.modal.rerender()
+						}
+						os.Stdout.Write(comp.redraw())
+						compMu.Unlock()
+						runOps(mops)
 					case comp != nil && comp.copy != nil:
 						out, res := comp.copyFeed(pass)
 						os.Stdout.Write(out)
@@ -637,7 +811,7 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 			if err != nil {
 				continue
 			}
-			send(&proto.ClientMsg{Resize: &proto.Resize{Cols: cols, Rows: rows, StatusLines: cliCfg.StatusLines}})
+			send(&proto.ClientMsg{Resize: &proto.Resize{Cols: contentCols(cols, cliCfg.Widgets, cliCfg.PaneBorders), Rows: contentRows(rows, cliCfg.StatusLines, cliCfg.Widgets, cliCfg.PaneBorders)}})
 			compMu.Lock()
 			if comp != nil {
 				comp.setPhysical(cols, rows)
@@ -672,7 +846,7 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 				env[kv[:i]] = kv[i+1:]
 			}
 		}
-		if err := send(&proto.ClientMsg{Attach: &proto.Attach{Session: target, Cols: cols, Rows: rows, Cwd: cwd, Create: create, GroupTarget: groupTarget, ReadOnly: readOnly, StatusCmds: serverCmds, StatusInterval: cliCfg.StatusInterval, StatusLines: cliCfg.StatusLines, Env: env}}); err != nil {
+		if err := send(&proto.ClientMsg{Attach: &proto.Attach{Session: target, Cols: contentCols(cols, cliCfg.Widgets, cliCfg.PaneBorders), Rows: contentRows(rows, cliCfg.StatusLines, cliCfg.Widgets, cliCfg.PaneBorders), Cwd: cwd, Create: create, GroupTarget: groupTarget, ReadOnly: readOnly, StatusCmds: serverCmds, StatusInterval: cliCfg.StatusInterval, Env: env, WantSnapshot: wantSnapshot(cliCfg.Widgets)}}); err != nil {
 			conn.Close()
 			return err
 		}
@@ -692,9 +866,49 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 		comp = newCompositor()
 		comp.cfg = cliCfg
 		comp.setPhysical(cols, rows)
+		wb := curBinds() // the widgets' fns live in this VM; captured for their lifetime
+		for _, w := range cliCfg.Widgets {
+			b := &textBox{
+				row: w.Row, col: w.Col, format: w.Text,
+				lines: strings.Split(w.Text, "\n"), // shown until the first refresh re-expands
+				fg:    w.FG, bg: w.BG, attr: w.Attr,
+				dock: w.Dock, size: w.Size,
+				textFn: w.TextFn, drawFn: w.Draw, component: w.Component, onClick: w.OnClick, binds: wb, interval: w.Interval,
+				w: w.Width, h: w.Height, // float draw size; docks override w/h per tick
+			}
+			switch w.Dock {
+			case "status":
+				comp.statusWidget = b // owns the status rows (replaces renderBar)
+			case "":
+				comp.overlays = append(comp.overlays, b)
+			default:
+				comp.docks = append(comp.docks, b)
+			}
+		}
 		compMu.Unlock()
 		switchTo := ""
 		var decodeErr error
+		// applyHookOps runs the ops a gtmux.on callback recorded (command-exited /
+		// program-changed / alerts): a pane:set_border override on the compositor,
+		// or a run_command/action dispatched like a keybind. runOps proper lives in
+		// the input goroutine; this is its read-loop-scoped counterpart.
+		applyHookOps := func(ops []config.BindOp) {
+			for _, op := range ops {
+				if op.Border != nil {
+					compMu.Lock()
+					if comp != nil {
+						os.Stdout.Write(comp.setPaneBorder(op.Border.PaneID, op.Border.Color))
+					}
+					compMu.Unlock()
+				} else if op.Command != "" {
+					if argv := tokenize(op.Command); len(argv) > 0 {
+						dispatch(argv)
+					}
+				} else if len(op.Action) > 0 {
+					dispatch(op.Action)
+				}
+			}
+		}
 		for {
 			var msg proto.ServerMsg
 			if err := dec.Decode(&msg); err != nil {
@@ -729,6 +943,16 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 				os.Stdout.Write(msg.Passthrough)
 				continue
 			}
+			if len(msg.CommandExits) > 0 {
+				// A command finished in a pane (OSC 133): fire gtmux.on("command-exited")
+				// with a pane object; its ops (set_border / run_command / action) apply.
+				for _, ce := range msg.CommandExits {
+					applyHookOps(curBinds().RunCommandExit(config.CommandExitEvent{
+						Session: ce.Session, Window: ce.Window, PaneID: ce.PaneID, ExitCode: ce.ExitCode,
+					}))
+				}
+				continue
+			}
 			if msg.ClientAction != nil {
 				// A hook fired a client-owned command (command-prompt / display-menu
 				// / confirm-before): open the overlay locally. dispatch handles its
@@ -738,8 +962,19 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 			}
 			compMu.Lock()
 			out := comp.apply(&msg)
+			alerts := comp.drainAlerts()
+			progChanges := comp.drainProgramChanges()
 			compMu.Unlock()
 			os.Stdout.Write(out)
+			// Fire gtmux.on callbacks outside compMu (Run* take vmMu). A callback
+			// most often notifies via os.execute (zero ops); any set_border /
+			// run_command / action it records applies like a keybind.
+			for _, ev := range alerts {
+				applyHookOps(curBinds().RunAlert(ev))
+			}
+			for _, pc := range progChanges {
+				applyHookOps(curBinds().RunProgramChanged(pc.session, pc.window, pc.pane, pc.command, pc.from))
+			}
 		}
 		conn.Close()
 		if switchTo == "" {

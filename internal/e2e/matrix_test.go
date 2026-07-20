@@ -337,6 +337,9 @@ func TestChooseSessionSwitch(t *testing.T) {
 
 	c.Prefix("s")
 	c.WaitForText("choose session")
+	c.WaitForText("work") // the picker is a component over the client snapshot;
+	//                       wait for the cross-session list to populate (it now
+	//                       re-renders live on the status tick).
 	c.Type("j") // sorted [default, work]; move to work
 	c.Key('\r')
 	c.WaitForStatus("work") // c re-attached to the work session
@@ -429,17 +432,10 @@ func TestMouseSelectWindow(t *testing.T) {
 	c.WaitFor(func(s *harness.Screen) bool { return s.ActiveWindow() == 1 })
 }
 
-// TestStatusShellSplit proves the #client()/#server() split end to end: a
-// custom status_left runs one command locally and one on the server, and both
-// outputs land in the bar. Exercises the whole wire — client extracts the
-// #server() body, ships it in Attach, the server runs it and streams the
-// populated ServerShell map back, and the client expands both sides.
-func TestStatusShellSplit(t *testing.T) {
-	lua := `gtmux.set_option("status_left", "#client(echo CLIENTOK) #server(echo SERVEROK) ")`
-	c := harness.StartWithConfig(t, lua, "")
-	c.WaitForText("CLIENTOK") // client-side exec + local expand
-	c.WaitForText("SERVEROK") // extract -> Attach -> server run -> gob map -> lookup
-}
+// (Retired, B2) TestStatusShellSplit tested #client()/#server() driven by a
+// custom status_left. Status content is now a component; status_left is gone,
+// so the #server extraction it relied on is too. A gtmux.server_shell() Lua
+// primitive could restore server-side exec if wanted — not wired yet.
 
 // TestSelectWindowByIndex covers the select_window primitive: prefix then a
 // digit jumps straight to that window.
@@ -1176,19 +1172,10 @@ func TestWindowNaming(t *testing.T) {
 	c.WaitForStatus("APPTITLE")
 }
 
-// TestStatusStyling covers window-status-format + window-status-separator: the
-// window list renders from the custom entry template, joined by the separator.
-func TestStatusStyling(t *testing.T) {
-	lua := `
-gtmux.options.window_status_separator = "|"
-gtmux.options.window_status_format = "w#{window_index}"
-gtmux.options.window_status_current_format = "w#{window_index}"
-`
-	c := harness.StartWithConfig(t, lua, "")
-	c.WaitForStatus("w1")
-	c.Prefix("c")
-	c.WaitForStatus("w1|w2") // custom template + separator
-}
+// (Retired, B2) TestStatusStyling tested window_status_format /
+// window_status_separator. The window list is now composed in the status
+// component (default: "index:name" + flags), so those content options are gone;
+// reshape by editing the component.
 
 // TestStatusPosition covers status-position top: the bar moves to the top row,
 // and a click on a window label there still selects it (the client offsets the
@@ -1256,13 +1243,10 @@ func TestFormatOperators(t *testing.T) {
 	}
 }
 
-// TestStatusFormatOperator covers the operators reaching the client status bar:
-// a window-status-current-format using ==/conditional renders on the bar.
-func TestStatusFormatOperator(t *testing.T) {
-	lua := `gtmux.options.window_status_current_format = "#{?#{==:#{window_index},1},<#{window_index}>,#{window_index}}"`
-	c := harness.StartWithConfig(t, lua, "")
-	c.WaitForStatus("<1>") // active window 1, rendered through the operator + conditional
-}
+// (Retired, B2) TestStatusFormatOperator tested #{?...}/#{==:...} inside
+// window_status_current_format. That option is gone; the #{...} engine itself
+// still works via gtmux.expand() (covered in internal/format tests) — a
+// component builds window labels in Lua and can call gtmux.expand as needed.
 
 // TestUserOptionsAndAlias covers @foo user options (readable in formats) and
 // command-alias (a command name resolved to its expansion at dispatch).
@@ -1763,24 +1747,17 @@ func TestMouseDragCopy(t *testing.T) {
 	c.WaitForStatus("q quit")
 }
 
-// TestMultiLineStatus: `status 2` reserves a second status row, drawn from
-// status-format[1] (status_format_2). Proves the full round-trip — the client
-// sends its status-lines count in Attach, the server sizes the window grid
-// (rows - 2) so the pane doesn't overwrite the extra line, and the client
-// composites it. On an 80x24 client the main bar is row 23, the extra line 22.
+// `status 2` reserves a second status row (structural round-trip, kept): the
+// client sends its status-lines count in Attach, the server sizes the window
+// grid (rows - 2) so the pane doesn't overwrite the extra row. The extra row's
+// CONTENT is now a component's job (retired: status_format_2); a component can
+// paint it via statusRowLine. This checks the reservation still holds.
 func TestMultiLineStatus(t *testing.T) {
-	lua := `
-gtmux.options.status = "2"
-gtmux.options.status_format_2 = "SECONDLINE"
-`
+	lua := `gtmux.options.status = "2"`
 	c := harness.StartWithConfig(t, lua, "")
 	c.WaitForStatus("1:") // main bar (window list) still on the bottom row
-	c.WaitFor(func(s *harness.Screen) bool {
-		return strings.Contains(string(s.Row(22)), "SECONDLINE")
-	})
-	// The server must reserve BOTH status rows, or the pane is one row too tall
-	// and its bottom line hides under the extra status line. On an 80x24 client
-	// the pane gets 24 - 2 = 22 rows.
+	// The server must reserve BOTH status rows, or the pane is one row too tall.
+	// On an 80x24 client the pane gets 24 - 2 = 22 rows.
 	h := strings.TrimSpace(c.Run("run", "default", "display-message", "-p", "#{pane_height}"))
 	if h != "22" {
 		t.Fatalf("pane_height = %q, want 22 (24 - 2 status rows)", h)

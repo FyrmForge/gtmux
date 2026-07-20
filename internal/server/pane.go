@@ -395,6 +395,26 @@ func (p *pane) fullContent() proto.PaneContent {
 	}
 }
 
+// takeCommandExits drains the OSC 133 command-finished exit codes recorded
+// since the last call (for gtmux.on("command-exited")). A finished command
+// with no reported code counts as 0. Runs on the actor goroutine, before the
+// per-view dirtyContent diff clears the rest of the dirty state.
+func (p *pane) takeCommandExits() []int {
+	d := p.term.Changes()
+	var codes []int
+	for _, e := range d.GetSemanticPrompts() {
+		if e.Type == emu.CommandFinished {
+			code := 0
+			if e.ExitCode != nil {
+				code = *e.ExitCode
+			}
+			codes = append(codes, code)
+		}
+	}
+	d.ClearSemanticPrompts()
+	return codes
+}
+
 // dirtyContent reports only the pane's rows that changed since the last
 // call (or since fullContent last reset them) — the hot path for ordinary
 // pty output.

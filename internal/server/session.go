@@ -21,11 +21,11 @@ import (
 // at once (sharing the same windows); the grid is sized to the smallest of
 // them. cols/rows are that client's own terminal size, used for negotiation.
 type attachment struct {
-	conn        net.Conn
-	enc         *gob.Encoder
-	cols, rows  int
-	statusLines int  // status rows this client reserves; sizes the window grid (rows - statusLines)
-	readOnly    bool // attach -r: input never reaches a pane
+	conn       net.Conn
+	enc        *gob.Encoder
+	cols, rows int  // rows is the window (content) height; the client already subtracted its status bar
+	readOnly   bool // attach -r: input never reaches a pane
+	wantSnap   bool // client uses widget queries: keep the registry snapshot count up
 }
 
 // session is one gtmux session: a set of windows/panes that keep running
@@ -80,9 +80,8 @@ type clientInput struct {
 	data  []byte
 }
 type clientResize struct {
-	epoch       int
-	cols, rows  int
-	statusLines int
+	epoch      int
+	cols, rows int // rows is the window (content) height (client already subtracted its status bar)
 }
 type clientMouse struct {
 	epoch    int
@@ -123,12 +122,12 @@ type actionEvent struct {
 type attachEvent struct {
 	conn           net.Conn
 	enc            *gob.Encoder
-	cols, rows     int
-	statusLines    int               // status rows this client reserves (tmux `status` 1..5)
+	cols, rows     int               // rows is the window (content) height (client subtracted its status bar)
 	statusCmds     []string          // #server(cmd) bodies this client's formats use
 	statusInterval int               // client's #server() cache cadence, seconds
 	env            map[string]string // client env, for update-environment
 	readOnly       bool              // attach -r
+	wantSnap       bool              // client uses widget queries
 	epochCh        chan int
 }
 type infoEvent struct{ replyCh chan proto.SessionInfo }
@@ -173,9 +172,9 @@ func newSession(name string) *session {
 // attach hands a freshly connected client off to the session's owner
 // goroutine and returns the epoch assigned to it, used to tag that
 // connection's later input/resize/close events.
-func (s *session) attach(conn net.Conn, enc *gob.Encoder, cols, rows, statusLines int, statusCmds []string, statusInterval int, env map[string]string, readOnly bool) int {
+func (s *session) attach(conn net.Conn, enc *gob.Encoder, cols, rows int, statusCmds []string, statusInterval int, env map[string]string, readOnly, wantSnap bool) int {
 	ch := make(chan int, 1)
-	s.events <- attachEvent{conn: conn, enc: enc, cols: cols, rows: rows, statusLines: statusLines, statusCmds: statusCmds, statusInterval: statusInterval, env: env, readOnly: readOnly, epochCh: ch}
+	s.events <- attachEvent{conn: conn, enc: enc, cols: cols, rows: rows, statusCmds: statusCmds, statusInterval: statusInterval, env: env, readOnly: readOnly, wantSnap: wantSnap, epochCh: ch}
 	return <-ch
 }
 
@@ -262,13 +261,13 @@ func (s *session) rename(name string) {
 // panes, and attachment state. Removes the session from reg when its last
 // pane exits.
 func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
-	// The status bar reserves rows the windows don't get. Its height is the
-	// acting client's status-lines (tmux `status` 1..5); statusLines tracks that,
-	// updated by applySize, defaulting to 1 (a detached session, or single-line).
-	statusLines := 1
+	// The client reserves its own status rows and reports the window (content)
+	// height directly, so the server sizes the grid to rows as-is — status-bar
+	// reservation is entirely client-side. (winRows stays a func for the many
+	// call sites and in case a future server-side inset needs it back.)
 	winRows := func() int {
-		if r := rows - statusLines; r > 0 {
-			return r
+		if rows > 0 {
+			return rows
 		}
 		return 1
 	}
@@ -612,6 +611,48 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 	// and read it after, so runCommand keeps its plain error-string return.
 	var cmdOut string
 
+	// buildSnapSession summarizes this session (windows → panes → clients) for the
+	// cross-session widget snapshot; stored into the registry on the 1s tick so
+	// detached sessions stay visible to another client's gtmux.sessions()/find_panes.
+	// Defined before currentStatus so the latter can refresh this session's entry
+	// fresh on each status send (the 1s cache lags a window change otherwise).
+	buildSnapSession := func() *proto.SnapSession {
+		snap := &proto.SnapSession{Name: s.name, Attached: len(attachments) > 0}
+		for i, wl := range windows {
+			w := wl.actor
+			sw := proto.SnapWindow{Index: i + baseIndex, Name: windowName(w), Active: i == active, Zoomed: w.zoomed, Activity: wl.view.activity, Bell: wl.view.bell, Silence: wl.view.silence}
+			for j, p := range w.panes {
+				pid := 0
+				if p.cmd != nil && p.cmd.Process != nil {
+					pid = p.cmd.Process.Pid
+				}
+				sw.Panes = append(sw.Panes, proto.PaneInfo{
+					Number: j + paneBaseIndex, ID: p.id,
+					Command: p.currentCommand(), Path: p.cwd(), Title: p.term.Title(),
+					PID: pid, Active: p == w.active, Marked: p.marked,
+					Width: p.rect.Cols, Height: p.rect.Rows,
+				})
+			}
+			snap.Windows = append(snap.Windows, sw)
+		}
+		for ep, a := range attachments {
+			snap.Clients = append(snap.Clients, proto.SnapClient{
+				Name: fmt.Sprintf("%s:%d", s.name, ep), Session: s.name, Width: a.cols, Height: a.rows,
+			})
+		}
+		for _, b := range buffers {
+			preview := b.data
+			if nl := strings.IndexByte(preview, '\n'); nl >= 0 {
+				preview = preview[:nl]
+			}
+			if len(preview) > 50 {
+				preview = preview[:50]
+			}
+			snap.Buffers = append(snap.Buffers, proto.SnapBuffer{Name: b.name, Preview: preview})
+		}
+		return snap
+	}
+
 	// currentStatus builds the status bar's raw data (not expanded — the client
 	// owns the formats and expands them): the variable map, the #server() shell
 	// output, the window list, and any transient server message.
@@ -640,6 +681,17 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 		// still owns transient status messages (run-shell output, errors).
 		if statusMsg != "" {
 			info.PromptLabel, info.PromptText = "message", statusMsg
+		}
+		// Widget clients get the whole-server snapshot (every session's summary,
+		// self-reported on each session's tick). Skipped entirely when no attached
+		// client uses widget queries.
+		if reg.snapshotsActive() {
+			// Refresh THIS session's registry entry now (not just on the 1s tick),
+			// so an attached client's status bar — gtmux.windows() of its own
+			// session — reflects a window change immediately instead of lagging a
+			// tick. Other sessions stay from their last self-report.
+			reg.putSnapshot(s.name, buildSnapSession())
+			info.Snapshot = &proto.StateSnapshot{Sessions: reg.allSnapshots()}
 		}
 		return info
 	}
@@ -967,6 +1019,9 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 	// and its panes keep running for any others.
 	closeClient := func(epoch int) {
 		if a := attachments[epoch]; a != nil {
+			if a.wantSnap {
+				reg.wantSnapshot(-1)
+			}
 			a.conn.Close()
 			delete(attachments, epoch)
 		}
@@ -1050,16 +1105,10 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 	// full-syncs).
 	applySize := func() bool {
 		nc, nr := effectiveSize()
-		// The window grid also shrinks/grows when the acting client's status-lines
-		// change (tmux `status` N), even if its terminal size didn't — so track it.
-		nsl := 1
-		if a := attachments[actingEpoch]; a != nil && a.statusLines > 0 {
-			nsl = a.statusLines
-		}
-		if nc == cols && nr == rows && nsl == statusLines {
+		if nc == cols && nr == rows {
 			return false
 		}
-		cols, rows, statusLines = nc, nr, nsl
+		cols, rows = nc, nr
 		return revoteWindows()
 	}
 
@@ -1596,6 +1645,13 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 			return
 		}
 		wv := windows[wi].view
+		// OSC 133 command-finished: notify this session's clients so a Lua
+		// gtmux.on("command-exited") callback can react (e.g. flag the pane).
+		for _, code := range rm.cmdExits {
+			send(&proto.ServerMsg{CommandExits: []proto.CommandExit{{
+				Session: s.name, Window: wi + baseIndex, PaneID: p.id, ExitCode: code,
+			}}})
+		}
 		// monitor-silence: any output clears the flag and rearms the timer.
 		wv.silence = false
 		sil := monitorSilence
@@ -3348,6 +3404,9 @@ loop:
 		select {
 		case <-ticker.C:
 			refreshStatus()
+			if reg.snapshotsActive() {
+				reg.putSnapshot(s.name, buildSnapSession())
+			}
 			send(&proto.ServerMsg{})
 		case rm := <-renderCh:
 			handleRender(rm)
@@ -3356,7 +3415,10 @@ loop:
 			case attachEvent:
 				nextEpoch++
 				ep := nextEpoch
-				attachments[ep] = &attachment{conn: e.conn, enc: e.enc, cols: e.cols, rows: e.rows, statusLines: e.statusLines, readOnly: e.readOnly}
+				attachments[ep] = &attachment{conn: e.conn, enc: e.enc, cols: e.cols, rows: e.rows, readOnly: e.readOnly, wantSnap: e.wantSnap}
+				if e.wantSnap {
+					reg.wantSnapshot(1)
+				}
 				// Fold this client's #server() commands into the union set the
 				// tick runs, and adopt its cache cadence.
 				serverCmds = mergeCmds(serverCmds, e.statusCmds)
@@ -3602,9 +3664,6 @@ loop:
 					continue
 				}
 				a.cols, a.rows = e.cols, e.rows
-				if e.statusLines > 0 {
-					a.statusLines = e.statusLines
-				}
 				if applySize() {
 					send(fullSync())
 				}

@@ -32,12 +32,14 @@ func TestChooseClient(t *testing.T) {
 	big.WaitForStatus("default")
 
 	// Both clients present; find the peer's epoch by its distinctive size.
+	// list-clients reports the window (content) height — the client subtracts its
+	// own status row before reporting, so a 24/9-row terminal lists as 23/8.
 	list := c.Run("run", "default", "list-clients")
-	epoch := epochWithSize(list, "[190x9]")
+	epoch := epochWithSize(list, "[190x8]")
 	if epoch == "" {
 		t.Fatalf("peer not in list-clients:\n%s", list)
 	}
-	if epochWithSize(list, "[80x24]") == "" {
+	if epochWithSize(list, "[80x23]") == "" {
 		t.Fatalf("acting client not in list-clients:\n%s", list)
 	}
 
@@ -46,10 +48,10 @@ func TestChooseClient(t *testing.T) {
 	c.Run("run", "default", "detach-client", "-t", "client-"+epoch+"@default")
 
 	list = c.Run("run", "default", "list-clients")
-	if epochWithSize(list, "[190x9]") != "" {
+	if epochWithSize(list, "[190x8]") != "" {
 		t.Fatalf("detached client still listed:\n%s", list)
 	}
-	if epochWithSize(list, "[80x24]") == "" {
+	if epochWithSize(list, "[80x23]") == "" {
 		t.Fatalf("acting client wrongly detached:\n%s", list)
 	}
 }

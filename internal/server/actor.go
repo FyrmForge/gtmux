@@ -81,6 +81,7 @@ type renderMsg struct {
 	mouseMode bool   // the pane's app just toggled mouse tracking → resend Layout (PaneRect.WantsMouse)
 	keyMode   bool   // the pane's app just toggled the kitty keyboard protocol → resend Layout (PaneRect.KeyFlags)
 	hostOut   []byte // un-doubled allow-passthrough payload to forward raw to the client terminal
+	cmdExits  []int  // OSC 133 command-finished exit codes in this chunk (gtmux.on("command-exited"))
 }
 
 func newWindowActor(w *window) *windowActor {
@@ -118,6 +119,9 @@ func (wa *windowActor) run() {
 			keyBefore := ev.pane.term.KeyState()
 			hostOut := wa.applyOutput(ev.pane, ev.data)
 			bell := bytes.IndexByte(ev.data, 0x07) >= 0
+			// Drain OSC 133 command-finished exits now (before dirtyContent's diff
+			// resets the dirty state below), regardless of any view being active.
+			cmdExits := ev.pane.takeCommandExits()
 			// An app toggling mouse tracking (DECSET/DECRST 1000-1003) changes
 			// PaneRect.WantsMouse, which the client uses to decide own-vs-forward.
 			// Infrequent (a real mode flip, not every frame), so resend Layout then.
@@ -141,7 +145,7 @@ func (wa *windowActor) run() {
 			// doesn't happen); reliable alert delivery isn't worth a second channel.
 			var content *proto.PaneContent
 			for _, vw := range wa.views {
-				rm := renderMsg{pane: ev.pane, bell: bell, mouseMode: mouseModeFlip, keyMode: keyModeFlip}
+				rm := renderMsg{pane: ev.pane, bell: bell, mouseMode: mouseModeFlip, keyMode: keyModeFlip, cmdExits: cmdExits}
 				if vw.isActive && (!wa.zoomed || ev.pane == wa.active) {
 					if content == nil {
 						c := ev.pane.dirtyContent()

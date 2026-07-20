@@ -42,16 +42,19 @@ type Attach struct {
 	StatusCmds     []string
 	StatusInterval int
 
+	// WantSnapshot: this client has widgets that query gtmux state, so the server
+	// should build and stamp the cross-session StateSnapshot on its status ticks.
+	// Off = the server skips that work entirely (no-widget clients pay nothing).
+	WantSnapshot bool
+
 	// Env is the client's environment, sent so the server can refresh the
 	// update-environment vars (SSH_AUTH_SOCK, DISPLAY, …) into the session env
 	// on attach/reattach — tmux's update-environment.
 	Env map[string]string
 
-	// StatusLines is how many rows this client reserves for its status bar
-	// (tmux `status` 1..5). The client draws the bar itself; the server only
-	// needs the count to size the window grid (Rows minus StatusLines). 0 is
-	// treated as 1 by the server (clamped).
-	StatusLines int
+	// Rows is the window (content) height: the client already subtracts the rows
+	// its status bar reserves, so the server sizes the grid to Rows directly.
+	// Status-bar reservation is entirely client-side.
 }
 
 // Input carries raw client key bytes to the server. Never contains mouse
@@ -73,11 +76,11 @@ type MouseEvent struct {
 	Press bool
 }
 
-// Resize notifies the server the client's terminal size changed.
+// Resize notifies the server the client's terminal size changed. Rows is the
+// window (content) height — the client has already subtracted its status rows.
 type Resize struct {
-	Cols        int
-	Rows        int
-	StatusLines int // status rows this client reserves (see Attach.StatusLines)
+	Cols int
+	Rows int
 }
 
 // PaneRect is one pane's position, size, and focus state within its
@@ -151,6 +154,69 @@ type StatusInfo struct {
 	Windows     []WindowInfo
 	PromptLabel string
 	PromptText  string
+	// Snapshot is the whole-server state the client caches each tick and exposes
+	// to Lua widgets (gtmux.sessions()/windows()/panes()/clients()). Nil until a
+	// client that uses widgets is attached (the server skips building it
+	// otherwise — see wantSnapshot). ponytail: full tree every tick; fine for
+	// tens of panes, move to on-demand query if it grows.
+	Snapshot *StateSnapshot
+}
+
+// StateSnapshot is the cross-session view assembled by the server: every live
+// session, its windows, and their panes. Each session self-reports its own
+// summary into the registry on its 1s tick (so detached sessions stay fresh);
+// the stamp reads the whole registry map. The client turns this into the Lua
+// query tables — no separate data bus, just a fatter StatusInfo.
+type StateSnapshot struct {
+	Sessions []SnapSession
+}
+
+// SnapSession is one session's summary in a StateSnapshot.
+type SnapSession struct {
+	Name     string
+	Attached bool
+	Windows  []SnapWindow
+	Clients  []SnapClient
+	Buffers  []SnapBuffer
+}
+
+// SnapBuffer is one paste buffer exposed to gtmux.buffers() (for choose-buffer).
+type SnapBuffer struct {
+	Name    string
+	Preview string // first line, truncated — for the list label
+}
+
+// SnapWindow is one window inside a SnapSession.
+type SnapWindow struct {
+	Index    int // base-index-adjusted display number
+	Name     string
+	Active   bool
+	Zoomed   bool
+	Activity bool // # flag (monitor-activity)
+	Bell     bool // ! flag (monitor-bell)
+	Silence  bool // ~ flag (monitor-silence)
+	Panes    []PaneInfo
+}
+
+// PaneInfo is one pane exposed to gtmux.panes()/find_panes() in Lua.
+type PaneInfo struct {
+	Number        int
+	ID            int
+	Command       string
+	Path          string
+	Title         string
+	PID           int
+	Active        bool
+	Marked        bool
+	Width, Height int
+}
+
+// SnapClient is one attached client exposed to gtmux.clients().
+type SnapClient struct {
+	Name    string
+	Session string
+	Width   int
+	Height  int
 }
 
 // OpenPrompt is the client-local descriptor for a text-entry prompt
@@ -347,6 +413,18 @@ type ServerMsg struct {
 	// Passthrough is raw bytes (an app's un-doubled allow-passthrough DCS payload)
 	// the client writes straight to its terminal, bypassing the compositor.
 	Passthrough []byte
+	// CommandExits reports OSC 133 command-finished events (a command run in a
+	// pane exited) so the client can fire gtmux.on("command-exited", …).
+	CommandExits []CommandExit
+}
+
+// CommandExit is one OSC 133 D (command-finished) event: a command run in a
+// pane exited with ExitCode. Window is the base-index-adjusted display number.
+type CommandExit struct {
+	Session  string
+	Window   int
+	PaneID   int
+	ExitCode int
 }
 
 // PopupMsg drives the client's display-popup overlay — a floating terminal the

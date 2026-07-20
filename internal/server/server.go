@@ -94,6 +94,58 @@ type registry struct {
 	// mu since a lock/wait blocks the connection goroutine while held-registered).
 	waitMu sync.Mutex
 	waitCh map[string]*waitChan
+	// snapshots is each session's self-reported summary (windows/panes), stored on
+	// its 1s tick so cross-session widget queries (gtmux.sessions/find_panes) see
+	// detached sessions too. snapWant counts attached clients that use widgets; the
+	// summary build + status stamp are skipped when it's zero. Guarded by mu.
+	snapshots map[string]*proto.SnapSession
+	snapWant  int
+}
+
+// wantSnapshot adjusts the count of attached clients that use widget queries. A
+// widget client bumps it +1 on attach, -1 on detach; when it hits zero the
+// per-session summary build and the status stamp are skipped (common no-widget
+// path pays nothing).
+func (r *registry) wantSnapshot(delta int) {
+	r.mu.Lock()
+	if r.snapWant += delta; r.snapWant < 0 {
+		r.snapWant = 0
+	}
+	r.mu.Unlock()
+}
+
+func (r *registry) snapshotsActive() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.snapWant > 0
+}
+
+// putSnapshot stores a session's current summary (called from its owner
+// goroutine each tick when snapshots are active).
+func (r *registry) putSnapshot(name string, s *proto.SnapSession) {
+	r.mu.Lock()
+	if r.snapshots == nil {
+		r.snapshots = map[string]*proto.SnapSession{}
+	}
+	r.snapshots[name] = s
+	r.mu.Unlock()
+}
+
+// allSnapshots returns every session's summary, sorted by name for a stable
+// widget list order (tmux lists sessions alphabetically).
+func (r *registry) allSnapshots() []proto.SnapSession {
+	r.mu.Lock()
+	names := make([]string, 0, len(r.snapshots))
+	for n := range r.snapshots {
+		names = append(names, n)
+	}
+	out := make([]proto.SnapSession, 0, len(names))
+	sort.Strings(names)
+	for _, n := range names {
+		out = append(out, *r.snapshots[n])
+	}
+	r.mu.Unlock()
+	return out
 }
 
 // waitChan is one wait-for channel: signal/wait (-S wakes bare waiters) and
@@ -279,6 +331,7 @@ func (r *registry) get(name string) (*session, bool) {
 func (r *registry) remove(name string) {
 	r.mu.Lock()
 	delete(r.sessions, name)
+	delete(r.snapshots, name)
 	empty := len(r.sessions) == 0 && r.exitEmpty
 	r.mu.Unlock()
 	if empty {
@@ -623,7 +676,7 @@ func acceptConn(reg *registry, conn net.Conn) {
 		conn.Close()
 		return
 	}
-	epoch := s.attach(conn, enc, msg.Attach.Cols, msg.Attach.Rows, msg.Attach.StatusLines, msg.Attach.StatusCmds, msg.Attach.StatusInterval, msg.Attach.Env, msg.Attach.ReadOnly)
+	epoch := s.attach(conn, enc, msg.Attach.Cols, msg.Attach.Rows, msg.Attach.StatusCmds, msg.Attach.StatusInterval, msg.Attach.Env, msg.Attach.ReadOnly, msg.Attach.WantSnapshot)
 
 	for {
 		var m proto.ClientMsg
@@ -641,7 +694,7 @@ func acceptConn(reg *registry, conn net.Conn) {
 		case m.CopyDrag != nil:
 			s.events <- copyDragEvent{epoch: epoch, paneID: m.CopyDrag.PaneID, row: m.CopyDrag.Row, col: m.CopyDrag.Col}
 		case m.Resize != nil:
-			s.events <- clientResize{epoch: epoch, cols: m.Resize.Cols, rows: m.Resize.Rows, statusLines: m.Resize.StatusLines}
+			s.events <- clientResize{epoch: epoch, cols: m.Resize.Cols, rows: m.Resize.Rows}
 		case m.SetPaste != nil:
 			s.events <- setPasteEvent{text: m.SetPaste.Text, pipe: m.SetPaste.Pipe}
 		case m.Action != nil:
