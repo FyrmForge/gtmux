@@ -42,6 +42,25 @@ func byteKey(b byte) string {
 	return ""
 }
 
+// advancePaste steps a bracketed-paste marker matcher: m is how many bytes of
+// pat matched so far, b is the next byte. Returns the new progress and whether
+// pat just completed. On a mismatch it restarts at 1 if b is pat's first byte
+// (ESC), else 0 — enough for "\x1b[200~"/"\x1b[201~" whose only repeatable byte
+// is the leading ESC. Used by the mouse pre-scan to know when a paste is in
+// flight (so a pasted SGR-mouse-looking sequence isn't latched and eaten).
+func advancePaste(m int, pat []byte, b byte) (int, bool) {
+	if b == pat[m] {
+		if m+1 == len(pat) {
+			return 0, true
+		}
+		return m + 1, false
+	}
+	if b == pat[0] {
+		return 1, false
+	}
+	return 0, false
+}
+
 // csiKeyName maps a CSI sequence body (bytes after "ESC [") to a bind token.
 // Modified forms (e.g. "1;5D" = C-Left) are intentionally absent — the full
 // modifier matrix (CSI-u / modifyOtherKeys) is out of scope; they fall through
@@ -161,6 +180,17 @@ func Attach(session string, ro bool) error { return RunGroup(session, false, "",
 // RunGroup is Run with a group target: new-session -t <groupTarget> joins that
 // session's group (displays its current windows). readOnly is attach -r.
 func RunGroup(session string, create bool, groupTarget string, readOnly bool) error {
+	// Refuse to attach to a session on the SAME server from inside one of its
+	// own panes — that renders a session into itself. $GTMUX is "sock,pid,name"
+	// (set on every spawned pane, pane.go); compare only the socket so attaching
+	// to a DIFFERENT server (other -S socket, a remote one) still works. tmux
+	// does the same and points at unsetting the var to force it.
+	if g := os.Getenv("GTMUX"); g != "" {
+		if sock, _, _ := strings.Cut(g, ","); sock == proto.SockPath() {
+			return fmt.Errorf("sessions should be nested with care, unset $GTMUX to force")
+		}
+	}
+
 	if err := ensureServer(); err != nil {
 		return err
 	}
@@ -178,7 +208,7 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 	var restoreOnce sync.Once
 	restoreTerm := func() {
 		restoreOnce.Do(func() {
-			os.Stdout.Write([]byte("\x1b[?1002l\x1b[?1006l")) // disable mouse (no-op if off)
+			os.Stdout.Write([]byte("\x1b[?1002l\x1b[?1006l\x1b[?2004l")) // disable mouse (no-op if off) + bracketed paste
 			term.Restore(int(os.Stdin.Fd()), oldState)
 		})
 	}
@@ -419,10 +449,25 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 		os.Stdout.Write([]byte("\x1b[?1002h\x1b[?1006h")) // restoreTerm disables it on exit/panic
 	}
 
+	// Bracketed paste: unconditional, unlike mouse. Without it the outer
+	// terminal dumps the clipboard raw, so every \r in pasted text runs as a
+	// command, and pasted bytes get eaten by the prefix/bind/mouse machinery
+	// below. The 200~/201~ markers let us tell data from keystrokes.
+	os.Stdout.Write([]byte("\x1b[?2004h"))
+
 	go func() {
 		defer guardPanic(restoreTerm) // a crash here must not leave the pane wedged
 		buf := make([]byte, 4096)
 		var mp mouseParser
+		// Paste matcher for the mouse pre-scan, independent of processInput's
+		// `pasting` (which drives the prefix/bind bypass). Own state so it works
+		// WITHIN the opener's own read chunk and across reads: while a paste is in
+		// flight the mouse parser is bypassed, so a pasted SGR-mouse sequence can't
+		// be swallowed. pasteOpen/Close are the DECSET 2004 markers.
+		pasteOpen := []byte("\x1b[200~")
+		pasteClose := []byte("\x1b[201~")
+		var openM, closeM int
+		mousePasting := false
 		// Prefix state machine (client owns input). Persist across reads: a
 		// prefix key and its follow byte can land in separate Stdin.Read chunks.
 		prefixPending := false
@@ -434,6 +479,13 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 		escStage := 0
 		escPrefixed := false
 		var escRaw []byte
+		// Bracketed paste: between ESC[200~ and ESC[201~ every byte is DATA, not a
+		// key. Persists across reads (a paste easily spans several 4096 chunks).
+		// While set, the prefix/bind machine is bypassed so a pasted prefix byte
+		// (C-b) or a bind -n key can't fire, and the mouse pre-scan is skipped so a
+		// pasted SGR-mouse-looking sequence isn't eaten. Only the ESC[201~
+		// terminator ends it.
+		pasting := false
 		// tmux's -r: after a repeatable bind, the bare key keeps firing until
 		// this window lapses. Checked at the next byte, so no timer/goroutine.
 		// ponytail: captured once at attach; a runtime `set repeat-time` reload
@@ -512,6 +564,22 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 					}
 					return
 				}
+				// Bracketed-paste markers delimit DATA. Flip the pasting state so the
+				// byte loop routes the payload around the prefix/bind machine, and
+				// forward the marker unconditionally: the server strips it when the
+				// target pane's app hasn't enabled 2004 (it owns that state). The
+				// client stays out of per-pane mode tracking.
+				if csiSeq == "200~" || csiSeq == "201~" {
+					pasting = csiSeq == "200~"
+					fwd = append(fwd, raw...)
+					return
+				}
+				// An esc sequence arriving mid-paste is pasted data, not a key —
+				// forward it raw, never resolve it as a bind.
+				if pasting {
+					fwd = append(fwd, raw...)
+					return
+				}
 				// Root (bind -n): fire a root bind, else forward the raw bytes.
 				if name != "" {
 					if ops := bd.ResolveRoot(name); ops != nil {
@@ -552,6 +620,18 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 						escStage = 0
 						finishEsc(ss3KeyName[string(b)], "", escPrefixed, escRaw)
 					}
+					continue
+				}
+				// Inside a bracketed paste: every byte is data. Forward it raw,
+				// bypassing the prefix/bind machine below. An ESC still enters the
+				// collector so the ESC[201~ terminator (or a pasted esc sequence) is
+				// recognized; finishEsc forwards non-terminator esc data raw too.
+				if pasting {
+					if b == 0x1b {
+						escStage, escPrefixed, escRaw = 1, false, []byte{b}
+						continue
+					}
+					fwd = append(fwd, b)
 					continue
 				}
 				// A custom key table (switch-client -T) claims the next key: look it
@@ -640,14 +720,34 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 				var pass []byte
 				var mouseEvents []proto.MouseEvent
 				for _, b := range buf[:n] {
+					// While a paste is in flight, bypass the mouse parser: the payload
+					// is data, and a pasted SGR-mouse-looking sequence would otherwise
+					// be latched and eaten by mp.feed. The close-marker matcher ends it.
+					if mousePasting {
+						pass = append(pass, b)
+						m, done := advancePaste(closeM, pasteClose, b)
+						if done {
+							mousePasting, closeM = false, 0
+						} else {
+							closeM = m
+						}
+						continue
+					}
 					consumed, flushed := mp.feed(b, func(cb, x, y int, press bool) {
 						mouseEvents = append(mouseEvents, proto.MouseEvent{Cb: cb, X: x, Y: y, Press: press})
 					})
 					if consumed {
 						pass = append(pass, flushed...)
-						continue
+					} else {
+						pass = append(pass, b)
 					}
-					pass = append(pass, b)
+					// Track the open marker on the RAW byte stream regardless of what
+					// mp did with it, so paste starting mid-chunk still gates mp.feed.
+					if m, done := advancePaste(openM, pasteOpen, b); done {
+						mousePasting, openM = true, 0
+					} else {
+						openM = m
+					}
 				}
 				pass = append(pass, mp.flush()...)
 				// Mouse events run through the same overlay-vs-forward gate as
@@ -660,6 +760,14 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 					switch {
 					case comp != nil && comp.copy != nil:
 						out, res := comp.copyMouse(me)
+						if res.exit {
+							// A drag-select yank exits copy-mode, same as the keyboard
+							// path (compositor.copyFeed). Without this the stale overlay
+							// swallows the user's next click — including the click meant
+							// to focus another pane — so server focus never leaves the
+							// copy-from pane and the subsequent paste lands there.
+							comp.copy = nil
+						}
 						os.Stdout.Write(out)
 						compMu.Unlock()
 						if res.yank != "" {
@@ -688,10 +796,10 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 							}
 						}
 						var mr mouseResult
-						offset := 0
+						rowOffset, colOffset := 0, 0
 						if comp != nil {
 							mr = comp.mouseAction(me)
-							offset = comp.contentOffset()
+							rowOffset, colOffset = comp.contentOffset(), comp.contentColOffset()
 						} else {
 							mr.forward = true
 						}
@@ -706,10 +814,14 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 							send(&proto.ClientMsg{CopyDrag: mr.copyDrag})
 						}
 						if mr.forward {
-							// The server places panes in window-row space; with the
-							// status bar at the top the client's rows are shifted down,
-							// so undo that before forwarding the event.
-							me.Y -= offset
+							// The server places panes in window space; the client's
+							// screen space is shifted by a top status bar / top dock
+							// (rows) and a left dock or frame inset (columns). Undo
+							// BOTH before forwarding, or the app sees the click at
+							// the wrong cell — the column half was missing, so any
+							// left dock offset every click by its width.
+							me.Y -= rowOffset
+							me.X -= colOffset
 							send(&proto.ClientMsg{Mouse: &me})
 						}
 					}

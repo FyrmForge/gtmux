@@ -245,6 +245,9 @@ type OpenPicker struct {
 	// content as styled lines (tmux choose-tree's pane preview), shown beside the
 	// list. Static — captured when the picker opens, not live. nil = no preview.
 	Previews [][]emu.Line
+	// Sel is the initially-highlighted item index (0 if unset) — e.g. the active
+	// session in choose-session, so the picker opens on it rather than the top.
+	Sel int
 }
 
 // Action is a client-invoked command run mid-session (prompt/picker commit,

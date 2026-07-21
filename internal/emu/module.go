@@ -20,6 +20,8 @@ const (
 	AttrWrap
 	AttrBlank
 	AttrTransparent
+	AttrOpaque // unused here, but keeps the bit values aligned with state.go
+	AttrDim
 )
 
 type UnderlineMode uint8

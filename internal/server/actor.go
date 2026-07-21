@@ -21,7 +21,7 @@ type windowActor struct {
 	views    []*view                // sessions displaying this window (P1: always exactly one)
 	relay    map[*pane]*windowActor // panes that migrated away: forward their output to the new actor
 	done     chan struct{}          // closed when run() exits (stopActor waits on it)
-	stopped  bool                   // set by stopActor before close(events); guards late reader events (session goroutine only)
+	stopped  bool                   // set by finishStop before the stopMsg; guards late reader events (session goroutine only)
 	stopping bool                   // torn down but still relaying migrated panes: finish when relay empties
 	// The window owns its grid size (tmux window-size + aggressive-resize),
 	// computed from its views' votes — so several sessions of different sizes
@@ -70,6 +70,14 @@ type doMsg struct {
 	done chan struct{}
 }
 
+// stopMsg ends run(). finishStop enqueues it instead of closing wa.events: pane
+// reader goroutines send outputMsg straight to origin.events (session.go), and a
+// straggler read landing after a close() would panic ("send on closed channel")
+// — which, being in a goroutine, would take the whole server down. FIFO means
+// run() drains everything queued before the sentinel; anything a reader sends
+// AFTER it just sits unread in the buffered channel until GC.
+type stopMsg struct{}
+
 // renderMsg is what the actor hands back to the session on each applied output:
 // the pane, its diff (non-nil only when this window is current and the pane
 // visible — the session fans it out), and whether the chunk contained a BEL (for
@@ -78,8 +86,10 @@ type renderMsg struct {
 	pane      *pane
 	content   *proto.PaneContent
 	bell      bool
-	mouseMode bool   // the pane's app just toggled mouse tracking → resend Layout (PaneRect.WantsMouse)
-	keyMode   bool   // the pane's app just toggled the kitty keyboard protocol → resend Layout (PaneRect.KeyFlags)
+	// modeFlip: the pane's app toggled a mode the client mirrors in PaneRect —
+	// mouse tracking (WantsMouse) or kitty keyboard (KeyFlags) → resend Layout.
+	// One flag because the only consumer (session.go) reacts identically to both.
+	modeFlip  bool
 	hostOut   []byte // un-doubled allow-passthrough payload to forward raw to the client terminal
 	cmdExits  []int  // OSC 133 command-finished exit codes in this chunk (gtmux.on("command-exited"))
 }
@@ -115,7 +125,7 @@ func (wa *windowActor) run() {
 				to.events <- ev
 				continue
 			}
-			mouseBefore := ev.pane.term.Mode() & emu.ModeMouseMask
+			modeBefore := ev.pane.term.Mode() & emu.ModeMouseMask
 			keyBefore := ev.pane.term.KeyState()
 			hostOut := wa.applyOutput(ev.pane, ev.data)
 			bell := bytes.IndexByte(ev.data, 0x07) >= 0
@@ -123,13 +133,15 @@ func (wa *windowActor) run() {
 			// resets the dirty state below), regardless of any view being active.
 			cmdExits := ev.pane.takeCommandExits()
 			// An app toggling mouse tracking (DECSET/DECRST 1000-1003) changes
-			// PaneRect.WantsMouse, which the client uses to decide own-vs-forward.
-			// Infrequent (a real mode flip, not every frame), so resend Layout then.
-			mouseModeFlip := ev.pane.term.Mode()&emu.ModeMouseMask != mouseBefore
-			// Same for the app toggling the kitty keyboard protocol (CSI > flags u):
-			// PaneRect.KeyFlags changes, and the client renegotiates extended-keys
-			// with its outer terminal. Resend Layout on the flip.
-			keyModeFlip := ev.pane.term.KeyState() != keyBefore
+			// PaneRect.WantsMouse, which the client uses to decide own-vs-forward;
+			// same for the kitty keyboard protocol (CSI > flags u), where the
+			// client renegotiates extended-keys with its outer terminal. Both are
+			// infrequent (real mode flips, not every frame), so resend Layout then.
+			// Bracketed paste (2004) is deliberately NOT here — it's gated
+			// server-side (pane.filterPaste), so the client needs no notification,
+			// and zsh toggles 2004 on every prompt.
+			modeFlip := ev.pane.term.Mode()&emu.ModeMouseMask != modeBefore ||
+				ev.pane.term.KeyState() != keyBefore
 			// Fan out to every viewing session, gating content per-view on that
 			// session's current-window choice (spike4/spike5 discipline):
 			//   - non-blocking send, drop on a full view — one slow/dead viewer must
@@ -145,7 +157,7 @@ func (wa *windowActor) run() {
 			// doesn't happen); reliable alert delivery isn't worth a second channel.
 			var content *proto.PaneContent
 			for _, vw := range wa.views {
-				rm := renderMsg{pane: ev.pane, bell: bell, mouseMode: mouseModeFlip, keyMode: keyModeFlip, cmdExits: cmdExits}
+				rm := renderMsg{pane: ev.pane, bell: bell, modeFlip: modeFlip, cmdExits: cmdExits}
 				if vw.isActive && (!wa.zoomed || ev.pane == wa.active) {
 					if content == nil {
 						c := ev.pane.dirtyContent()
@@ -166,6 +178,8 @@ func (wa *windowActor) run() {
 		case doMsg:
 			ev.fn()
 			close(ev.done)
+		case stopMsg:
+			return // defer close(wa.done) fires; unread stragglers are dropped
 		}
 	}
 }

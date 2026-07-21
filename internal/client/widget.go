@@ -147,6 +147,35 @@ func (b *textBox) regionAt(x, y int) *lua.LFunction {
 	return nil
 }
 
+// layText lays s's runes into line starting at col0, clipped to maxCols DISPLAY
+// columns, and returns the number of columns written. A wide rune (CJK/emoji)
+// occupies its true width: the rune in one cell, then a Char==0 spacer cell per
+// extra column — the invariant emu.WriteLine relies on to keep columns aligned
+// (it emits one rune per non-zero cell, advancing by the glyph's own width). A
+// wide rune that would straddle the maxCols boundary is dropped, not spilled —
+// spilling is exactly what bled dock text across the border. Shared by the
+// left/right-dock strip and the float-widget row so both stay width-correct.
+func layText(line emu.Line, s string, col0, maxCols int, fg, bg emu.Color, attr int16) int {
+	used := 0
+	for _, r := range s {
+		g := emu.Glyph{Char: r, FG: fg, BG: bg, Mode: attr}
+		w := g.Width()
+		if used+w > maxCols {
+			break
+		}
+		if col := col0 + used; col >= 0 && col < len(line) {
+			line[col] = g
+		}
+		for k := 1; k < w; k++ { // spacer cells under a wide glyph
+			if c := col0 + used + k; c >= 0 && c < len(line) {
+				line[c] = emu.Glyph{Char: 0, FG: fg, BG: bg, Mode: attr}
+			}
+		}
+		used += w
+	}
+	return used
+}
+
 // paintStrip fills a docked widget's reserved column strip for one window row:
 // a solid style background across `size` cols starting at colStart, with the
 // row's text (if any) left-aligned into it. Used for left/right docks.
@@ -166,20 +195,14 @@ func (b *textBox) paintStrip(winRow, colStart, size int, line emu.Line) {
 		}
 		return
 	}
-	var runes []rune
+	used := 0
 	if winRow >= 0 && winRow < len(b.lines) {
-		runes = []rune(b.lines[winRow])
+		used = layText(line, b.lines[winRow], colStart, size, b.fg, b.bg, b.attr)
 	}
-	for x := 0; x < size; x++ {
-		col := colStart + x
-		if col < 0 || col >= len(line) {
-			continue
+	for x := used; x < size; x++ { // style-fill the strip's remaining columns
+		if col := colStart + x; col >= 0 && col < len(line) {
+			line[col] = emu.Glyph{Char: ' ', FG: b.fg, BG: b.bg, Mode: b.attr}
 		}
-		g := emu.Glyph{Char: ' ', FG: b.fg, BG: b.bg, Mode: b.attr}
-		if x < len(runes) {
-			g.Char = runes[x]
-		}
-		line[col] = g
 	}
 }
 
@@ -204,11 +227,7 @@ func (b *textBox) paintRow(row, cols int, line emu.Line) {
 	if i < 0 || i >= len(b.lines) {
 		return
 	}
-	col := b.col
-	for _, r := range b.lines[i] {
-		if col >= 0 && col < cols && col < len(line) {
-			line[col] = emu.Glyph{Char: r, FG: b.fg, BG: b.bg, Mode: b.attr}
-		}
-		col++
+	if maxCols := cols - b.col; maxCols > 0 {
+		layText(line, b.lines[i], b.col, maxCols, b.fg, b.bg, b.attr)
 	}
 }

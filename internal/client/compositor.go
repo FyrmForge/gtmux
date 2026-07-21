@@ -1007,8 +1007,16 @@ func (c *compositor) redraw() []byte {
 }
 
 // emit turns the given dirty rows into ANSI bytes and repositions the cursor.
+//
+// The frame is bracketed twice over: DECSET 2026 (synchronized update) so a
+// terminal that supports it swaps the whole frame at once, and ?25l/?25h so
+// one that doesn't still never shows the cursor tracking the write head
+// mid-paint. Without the latter a large repaint (a vim scroll dirties the
+// whole scroll region) flickers a stray cursor across the rows being drawn.
 func (c *compositor) emit(dirty map[int]bool) []byte {
 	var b strings.Builder
+	b.WriteString("\x1b[?2026h\x1b[?25l")
+
 	for row := range dirty {
 		if row < 0 || row >= c.totalRows() {
 			continue
@@ -1019,10 +1027,9 @@ func (c *compositor) emit(dirty map[int]bool) []byte {
 
 	if row, col, visible := c.activeCursor(); visible {
 		fmt.Fprintf(&b, "\x1b[%d;%dH\x1b[?25h", row+1, col+1)
-	} else {
-		b.WriteString("\x1b[?25l")
 	}
 
+	b.WriteString("\x1b[?2026l")
 	return []byte(b.String())
 }
 
@@ -1502,8 +1509,10 @@ func (c *compositor) buildCopyRow(pr proto.PaneRect, localRow int, line emu.Line
 		switch {
 		case bufY == cm.cy && x == cm.cx:
 			g.FG, g.BG = c.cfg.CopyCursorFG, c.cfg.CopyCursorBG
+			g.Mode &^= emu.AttrReverse // forced colors win; don't let the cell re-swap them
 		case cm.selecting && cm.inSelection(bufY, x):
 			g.FG, g.BG = c.cfg.CopySelectionFG, c.cfg.CopySelectionBG
+			g.Mode &^= emu.AttrReverse
 		}
 		line[col] = g
 	}
@@ -1831,9 +1840,16 @@ func (c *compositor) mouseAction(me proto.MouseEvent) mouseResult {
 	if !ok {
 		return mouseResult{}
 	}
-	// A pane whose app tracks the mouse gets the event forwarded verbatim.
+	// A pane whose app tracks the mouse gets the event forwarded verbatim — but
+	// a left-press on an unfocused one still focuses it first (like tmux), then
+	// forwards. Without this, clicking into a mouse-tracking pane (nvim, less,
+	// Claude Code) sent the click to the app but never switched panes.
 	if target.WantsMouse {
-		return mouseResult{forward: true}
+		mr := mouseResult{forward: true}
+		if isLeft && me.Press && !isMotion && !target.Active {
+			mr.actions = [][]string{{"select-pane", "-t", fmt.Sprintf("%%%d", target.ID)}}
+		}
+		return mr
 	}
 
 	// Non-tracking pane — the client owns the gesture.

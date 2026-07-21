@@ -799,17 +799,22 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 		}
 	}
 
-	// finishStop closes a window actor's inbox so run() exits after draining queued
-	// events, discarding renderCh meanwhile so a final render can't deadlock the
-	// wait. After it returns the actor touches no pane state, so the window's panes
-	// are safe to Close (both applyOutput and p.Close touch p.pipeW). Renders are
-	// discarded, not handled: mid-session that dodges reading the mid-adjustment
-	// `active`, and a dropped render self-heals (a fullSync on window switch, or the
-	// next output chunk). Late reader events for a stopped actor are guarded by
-	// wa.stopped in the ptyOutput handler.
+	// finishStop ends a window actor's run() so it touches no more pane state,
+	// discarding renderCh meanwhile so a final render can't deadlock the wait.
+	// After it returns the window's panes are safe to Close (both applyOutput and
+	// p.Close touch p.pipeW). Renders are discarded, not handled: mid-session that
+	// dodges reading the mid-adjustment `active`, and a dropped render self-heals
+	// (a fullSync on window switch, or the next output chunk).
+	//
+	// It enqueues stopMsg rather than close(wa.events): a pane reader goroutine
+	// sends outputMsg straight to origin.events (watchPane), and a straggler read
+	// after a close would panic on a closed channel — fatal to the whole server.
+	// FIFO drains everything already queued first; late reader sends land unread
+	// in the buffer. Session-goroutine ptyOutput stragglers are still guarded by
+	// wa.stopped in the handler below.
 	finishStop := func(wa *windowActor) {
 		wa.stopped = true // late reader events (exit) must skip this actor now
-		close(wa.events)
+		wa.events <- stopMsg{}
 		for {
 			select {
 			case <-wa.done:
@@ -1326,9 +1331,9 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 		send(fullSync())
 	}
 
-	openPicker := func(title, verb string, filter bool, items, targets []string, previews [][]emu.Line) {
+	openPicker := func(title, verb string, filter bool, items, targets []string, previews [][]emu.Line, sel int) {
 		sendTo(actingEpoch, &proto.ServerMsg{OpenPicker: &proto.OpenPicker{
-			Title: title, Verb: verb, Items: items, Targets: targets, Filter: filter, Previews: previews,
+			Title: title, Verb: verb, Items: items, Targets: targets, Filter: filter, Previews: previews, Sel: sel,
 		}})
 	}
 
@@ -1354,14 +1359,16 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 		names := reg.names()
 		items := make([]string, len(names))
 		previews := make([][]emu.Line, len(names))
+		sel := 0
 		for i, n := range names {
 			items[i] = n
 			if n == s.name {
 				items[i] += " (attached)"
+				sel = i // open on the attached session, not the top of the list
 			}
 			previews[i] = sessionPreview(n)
 		}
-		openPicker("choose session", "switch-session", false, items, names, previews)
+		openPicker("choose session", "switch-session", false, items, names, previews, sel)
 	}
 
 	// chooseTree opens a filterable session→window tree picker: each session is
@@ -1424,7 +1431,7 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 				}
 			}
 		}
-		openPicker("choose tree", "run", true, items, targets, previews)
+		openPicker("choose tree", "run", true, items, targets, previews, 0) // ponytail: header/window rows + filter make preselect fiddly; top is fine
 	}
 
 	// gatherClients enumerates every client across all sessions (self read
@@ -1464,7 +1471,7 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 			// the client tokenizer.
 			targets[i] = fmt.Sprintf("detach-client -t 'client-%d@%s'", ci.epoch, ci.session)
 		}
-		openPicker("choose client", "run", true, items, targets, nil)
+		openPicker("choose client", "run", true, items, targets, nil, 0)
 	}
 
 	// chooseBuffer opens a picker of the paste buffers; selecting one pastes it
@@ -1486,7 +1493,7 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 			// as one arg.
 			targets[i] = "paste-buffer -b '" + b.name + "'"
 		}
-		openPicker("choose buffer", "run", false, items, targets, nil)
+		openPicker("choose buffer", "run", false, items, targets, nil, 0)
 	}
 
 	// breakPane moves the active pane out into its own new window (prefix+!).
@@ -1625,7 +1632,7 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 		// window's here would paint it over the foreground. A background
 		// window's fresh WantsMouse arrives when it's switched to (switchToWindow
 		// re-pushes Layout).
-		if (rm.mouseMode || rm.keyMode) && w == activeWindow().window {
+		if rm.modeFlip && w == activeWindow().window {
 			sendLayout(w.actor)
 		}
 		// allow-passthrough: forward the un-doubled DCS payload raw to this
@@ -3015,7 +3022,16 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 		case "paste", "paste-buffer":
 			name, _ := bufFlag(args)
 			if b, ok := findBuffer(name); ok {
-				activeWindow().active.pty.Write([]byte(b.data))
+				// Wrap in bracketed-paste markers when the app asked for them,
+				// so embedded newlines insert instead of executing each line.
+				// An app that didn't must never see the markers — it would
+				// print them literally.
+				p := activeWindow().active
+				if p.wantsPaste() {
+					p.pty.Write([]byte("\x1b[200~" + b.data + "\x1b[201~"))
+				} else {
+					p.pty.Write([]byte(b.data))
+				}
 			}
 		case "set-buffer":
 			// set-buffer [-a] [-b name] data — -a appends to the named (or newest)
@@ -3369,7 +3385,7 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 		// A display-popup grabs its owner's input while open (its process reads
 		// it), exactly like a foreground app in the pane would.
 		if p := popups[epoch]; p != nil {
-			p.pty.Write(data)
+			p.pty.Write(p.filterPaste(data))
 			return
 		}
 		wa := activeWindow()
@@ -3385,11 +3401,11 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 			var panes []*pane
 			actorDo(wa, func() { panes = append(panes, wa.panes...) })
 			for _, p := range panes {
-				p.pty.Write(data)
+				p.pty.Write(p.filterPaste(data)) // per pane: 2004 state can differ
 			}
 			return
 		}
-		wa.active.pty.Write(data)
+		wa.active.pty.Write(wa.active.filterPaste(data))
 	}
 
 	// Drives the status bar's clock/git-branch fields, which change on their

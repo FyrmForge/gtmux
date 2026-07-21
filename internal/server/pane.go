@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -341,6 +342,30 @@ func (p *pane) cursorVisible() bool {
 // layout-geometry tests can build panes without a term.
 func (p *pane) wantsMouse() bool {
 	return p.term != nil && p.term.Mode()&emu.ModeMouseMask != 0
+}
+
+// wantsPaste reports whether the pane's app has enabled bracketed paste
+// (DECSET 2004). Owned here in the emulator — the client can't know it (it sees
+// rendered glyphs, not the app's output stream). Nil-safe, same as wantsMouse.
+func (p *pane) wantsPaste() bool {
+	return p.term != nil && p.term.Mode()&emu.ModeBracketedPaste != 0
+}
+
+// filterPaste strips bracketed-paste markers from client input when the pane's
+// app hasn't enabled 2004 — it would otherwise get literal "200~"/"201~" text
+// (garbling a sudo password prompt, printing junk in a plain shell). When the
+// app HAS enabled 2004 the markers pass through so it can tell a paste from
+// typing. This is the server-side gate: the client forwards markers
+// unconditionally, and the live 2004 state lives here, so the decision stays
+// where the state is instead of being pushed to the client.
+// ponytail: only rewrites when data carries ESC (keystrokes almost never do)
+// and 2004 is off; both true only during an actual paste into a non-2004 app.
+func (p *pane) filterPaste(data []byte) []byte {
+	if bytes.IndexByte(data, 0x1b) < 0 || p.wantsPaste() {
+		return data
+	}
+	data = bytes.ReplaceAll(data, []byte("\x1b[200~"), nil)
+	return bytes.ReplaceAll(data, []byte("\x1b[201~"), nil)
 }
 
 // keyFlags reports the pane app's kitty-keyboard progressive-enhancement flags

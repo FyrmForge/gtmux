@@ -237,7 +237,7 @@ type picker struct {
 }
 
 func newPicker(m *proto.OpenPicker) *picker {
-	return &picker{title: m.Title, verb: m.Verb, items: m.Items, targets: m.Targets, filterable: m.Filter, previews: m.Previews}
+	return &picker{title: m.Title, verb: m.Verb, items: m.Items, targets: m.Targets, filterable: m.Filter, previews: m.Previews, sel: m.Sel}
 }
 
 // view returns the original indices of the items matching the current filter

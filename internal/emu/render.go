@@ -41,6 +41,9 @@ func sgr(g Glyph) string {
 	if g.Mode&AttrBold != 0 {
 		b.WriteString(";1")
 	}
+	if g.Mode&AttrDim != 0 {
+		b.WriteString(";2")
+	}
 	if g.Mode&AttrItalic != 0 {
 		b.WriteString(";3")
 	}
@@ -50,11 +53,9 @@ func sgr(g Glyph) string {
 	if g.Mode&AttrBlink != 0 {
 		b.WriteString(";5")
 	}
-	// Deliberately not re-emitting ";7" (reverse video) here: emu's setChar
-	// already bakes reverse video into FG/BG at write time (swaps them and
-	// stores the swapped colors), but leaves the AttrReverse bit set on the
-	// cell. Re-sending ";7" would make the real terminal swap a second time,
-	// undoing it.
+	if g.Mode&AttrReverse != 0 {
+		b.WriteString(";7")
+	}
 	if g.Mode&AttrStrikethrough != 0 {
 		b.WriteString(";9")
 	}

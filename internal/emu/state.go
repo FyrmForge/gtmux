@@ -26,6 +26,7 @@ const (
 	attrBlank
 	attrTransparent
 	attrOpaque
+	attrDim
 )
 
 // State represents the terminal emulation state. Use Lock/Unlock
@@ -259,13 +260,15 @@ func (t *State) setChar(c rune, attr *Glyph, x, y int) {
 			t.screen[y][i].Char = ' '
 		}
 		//if t.options.BrightBold && attr.Mode&attrBold != 0 && attr.FG < 8 {
-		if attr.Mode&attrBold != 0 && attr.FG < 8 {
+		// bold+faint together must not brighten — faint wins on intensity.
+		if attr.Mode&attrBold != 0 && attr.Mode&attrDim == 0 && attr.FG < 8 {
 			t.screen[y][i].FG = attr.FG + 8
 		}
-		if attr.Mode&attrReverse != 0 {
-			t.screen[y][i].FG = attr.BG
-			t.screen[y][i].BG = attr.FG
-		}
+		// Reverse video is NOT baked into FG/BG here — the attrReverse bit on
+		// the cell is the single source of truth and render.go emits ";7" so
+		// the real terminal does the swap. Baking it in silently dropped the
+		// highlight whenever both colors were default (swapping two Default()
+		// colors yields two Default() colors, which serialize to nothing).
 	}
 }
 
@@ -757,12 +760,14 @@ func (t *State) setAttr(attr []int, subArgs [][]int) {
 		a := attr[i]
 		switch a {
 		case 0:
-			t.cur.Attr.Mode &^= attrReverse | attrStrikethrough | attrBold | attrItalic | attrBlink
+			t.cur.Attr.Mode &^= attrReverse | attrStrikethrough | attrBold | attrItalic | attrBlink | attrDim
 			t.cur.Attr.FG = DefaultFG
 			t.cur.Attr.BG = DefaultBG
 			t.cur.Attr.Underline = UnderlineStyle{}
 		case 1:
 			t.cur.Attr.Mode |= attrBold
+		case 2: // faint / dim
+			t.cur.Attr.Mode |= attrDim
 		case 3:
 			t.cur.Attr.Mode |= attrItalic
 		case 4:
@@ -782,8 +787,8 @@ func (t *State) setAttr(attr []int, subArgs [][]int) {
 			t.cur.Attr.Mode |= attrStrikethrough
 		case 21:
 			t.cur.Attr.Underline.Mode = UnderlineDouble
-		case 22:
-			t.cur.Attr.Mode &^= attrBold
+		case 22: // "normal intensity" clears bold AND faint
+			t.cur.Attr.Mode &^= attrBold | attrDim
 		case 23:
 			t.cur.Attr.Mode &^= attrItalic
 		case 24:
