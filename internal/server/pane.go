@@ -93,6 +93,11 @@ type pane struct {
 	rect   rect
 	marked bool // tagged by prefix+m as the join-pane source
 	dead   bool // remain-on-exit: process exited but the pane is kept in the layout
+	// activePoint is a monotonic stamp set each time the pane becomes active
+	// (setActive), mirroring tmux's active_point. Directional nav (adjacent)
+	// breaks a tie between multiple neighbors by picking the highest — the
+	// most-recently-active — so left-then-right returns to where you came from.
+	activePoint int64
 	gen    int  // bumped on respawn; tags PTY-reader events so a stale reader's
 	// output/exit (from the pre-respawn process) is dropped, not applied.
 	// origin is the actor this pane's reader posts to (its birth window). It never
@@ -281,6 +286,9 @@ func (p *pane) currentCommand() string {
 
 func (p *pane) resize(r rect) {
 	p.rect = r
+	if p.pty == nil || p.term == nil { // layout-geometry tests build paneless-of-pty windows
+		return
+	}
 	pty.Setsize(p.pty, &pty.Winsize{Rows: uint16(r.Rows), Cols: uint16(r.Cols)})
 	p.term.Resize(geom.Vec2{R: r.Rows, C: r.Cols})
 }

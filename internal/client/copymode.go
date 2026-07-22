@@ -546,7 +546,11 @@ func (cm *copyMode) dispatch(b byte) copyResult {
 	case '0':
 		cm.cx = 0
 	case '$':
-		cm.cx = len(cm.lines[cm.cy]) - 1
+		// End of line is the last NON-BLANK cell, not the grid width: a terminal
+		// line is space-padded to the pane width, so len(line)-1 parked the cursor
+		// far right in the padding and a visual selection swept up a tail of
+		// spaces. lineRunes already trims that padding (it's what the yank uses).
+		cm.cx = len(lineRunes(cm.lines[cm.cy])) - 1
 		if cm.cx < 0 {
 			cm.cx = 0
 		}

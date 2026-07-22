@@ -1267,11 +1267,13 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 				wasZoomed = true
 				w.unzoom()
 				if adj := w.adjacent(dir); adj != nil {
-					w.lastActive, w.active = w.active, adj
+					w.lastActive = w.active
+					w.setActive(adj)
 				}
 			} else if adj := w.adjacent(dir); adj != nil {
 				moved = true
-				w.lastActive, w.active = w.active, adj
+				w.lastActive = w.active
+				w.setActive(adj)
 			}
 		})
 		if wasZoomed {
@@ -1292,7 +1294,9 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 			}
 			for _, p := range w.panes {
 				if p == w.lastActive {
-					w.lastActive, w.active = w.active, w.lastActive
+					prev := w.active
+					w.setActive(w.lastActive)
+					w.lastActive = prev
 					swapped = true
 					return
 				}
@@ -2589,7 +2593,8 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 			if targeted {
 				active = twi
 				if tp != tw.active {
-					tw.lastActive, tw.active = tw.active, tp
+					tw.lastActive = tw.active
+					tw.setActive(tp)
 				}
 			}
 			if hasDir {

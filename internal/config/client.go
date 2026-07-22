@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -51,9 +52,9 @@ type ClientConfig struct {
 	WindowStatusFG, WindowStatusBG emu.Color
 	WindowStatusAttr               int16
 	WindowStatusStyleSet           bool
-	StatusLeftLength   int   // status-left-length: max cells for status-left (0 = unlimited)
-	StatusRightLength  int   // status-right-length: max cells for status-right (0 = unlimited)
-	StatusLines        int   // tmux `status` 1..5: number of status rows (the client reserves them)
+	StatusLeftLength               int // status-left-length: max cells for status-left (0 = unlimited)
+	StatusRightLength              int // status-right-length: max cells for status-right (0 = unlimited)
+	StatusLines                    int // tmux `status` 1..5: number of status rows (the client reserves them)
 	// ExtraStatusFormats are the formats for status lines 2..5 (index 0 = line 2),
 	// each expanded and drawn full-width. status-format[0] (line 1) is the normal
 	// bar (status-left + window list + status-right); these are the extra lines.
@@ -67,13 +68,13 @@ type ClientConfig struct {
 	// Copy-mode mouse behavior. In tmux these are copy-mode-vi keybinds
 	// (WheelUp/Down `send -N<n> -X scroll`, MouseDragEnd `copy-selection-and-cancel`);
 	// gtmux has no copy-mode keytable, so they're options.
-	CopyWheelLines  int  // lines scrolled per wheel notch in copy-mode (default 3)
-	CopyDragFinish  bool // release after a drag yanks + exits (tmux default true); false = selection persists (tmux's `unbind MouseDragEnd1Pane`)
-	WordSeparators     string // tmux word-separators: chars (besides whitespace) that bound copy-mode w/b/e words
-	LockPassword       string // lock overlay: typed password to unlock; "" = any key dismisses
-	RepeatTime         int    // tmux repeat-time: bare-key repeat window after a -r bind, ms
-	SetTitles          bool   // tmux set-titles: emit OSC 0/2 to set the outer terminal's title
-	SetTitlesString    string // format for the outer-terminal title when SetTitles is on
+	CopyWheelLines  int    // lines scrolled per wheel notch in copy-mode (default 3)
+	CopyDragFinish  bool   // release after a drag yanks + exits (tmux default true); false = selection persists (tmux's `unbind MouseDragEnd1Pane`)
+	WordSeparators  string // tmux word-separators: chars (besides whitespace) that bound copy-mode w/b/e words
+	LockPassword    string // lock overlay: typed password to unlock; "" = any key dismisses
+	RepeatTime      int    // tmux repeat-time: bare-key repeat window after a -r bind, ms
+	SetTitles       bool   // tmux set-titles: emit OSC 0/2 to set the outer terminal's title
+	SetTitlesString string // format for the outer-terminal title when SetTitles is on
 	// Status-bar layout (tmux status-position / status-justify) and the
 	// per-window-entry formats (window-status-format / -current-format, joined
 	// by window-status-separator). The entry formats are expanded client-side
@@ -202,10 +203,10 @@ func DefaultClientConfig() ClientConfig {
 		StatusInterval: 15,
 		StatusLines:    1,
 		ModeKeys:       "vi",
-		StatusKeys:     "emacs",    // tmux default
-		SetClipboard:   "external", // tmux default
-		CopyWheelLines: 3,          // tmux copy-mode default
-		CopyDragFinish: true,       // tmux default: drag-release yanks + cancels
+		StatusKeys:     "emacs",                                // tmux default
+		SetClipboard:   "external",                             // tmux default
+		CopyWheelLines: 3,                                      // tmux copy-mode default
+		CopyDragFinish: true,                                   // tmux default: drag-release yanks + cancels
 		WordSeparators: "!\"#$%&'()*+,-./:;<=>?@[\\]^\x60{|}~", // tmux default: all ASCII punctuation
 
 		RepeatTime:      500,
@@ -350,6 +351,14 @@ func applyOption(cfg *ClientConfig, binds *ClientBinds, name, value string) bool
 		cfg.LockPassword = value
 	case "status_style":
 		applyStyle(value, &cfg.StatusFG, &cfg.StatusBG, &cfg.StatusAttr)
+	// Direct fg/bg for the status bar, matching the active_window_fg/bg pairs.
+	// Without these, `gtmux.options.status_fg = "white"` parsed fine but was
+	// silently dropped (only the combined status_style was recognized), so the
+	// bar kept its default colors with no error.
+	case "status_fg":
+		setColor(&cfg.StatusFG)
+	case "status_bg":
+		setColor(&cfg.StatusBG)
 	case "window_status_style":
 		applyStyle(value, &cfg.WindowStatusFG, &cfg.WindowStatusBG, &cfg.WindowStatusAttr)
 		cfg.WindowStatusStyleSet = true
@@ -497,11 +506,11 @@ func ClientConfigPath() string {
 // from its own state (prompts/pickers whose data it already mirrors — so no
 // server round-trip, no type-before-prompt-opens race). Exactly one is set.
 type BindOp struct {
-	Action  []string   // send as proto.Action
-	Local   string     // "command-prompt" | "rename-window" | "rename-session" | "choose-window"
-	Table   string     // switch the client into this key table for the next key (tmux switch-client -T)
-	Modal   *ModalOpen // open a modal keyboard widget (gtmux.open{...})
-	Command string     // a raw command line the client tokenizes + dispatches (gtmux.run_command)
+	Action  []string    // send as proto.Action
+	Local   string      // "command-prompt" | "rename-window" | "rename-session" | "choose-window"
+	Table   string      // switch the client into this key table for the next key (tmux switch-client -T)
+	Modal   *ModalOpen  // open a modal keyboard widget (gtmux.open{...})
+	Command string      // a raw command line the client tokenizes + dispatches (gtmux.run_command)
 	Border  *PaneBorder // set a pane's border override color (pane:set_border)
 }
 
@@ -532,7 +541,7 @@ type ClientBinds struct {
 	Repeat    map[string]bool                      // prefix keys that repeat (tmux bind -r)
 	Tables    map[string]map[string]*lua.LFunction // custom key tables (tmux bind -T <table>)
 	Prefix    byte
-	Prefix2   byte // tmux prefix2: optional secondary prefix key; 0 = unset
+	Prefix2   byte     // tmux prefix2: optional secondary prefix key; 0 = unset
 	ops       []BindOp // accumulated by the primitives while one bind runs
 	// oBinds/oRoot are runtime overrides (tmux bind-key/unbind-key at runtime):
 	// a key present here shadows the Lua bind — non-nil ops run instead, nil ops
@@ -572,9 +581,9 @@ type AlertEvent struct {
 // call at runtime. Set by the client after LoadClient; each is nil until then.
 type WidgetHooks struct {
 	Snapshot func() *proto.StateSnapshot // gtmux.sessions/windows/panes/clients/find_panes
-	Context  func() map[string]string   // gtmux.context(): session/window/pane/prefix/width/height
-	Expand   func(string) string        // gtmux.expand()
-	Option   func(string) string        // gtmux.get_option()
+	Context  func() map[string]string    // gtmux.context(): session/window/pane/prefix/width/height
+	Expand   func(string) string         // gtmux.expand()
+	Option   func(string) string         // gtmux.get_option()
 }
 
 func (c *ClientBinds) Close() { c.l.Close() }
@@ -833,7 +842,20 @@ func (c *ClientBinds) buildUI(cv *Canvas, regions *[]Region, state *lua.LTable) 
 			if title != "" {
 				drawTitle(x, y, bw, bh, " "+title+" ", titleAt, 0, g)
 			}
-			return 0
+			// Return the box's INTERIOR as a clipped child ui, so drawing "inside
+			// the box" is the natural thing to reach for:
+			//
+			//	local inner = c:box(0, 0, c.w, c.h, "fg=cyan")
+			//	inner:text(0, 0, name)   -- can't spill onto the border
+			//
+			// Without this, text drawn at the parent's coords runs over the border
+			// cells (a long session name ate the dock's right │). Existing configs
+			// that ignore the return value behave exactly as before.
+			ix, iy, iw, ih := x+1, y+1, bw-2, bh-2
+			nx0, ny0 := max(cx0, ox+ix), max(cy0, oy+iy)
+			nx1, ny1 := min(cx1, ox+ix+iw), min(cy1, oy+iy+ih)
+			l.Push(mk(ox+ix, oy+iy, iw, ih, nx0, ny0, nx1, ny1))
+			return 1
 		}))
 		// ui:hline(y, style?) — separator across THIS ui's width, junction-aware.
 		L.SetField(t, "hline", L.NewFunction(func(l *lua.LState) int {
@@ -1792,8 +1814,27 @@ func LoadClientWith(path string, overrides [][2]string) (ClientConfig, *ClientBi
 	// set_option and gtmux.options.* both funnel through applyOption (the single
 	// client-option registry), so runtime set-option reaches exactly what the
 	// config file can.
+	// inUserFile gates the unknown-option warning to the user's config: the
+	// embedded default file is validated by its own tests, and warning for it
+	// would be noise the user can't act on.
+	inUserFile := false
+	// warnUnknown reports an option name applyOption didn't recognize. Without
+	// this a typo (or a server option in client.lua) was silently dropped —
+	// status_fg/status_bg went unnoticed exactly this way. Names are collected
+	// and logged once at the end so a reload emits one line, not a burst.
+	var unknown []string
+	seenUnknown := map[string]bool{}
+	noteUnknown := func(name string) {
+		if inUserFile && !seenUnknown[name] {
+			seenUnknown[name] = true
+			unknown = append(unknown, name)
+		}
+	}
 	L.SetField(tbl, "set_option", L.NewFunction(func(l *lua.LState) int {
-		applyOption(&cfg, binds, l.CheckString(1), l.CheckString(2))
+		name := l.CheckString(1)
+		if !applyOption(&cfg, binds, name, l.CheckString(2)) {
+			noteUnknown(name)
+		}
 		return 0
 	}))
 	L.SetGlobal("gtmux", tbl)
@@ -1809,6 +1850,7 @@ func LoadClientWith(path string, overrides [][2]string) (ClientConfig, *ClientBi
 	// random, which made same-field aliases flaky.
 	userOpts := L.NewTable()
 	L.SetField(tbl, "options", userOpts)
+	inUserFile = true // from here on, unknown option names are the user's to fix
 	if data, err := os.ReadFile(path); err == nil {
 		if err := L.DoString(string(data)); err != nil {
 			log.Printf("gtmux: %s: %v (ignoring, using defaults)", path, err)
@@ -1826,18 +1868,32 @@ func LoadClientWith(path string, overrides [][2]string) (ClientConfig, *ClientBi
 			}
 			switch val := v.(type) {
 			case lua.LString:
-				applyOption(&cfg, binds, string(name), string(val))
+				if !applyOption(&cfg, binds, string(name), string(val)) {
+					noteUnknown(string(name))
+				}
 			case lua.LBool:
-				applyOption(&cfg, binds, string(name), boolStr(bool(val)))
+				if !applyOption(&cfg, binds, string(name), boolStr(bool(val))) {
+					noteUnknown(string(name))
+				}
 			}
 		})
 	}
+	inUserFile = false // defaults first, and they're not the user's to fix
 	applyOpts(defOpts)
+	inUserFile = true
 	applyOpts(userOpts)
 
 	// Runtime set-option overrides, applied last so they win over the file.
+	// Not warned: a server-pushed option legitimately lands here and is a
+	// deliberate no-op on the client (see applyOverride).
+	inUserFile = false
 	for _, o := range overrides {
 		applyOption(&cfg, binds, o[0], o[1])
+	}
+	if len(unknown) > 0 {
+		sort.Strings(unknown)
+		log.Printf("gtmux: %s: unknown client option(s) %s — ignored (server options like main-pane-width belong in server.lua)",
+			path, strings.Join(unknown, ", "))
 	}
 	return cfg, binds
 }

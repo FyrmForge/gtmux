@@ -1,8 +1,27 @@
 package server
 
 import (
+	"sync/atomic"
+
 	"github.com/FyrmForge/gtmux/internal/proto"
 )
+
+// activePointSeq stamps panes as they become active (pane.activePoint), for the
+// MRU tiebreak in directional nav. Server-global (like tmux's next_active_point)
+// so a pane keeps a comparable stamp after moving between windows (join-pane).
+// Concurrent across window-actor goroutines, hence atomic.
+var activePointSeq atomic.Int64
+
+// setActive makes p the window's active pane and stamps it, so directional nav
+// can prefer the most-recently-active neighbor. THE one place w.active is set —
+// mirrors tmux's window_set_active_pane. Callers that also track lastActive set
+// it themselves before calling this (see session.go).
+func (w *window) setActive(p *pane) {
+	w.active = p
+	if p != nil {
+		p.activePoint = activePointSeq.Add(1)
+	}
+}
 
 // window is a tiled arrangement of panes (a tmux "window"). Only one window
 // per session is displayed at a time; its panes are all visible together.
@@ -27,6 +46,10 @@ type window struct {
 	actor        *windowActor      // the actor wrapping this window (set by newWindowActor); reached via pane.win.actor
 	zoomed       bool              // prefix+z: active pane fills the window, others hidden
 	layoutName   string            // last preset applied via select-layout, for next-layout cycling
+	// main-pane-width/height in effect when layoutName was applied, so a window
+	// resize can re-apply the named layout (keeping the main pane absolute)
+	// instead of scaling frozen fractions. See resize().
+	mainW, mainH int
 }
 
 func newWindow(cols, rows int, dir, command, sessionName string, env, globalEnv map[string]string) (*window, error) {
@@ -37,7 +60,7 @@ func newWindow(cols, rows int, dir, command, sessionName string, env, globalEnv 
 	}
 	w.root = &layoutNode{pane: p}
 	w.panes = []*pane{p}
-	w.active = p
+	w.setActive(p)
 	return w, nil
 }
 
@@ -188,6 +211,7 @@ func (w *window) resizePane(dir string, delta int) {
 		if node.frac > 1 {
 			node.frac = 1
 		}
+		w.layoutName = "" // hand-tuned now — a window resize should scale, not snap back
 		w.reflow()
 		return
 	}
@@ -232,6 +256,7 @@ func (w *window) resizePaneTo(width bool, spec string) {
 			frac = 1
 		}
 		node.frac = frac
+		w.layoutName = "" // hand-tuned now — a window resize should scale, not snap back
 		w.reflow()
 		return
 	}
@@ -239,6 +264,17 @@ func (w *window) resizePaneTo(width bool, spec string) {
 
 func (w *window) resize(cols, rows int) {
 	w.cols, w.rows = cols, rows
+	// A named preset (main-vertical, tiled, …) defines pane sizes relative to
+	// the window, so re-apply it at the new size rather than scaling the frozen
+	// fractions. Without this, a layout built while the session was detached —
+	// window width == main-pane-width, so the side column clamps to its 2-col
+	// minimum — stays a permanent sliver once the client attaches wider (the
+	// main-vertical-from-workspacer bug). A manual pane resize clears layoutName
+	// (resizePane), so a hand-tuned layout still scales instead of snapping back.
+	if w.layoutName != "" {
+		w.setLayout(w.layoutName, w.mainW, w.mainH)
+		return
+	}
 	w.reflow()
 }
 
@@ -269,7 +305,7 @@ func (w *window) split(dir splitDir, command, dirPath string) error {
 	node.b = &layoutNode{pane: newPane}
 
 	w.panes = append(w.panes, newPane)
-	w.active = newPane
+	w.setActive(newPane)
 	w.reflow()
 	return nil
 }
@@ -317,7 +353,7 @@ func (w *window) closePane(p *pane) bool {
 	}
 
 	if w.active == p {
-		w.active = w.panes[0]
+		w.setActive(w.panes[0])
 	}
 	w.reflow()
 	return true
@@ -360,7 +396,7 @@ func adoptWindow(p *pane, cols, rows int, sessionName string) *window {
 	w := &window{sessionName: sessionName, cols: cols, rows: rows}
 	w.root = &layoutNode{pane: p}
 	w.panes = []*pane{p}
-	w.active = p
+	w.setActive(p)
 	p.win = w
 	return w
 }
@@ -381,7 +417,7 @@ func (w *window) joinPaneAt(p, at *pane, dir splitDir) {
 	node.a = &layoutNode{pane: at}
 	node.b = &layoutNode{pane: p}
 	w.panes = append(w.panes, p)
-	w.active = p
+	w.setActive(p)
 	p.win = w
 	w.reflow()
 }
@@ -391,30 +427,28 @@ func (w *window) joinPaneAt(p, at *pane, dir splitDir) {
 func (w *window) adjacent(dir string) *pane {
 	a := w.active.rect
 	var best *pane
-	bestOverlap := -1
 	for _, p := range w.panes {
 		if p == w.active {
 			continue
 		}
 		r := p.rect
 		var match bool
-		var overlap int
 		switch dir {
 		case "right":
 			match = r.Col == a.Col+a.Cols+1 && r.rowsOverlap(a)
-			overlap = min(r.Row+r.Rows, a.Row+a.Rows) - max(r.Row, a.Row)
 		case "left":
 			match = a.Col == r.Col+r.Cols+1 && r.rowsOverlap(a)
-			overlap = min(r.Row+r.Rows, a.Row+a.Rows) - max(r.Row, a.Row)
 		case "down":
 			match = r.Row == a.Row+a.Rows+1 && r.colsOverlap(a)
-			overlap = min(r.Col+r.Cols, a.Col+a.Cols) - max(r.Col, a.Col)
 		case "up":
 			match = a.Row == r.Row+r.Rows+1 && r.colsOverlap(a)
-			overlap = min(r.Col+r.Cols, a.Col+a.Cols) - max(r.Col, a.Col)
 		}
-		if match && overlap > bestOverlap {
-			best, bestOverlap = p, overlap
+		// Among the panes touching the moving edge (and overlapping the active
+		// pane's span), pick the most-recently-active — highest activePoint. This
+		// is tmux's window_pane_choose_best: navigate left then right returns to
+		// the pane you came from, not whichever neighbor happens to be biggest.
+		if match && (best == nil || p.activePoint > best.activePoint) {
+			best = p
 		}
 	}
 	return best
@@ -501,6 +535,7 @@ func (w *window) setLayout(name string, mainW, mainH int) {
 		return
 	}
 	w.layoutName = name
+	w.mainW, w.mainH = mainW, mainH // remembered so resize() can re-apply this preset
 	w.reflow()
 }
 

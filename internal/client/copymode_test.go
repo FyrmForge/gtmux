@@ -186,3 +186,34 @@ func TestCopyModeWordSeparators(t *testing.T) {
 		t.Fatalf("no separators: w landed at cx=%d, want 11 (gamma)", noSep.cx)
 	}
 }
+
+// `$` (and emacs C-e) must land on the last NON-BLANK cell. A terminal line is
+// space-padded to the pane width, so using len(line)-1 parked the cursor far
+// right in the padding — a visual selection to end-of-line then swept up a long
+// tail of spaces instead of stopping at the real last character.
+func TestCopyModeDollarStopsAtLastNonBlank(t *testing.T) {
+	padded := make(emu.Line, 40)
+	for i, r := range []rune("hello") {
+		padded[i] = emu.Glyph{Char: r}
+	} // 5..39 are blank padding
+	cm := &copyMode{rows: 10, lines: []emu.Line{padded}}
+	cm.cy, cm.cx = 0, 0
+	cm.feed([]byte("$"))
+	if cm.cx != 4 {
+		t.Fatalf("$ cx = %d, want 4 (the 'o' of hello, not the padded width)", cm.cx)
+	}
+
+	// A selection to end-of-line yanks just the text, no trailing spaces.
+	cm.cy, cm.cx = 0, 0
+	cm.feed([]byte("v$"))
+	if got := cm.selectedText(); got != "hello" {
+		t.Fatalf("v$ selected %q, want %q", got, "hello")
+	}
+
+	// An all-blank line clamps to 0 rather than going negative.
+	blank := &copyMode{rows: 10, lines: []emu.Line{make(emu.Line, 20)}}
+	blank.feed([]byte("$"))
+	if blank.cx != 0 {
+		t.Fatalf("$ on a blank line cx = %d, want 0", blank.cx)
+	}
+}

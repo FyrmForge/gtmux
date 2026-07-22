@@ -910,7 +910,12 @@ func (c *compositor) apply(msg *proto.ServerMsg) []byte {
 				if d.dock == "top" || d.dock == "bottom" {
 					d.w, d.h = c.cols(), d.size
 				} else {
-					d.w, d.h = d.size, c.layout.Rows
+					// Left/right docks span the whole strip, INCLUDING the two rows
+					// the framed outer border occupies — the frame wraps the window's
+					// panes, not the client chrome beside them. Sizing the dock to
+					// layout.Rows alone left its box two rows short of the frame, so
+					// its bottom border sat one row high (visibly misaligned).
+					d.w, d.h = d.size, c.layout.Rows+2*c.frameInset()
 				}
 				d.reexpand(c.expander, msg.Status.Vars, msg.Status.ServerShell)
 			}
@@ -1114,37 +1119,19 @@ func (c *compositor) buildRow(row int) emu.Line {
 		return c.composeContentRow(line, row)
 	}
 
-	var activeRect, markedRect *proto.PaneRect
-	for i := range c.layout.Panes {
-		if c.layout.Panes[i].Active {
-			activeRect = &c.layout.Panes[i]
-		}
-		if c.layout.Panes[i].Marked {
-			markedRect = &c.layout.Panes[i]
-		}
-	}
 	// Border color is decided per cell, not per divider: a cell lights active
 	// (or marked) only where it lies on that pane's outline ring, so a long
 	// divider shared by several stacked panes highlights just the active pane's
 	// own edge instead of its full length.
 	// Inactive dividers use pane-border-style (fg/bg/attr); the active/marked
 	// pane's own ring cells override with their fg-only color.
+	// twoPanes: tmux's pane-border-indicators=colour lights only HALF the shared
+	// divider when a window has exactly two panes, so you can tell which is
+	// active (a full-length divider is ambiguous between the two). See
+	// onActiveBorder.
 	borderGlyph := func(char rune, col int) emu.Glyph {
-		g := emu.Glyph{Char: char, FG: c.cfg.InactiveBorderFG, BG: c.cfg.InactiveBorderBG, Mode: c.cfg.InactiveBorderAttr}
-		if activeRect != nil && onPaneRing(*activeRect, col, row) {
-			g.FG, g.BG, g.Mode = c.cfg.ActiveBorderFG, emu.DefaultBG, 0
-		}
-		if markedRect != nil && onPaneRing(*markedRect, col, row) {
-			g.FG, g.BG, g.Mode = c.cfg.MarkedBorderFG, emu.DefaultBG, 0
-		}
-		// pane:set_border override (e.g. command-exited flagging a pane): paint
-		// this cell in the override color if it lies on that pane's ring.
-		for id, col2 := range c.paneBorderColor {
-			if pr, ok := c.rectFor(id); ok && onPaneRing(pr, col, row) {
-				g.FG, g.BG, g.Mode = col2, emu.DefaultBG, 0
-			}
-		}
-		return g
+		fg, bg, mode := c.borderStyleAt(col, row)
+		return emu.Glyph{Char: char, FG: fg, BG: bg, Mode: mode}
 	}
 	joined := c.borderRunes != nil // joined/framed: use precomputed junction glyphs
 	for _, bd := range c.layout.Borders {
@@ -1292,10 +1279,14 @@ func (c *compositor) composeContentRow(content emu.Line, winRow int) emu.Line {
 		return content
 	}
 	phys := make(emu.Line, c.cols())
+	// Dock rows are offset by the frame inset: dock row 0 is the frame's TOP row,
+	// so the dock's own box lines up with the framed border (see the sizing in
+	// apply). With no frame this is a no-op.
+	dockRow := winRow + frame
 	colStart := 0
 	for _, d := range c.docks {
 		if d.dock == "left" {
-			d.paintStrip(winRow, colStart, d.size, phys)
+			d.paintStrip(dockRow, colStart, d.size, phys)
 			colStart += d.size
 		}
 	}
@@ -1308,18 +1299,19 @@ func (c *compositor) composeContentRow(content emu.Line, winRow int) emu.Line {
 	// framed: the left and right outer-frame columns bracket the content on every
 	// window row (│, or ├/┤ where an interior horizontal divider meets the frame).
 	if frame > 0 && c.layout != nil && winRow >= 0 && winRow < c.layout.Rows {
-		fg, bg, attr := c.cfg.InactiveBorderFG, c.cfg.InactiveBorderBG, c.cfg.InactiveBorderAttr
 		if l := coff - 1; l >= 0 && l < len(phys) {
+			fg, bg, attr := c.borderStyleAt(-1, winRow) // frame col in content coords
 			phys[l] = emu.Glyph{Char: c.borderRuneAt(winRow, -1, '│'), FG: fg, BG: bg, Mode: attr}
 		}
 		if r := coff + c.contentCols(); r >= 0 && r < len(phys) {
+			fg, bg, attr := c.borderStyleAt(c.contentCols(), winRow)
 			phys[r] = emu.Glyph{Char: c.borderRuneAt(winRow, c.contentCols(), '│'), FG: fg, BG: bg, Mode: attr}
 		}
 	}
 	colStart = c.cols() - right
 	for _, d := range c.docks {
 		if d.dock == "right" {
-			d.paintStrip(winRow, colStart, d.size, phys)
+			d.paintStrip(dockRow, colStart, d.size, phys)
 			colStart += d.size
 		}
 	}
@@ -1343,18 +1335,37 @@ func (c *compositor) buildFrameRow(top bool) emu.Line {
 	for i := range line {
 		line[i] = c.fillGlyph()
 	}
-	fg, bg, attr := c.cfg.InactiveBorderFG, c.cfg.InactiveBorderBG, c.cfg.InactiveBorderAttr
 	coff := c.contentColOffset()
 	rc := -1 // content-row coord of the top frame
 	if !top {
 		rc = c.layout.Rows
 	}
+	// Docks span the full client height, so their strips must cover the frame
+	// rows too — otherwise those cells fall through to the dot-fill above and a
+	// left/right dock shows a row of dots level with the frame. Out-of-range
+	// winRow makes paintStrip style-fill, continuing the dock's background.
+	colStart := 0
+	for _, d := range c.docks {
+		if d.dock == "left" {
+			d.paintStrip(rc+c.frameInset(), colStart, d.size, line)
+			colStart += d.size
+		}
+	}
+	colStart = c.cols() - c.rightInset()
+	for _, d := range c.docks {
+		if d.dock == "right" {
+			d.paintStrip(rc+c.frameInset(), colStart, d.size, line)
+			colStart += d.size
+		}
+	}
 	for cc := -1; cc <= c.contentCols(); cc++ {
 		if phys := coff + cc; phys >= 0 && phys < len(line) {
+			fg, bg, attr := c.borderStyleAt(cc, rc)
 			line[phys] = emu.Glyph{Char: c.borderRuneAt(rc, cc, '─'), FG: fg, BG: bg, Mode: attr}
 		}
 	}
-	c.drawFrameTitle(line, top, coff, emu.Glyph{FG: fg, BG: bg, Mode: attr})
+	tfg, tbg, tattr := c.cfg.InactiveBorderFG, c.cfg.InactiveBorderBG, c.cfg.InactiveBorderAttr
+	c.drawFrameTitle(line, top, coff, emu.Glyph{FG: tfg, BG: tbg, Mode: tattr})
 	return line
 }
 
@@ -1947,13 +1958,47 @@ func (c *compositor) copyMouse(me proto.MouseEvent) ([]byte, copyResult) {
 // reload swaps in a freshly-loaded client config (source-file) and repaints.
 // The caller holds compMu. Status formats (stLeft/stRight) refresh on the next
 // server status tick; colors/borders take effect on this redraw.
-func (c *compositor) reload(cfg config.ClientConfig) []byte {
+//
+// binds is the VM the new config's widget fns live in (curBinds() after the
+// swap); nil keeps the existing widgets, for callers that only changed options.
+func (c *compositor) reload(cfg config.ClientConfig, binds *config.ClientBinds) []byte {
 	c.cfg = cfg
 	c.rebuildBorders() // pane_borders may have changed
+	if binds != nil {
+		// Widgets are built from the config, so a reload has to rebuild them —
+		// otherwise a re-sourced config keeps the OLD status bar (its fg/bg and
+		// format are captured per widget at build time), and added/removed
+		// widgets are ignored. Mirrors the build at attach (client.go).
+		c.rebuildWidgets(binds)
+	}
 	// ponytail: no extended-keys renegotiation here — every path that changes the
 	// option produces a Layout that reconciles; a source-file with no following
 	// output self-heals on the next Layout event. Add back if that ever bites.
 	return c.redraw()
+}
+
+// rebuildWidgets recreates the status/dock/float widgets from c.cfg.Widgets,
+// dropping the previous set. Shared by attach-time setup and reload.
+func (c *compositor) rebuildWidgets(binds *config.ClientBinds) {
+	c.statusWidget, c.docks, c.overlays = nil, nil, nil
+	for _, w := range c.cfg.Widgets {
+		b := &textBox{
+			row: w.Row, col: w.Col, format: w.Text,
+			lines: strings.Split(w.Text, "\n"), // shown until the first refresh re-expands
+			fg:    w.FG, bg: w.BG, attr: w.Attr,
+			dock: w.Dock, size: w.Size,
+			textFn: w.TextFn, drawFn: w.Draw, component: w.Component, onClick: w.OnClick, binds: binds, interval: w.Interval,
+			w: w.Width, h: w.Height, // float draw size; docks override w/h per tick
+		}
+		switch w.Dock {
+		case "status":
+			c.statusWidget = b // owns the status rows (replaces renderBar)
+		case "":
+			c.overlays = append(c.overlays, b)
+		default:
+			c.docks = append(c.docks, b)
+		}
+	}
 }
 
 // openLocal opens a prompt/picker overlay from the client's own mirrored state
@@ -2207,6 +2252,83 @@ func (c *compositor) pickerFeed(data []byte) ([]byte, pickerResult) {
 		c.picker = nil
 	}
 	return c.redraw(), res
+}
+
+// borderStyleAt resolves one border cell's style in CONTENT coordinates, so the
+// interior dividers and the framed outer frame share one rule (the frame used to
+// hardcode the inactive style, so a framed window never showed which pane was
+// active). Precedence: pane-border-style, then the active pane's own ring cells,
+// then a marked pane, then a pane:set_border override.
+func (c *compositor) borderStyleAt(col, row int) (emu.Color, emu.Color, int16) {
+	fg, bg, mode := c.cfg.InactiveBorderFG, c.cfg.InactiveBorderBG, c.cfg.InactiveBorderAttr
+	if c.layout == nil {
+		return fg, bg, mode
+	}
+	twoPanes := len(c.layout.Panes) == 2
+	for i := range c.layout.Panes {
+		p := c.layout.Panes[i]
+		if !p.Active || !onPaneRing(p, col, row) {
+			continue
+		}
+		// Two-pane indicator: only HALF the shared divider lights, so you can tell
+		// which pane owns it. But that half-split applies ONLY to a cell shared
+		// with the other pane (the divider between them) — a non-shared edge (the
+		// outer frame in framed mode) is touched by one pane and must light fully.
+		// Applying the split to the frame made it half-green/half-inactive, which
+		// read as broken.
+		if twoPanes && c.sharedBorderCell(col, row, i) && !activeBorderHalf(p, col, row) {
+			continue // the neighbour's half of the shared divider stays inactive
+		}
+		fg, bg, mode = c.cfg.ActiveBorderFG, emu.DefaultBG, 0
+	}
+	for i := range c.layout.Panes {
+		if c.layout.Panes[i].Marked && onPaneRing(c.layout.Panes[i], col, row) {
+			fg, bg, mode = c.cfg.MarkedBorderFG, emu.DefaultBG, 0
+		}
+	}
+	// pane:set_border override (e.g. command-exited flagging a pane).
+	for id, override := range c.paneBorderColor {
+		if pr, ok := c.rectFor(id); ok && onPaneRing(pr, col, row) {
+			fg, bg, mode = override, emu.DefaultBG, 0
+		}
+	}
+	return fg, bg, mode
+}
+
+// sharedBorderCell reports whether a border cell lies on another pane's ring
+// too — i.e. it's a divider shared between the active pane (index exclude) and a
+// neighbour, as opposed to a non-shared outer-frame edge. Gates the two-pane
+// half-colour indicator so it only splits the genuine shared divider.
+func (c *compositor) sharedBorderCell(col, row, exclude int) bool {
+	for i := range c.layout.Panes {
+		if i != exclude && onPaneRing(c.layout.Panes[i], col, row) {
+			return true
+		}
+	}
+	return false
+}
+
+// activeBorderHalf implements tmux's pane-border-indicators=colour split for a
+// two-pane window: which HALF of the active pane's shared divider lights, so the
+// two panes are distinguishable (a full-length divider is the same cells for
+// both). The active pane's RIGHT edge (it is the left pane) lights the top half;
+// its LEFT edge (it is the right pane) the bottom half; a horizontal divider
+// splits its BOTTOM edge (top pane) into the left half and its TOP edge (bottom
+// pane) into the right half — split at the pane's midpoint, matching tmux 3.6.
+// Only meaningful for a shared divider cell (see sharedBorderCell).
+func activeBorderHalf(pr proto.PaneRect, col, row int) bool {
+	midRow, midCol := pr.Row+pr.Rows/2, pr.Col+pr.Cols/2
+	switch {
+	case col == pr.Col+pr.Cols: // right edge (pr is the left pane) -> top half
+		return row <= midRow
+	case col == pr.Col-1: // left edge (pr is the right pane) -> bottom half
+		return row > midRow
+	case row == pr.Row+pr.Rows: // bottom edge (pr is the top pane) -> left half
+		return col <= midCol
+	case row == pr.Row-1: // top edge (pr is the bottom pane) -> right half
+		return col > midCol
+	}
+	return true
 }
 
 // onPaneRing reports whether cell (col,row) lies on pr's outline ring — the

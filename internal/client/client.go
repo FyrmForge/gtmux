@@ -321,9 +321,24 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 		bindsPtr.Store(newBinds)
 		compMu.Lock()
 		if comp != nil {
-			os.Stdout.Write(comp.reload(newCfg))
+			// newBinds owns the new config's widget fns — reload rebuilds the
+			// widgets against it, so a re-sourced status bar/dock actually changes.
+			os.Stdout.Write(comp.reload(newCfg, newBinds))
 		}
 		compMu.Unlock()
+		// Re-report our size with the NEW insets: docks and pane_borders="framed"
+		// change how many rows/cols the window gets (dockInset/frameReserve), and
+		// the server owns the layout. Without this the compositor renders the new
+		// chrome against the OLD layout until some unrelated resize — toggling
+		// pane_borders live left the dock's box drawn for the old height, so its
+		// bottom border landed on a row framed now treats as frame and vanished.
+		// Sent outside compMu (lock order vs the SIGWINCH goroutine).
+		if cols, rows, err := term.GetSize(int(os.Stdout.Fd())); err == nil {
+			send(&proto.ClientMsg{Resize: &proto.Resize{
+				Cols: contentCols(cols, newCfg.Widgets, newCfg.PaneBorders),
+				Rows: contentRows(rows, newCfg.StatusLines, newCfg.Widgets, newCfg.PaneBorders),
+			}})
+		}
 	}
 	// applyOverride records one runtime option and re-derives the config. Used
 	// for a local client-option :set and for a server push — no routing, so a
@@ -454,6 +469,38 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 	// command, and pasted bytes get eaten by the prefix/bind/mouse machinery
 	// below. The 200~/201~ markers let us tell data from keystrokes.
 	os.Stdout.Write([]byte("\x1b[?2004h"))
+
+	// Auto-reload: poll the active config file's mtime and re-run reloadConfig on
+	// change, so edits to client.lua apply live without a manual source-file.
+	// mtime polling (not fsnotify) keeps it dependency-free — 1s latency is fine
+	// for a config file. reloadConfig is the same reset-then-eval source-file
+	// uses; it reads cfgPath under cfgMu, so this reads it the same way. An editor
+	// mid-save may briefly load a partial file; it self-heals on the next write.
+	// ponytail: always on; gate behind a `set -g automatic-reload` option if it
+	// ever needs to be opt-out.
+	go func() {
+		defer guardPanic(restoreTerm)
+		stamp := func() (int64, bool) {
+			cfgMu.Lock()
+			p := cfgPath
+			cfgMu.Unlock()
+			if fi, err := os.Stat(p); err == nil {
+				return fi.ModTime().UnixNano(), true
+			}
+			return 0, false
+		}
+		last, lastOK := stamp()
+		tick := time.NewTicker(time.Second)
+		defer tick.Stop()
+		for range tick.C {
+			// reloadConfig already updated the mtime we read here (it only reads
+			// the file), so a real edit — not our own reload — is what differs.
+			if mt, ok := stamp(); ok != lastOK || mt != last {
+				last, lastOK = mt, ok
+				reloadConfig(nil)
+			}
+		}
+	}()
 
 	go func() {
 		defer guardPanic(restoreTerm) // a crash here must not leave the pane wedged
@@ -978,25 +1025,7 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 		comp = newCompositor()
 		comp.cfg = cliCfg
 		comp.setPhysical(cols, rows)
-		wb := curBinds() // the widgets' fns live in this VM; captured for their lifetime
-		for _, w := range cliCfg.Widgets {
-			b := &textBox{
-				row: w.Row, col: w.Col, format: w.Text,
-				lines: strings.Split(w.Text, "\n"), // shown until the first refresh re-expands
-				fg:    w.FG, bg: w.BG, attr: w.Attr,
-				dock: w.Dock, size: w.Size,
-				textFn: w.TextFn, drawFn: w.Draw, component: w.Component, onClick: w.OnClick, binds: wb, interval: w.Interval,
-				w: w.Width, h: w.Height, // float draw size; docks override w/h per tick
-			}
-			switch w.Dock {
-			case "status":
-				comp.statusWidget = b // owns the status rows (replaces renderBar)
-			case "":
-				comp.overlays = append(comp.overlays, b)
-			default:
-				comp.docks = append(comp.docks, b)
-			}
-		}
+		comp.rebuildWidgets(curBinds()) // the widgets' fns live in this VM
 		compMu.Unlock()
 		switchTo := ""
 		var decodeErr error
