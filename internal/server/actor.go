@@ -92,6 +92,10 @@ type renderMsg struct {
 	modeFlip  bool
 	hostOut   []byte // un-doubled allow-passthrough payload to forward raw to the client terminal
 	cmdExits  []int  // OSC 133 command-finished exit codes in this chunk (gtmux.on("command-exited"))
+	// clipboards: OSC 52 set-clipboard payloads an app emitted in this chunk,
+	// forwarded to the outer terminal (set-clipboard) + the paste buffer. Rides
+	// the same visibility gate as hostOut: only views that see the pane.
+	clipboards []string
 }
 
 func newWindowActor(w *window) *windowActor {
@@ -132,6 +136,7 @@ func (wa *windowActor) run() {
 			// Drain OSC 133 command-finished exits now (before dirtyContent's diff
 			// resets the dirty state below), regardless of any view being active.
 			cmdExits := ev.pane.takeCommandExits()
+			clips := ev.pane.takeClipboards()
 			// An app toggling mouse tracking (DECSET/DECRST 1000-1003) changes
 			// PaneRect.WantsMouse, which the client uses to decide own-vs-forward;
 			// same for the kitty keyboard protocol (CSI > flags u), where the
@@ -169,6 +174,7 @@ func (wa *windowActor) run() {
 					// window, not hidden behind a zoom) — tmux passes through for the
 					// visible pane only.
 					rm.hostOut = hostOut
+					rm.clipboards = clips
 				}
 				select {
 				case vw.renders <- rm:

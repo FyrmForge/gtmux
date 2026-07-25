@@ -448,6 +448,13 @@ func (p *pane) takeCommandExits() []int {
 	return codes
 }
 
+// takeClipboards drains OSC 52 set-clipboard payloads an app in this pane
+// emitted since the last call. Runs on the actor goroutine, before the
+// per-view dirtyContent diff resets the dirty state.
+func (p *pane) takeClipboards() []string {
+	return p.term.Changes().TakeClipboards()
+}
+
 // dirtyContent reports only the pane's rows that changed since the last
 // call (or since fullContent last reset them) — the hot path for ordinary
 // pty output.

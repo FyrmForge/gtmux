@@ -416,6 +416,10 @@ type ServerMsg struct {
 	// Passthrough is raw bytes (an app's un-doubled allow-passthrough DCS payload)
 	// the client writes straight to its terminal, bypassing the compositor.
 	Passthrough []byte
+	// Clipboards is decoded OSC 52 set-clipboard payloads from an app in a
+	// visible pane; the client re-emits them as OSC 52 to its outer terminal
+	// unless its set-clipboard option is off.
+	Clipboards []string
 	// CommandExits reports OSC 133 command-finished events (a command run in a
 	// pane exited) so the client can fire gtmux.on("command-exited", …).
 	CommandExits []CommandExit

@@ -103,3 +103,21 @@ func TestAllowPassthroughOff(t *testing.T) {
 		t.Fatalf("payload forwarded with allow-passthrough off")
 	}
 }
+
+// TestOSC52SetClipboard: a bare OSC 52 from an app in a pane (no passthrough
+// wrapper, no allow-passthrough needed) is decoded by the pane's emulator,
+// re-emitted as OSC 52 to the client terminal, and lands in the paste buffer
+// so prefix+] pastes it — the "yank in remote nvim → local clipboard" path.
+func TestOSC52SetClipboard(t *testing.T) {
+	c := harness.Start(t)
+	c.WaitForStatus("default")
+
+	c.TypeLine(`printf '\033]52;c;R1RNVVg=\033\134'`) // sets clipboard to "GTMUX"
+	// The client re-encodes (BEL-terminated), so match the common prefix. The
+	// command echo has the literal ASCII "]52;c;…" but never a real ESC before it.
+	c.WaitForRaw([]byte("\x1b]52;c;R1RNVVg="))
+
+	c.TypeLine("cat")
+	c.Prefix("]") // paste buffer was set from the same OSC 52
+	c.WaitForText("GTMUX")
+}

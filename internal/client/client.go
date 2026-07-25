@@ -1084,6 +1084,16 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 				os.Stdout.Write(msg.Passthrough)
 				continue
 			}
+			if len(msg.Clipboards) > 0 {
+				// An app in a pane set the clipboard (OSC 52): re-emit to the
+				// outer terminal, same gate as a copy-mode yank.
+				if comp.cfg.SetClipboard != "off" {
+					for _, text := range msg.Clipboards {
+						os.Stdout.Write(encodeOSC52(text))
+					}
+				}
+				continue
+			}
 			if len(msg.CommandExits) > 0 {
 				// A command finished in a pane (OSC 133): fire gtmux.on("command-exited")
 				// with a pane object; its ops (set_border / run_command / action) apply.

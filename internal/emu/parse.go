@@ -458,13 +458,13 @@ func (t *State) handleOSC52(s strEscape) {
 	}
 
 	// Decode base64 data
-	_, err := base64.StdEncoding.DecodeString(pd)
+	data, err := base64.StdEncoding.DecodeString(pd)
 	if err != nil {
 		t.logf("osc-52: failed to decode data %v", err)
 		return
 	}
 
-	// TODO(cfoust): 08/10/25 publish event
+	t.dirty.Clipboards = append(t.dirty.Clipboards, string(data))
 }
 
 // handleOSC133 processes OSC 133 semantic prompt sequences.

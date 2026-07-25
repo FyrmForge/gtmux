@@ -113,7 +113,14 @@
       "Bash(python3 /tmp/fcol.py)",
       "Bash(python3 -c 'import json,sys *)",
       "Bash(grim -g \"2264,2232 509x278\" .tmp/fb.png)",
-      "Bash(GTMUX_SOCK=/tmp/gtmux-fb/server .tmp/gtmux kill-server)"
+      "Bash(GTMUX_SOCK=/tmp/gtmux-fb/server .tmp/gtmux kill-server)",
+      "Bash(tmux ls *)",
+      "Bash(grim -g \"2247,24 1906x1049\" /home/darthvader/FyrmForge/gtmux/.tmp/full.png)",
+      "Bash(gtmux list *)",
+      "Bash(gtmux --help)",
+      "Bash(go version *)",
+      "Bash(./.tmp/observe/observe ~/go/bin/gtmux ff-stackr 165 77 4)",
+      "Bash(env -u GTMUX ./.tmp/observe/observe ~/go/bin/gtmux ff-stackr 165 77 4)"
     ]
   }
 }

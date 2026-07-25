@@ -53,6 +53,11 @@ type Dirty struct {
 	// SemanticPrompts contains OSC 133 semantic prompt events since the
 	// last Reset().
 	SemanticPrompts []SemanticPromptEvent
+
+	// Clipboards holds decoded OSC 52 set-clipboard payloads since the last
+	// Reset()/TakeClipboards() — the server drains and forwards them to the
+	// client's outer terminal (tmux set-clipboard).
+	Clipboards []string
 }
 
 func (t *State) Changes() *Dirty {
@@ -99,6 +104,14 @@ func (d *Dirty) GetSemanticPrompts() []SemanticPromptEvent {
 // before the per-view content diff calls Reset().
 func (d *Dirty) ClearSemanticPrompts() { d.SemanticPrompts = d.SemanticPrompts[:0] }
 
+// TakeClipboards drains queued OSC 52 clipboard payloads without touching
+// line dirtiness (same discipline as ClearSemanticPrompts).
+func (d *Dirty) TakeClipboards() []string {
+	c := d.Clipboards
+	d.Clipboards = nil
+	return c
+}
+
 // Reset the change mask and dirtiness.
 func (d *Dirty) Reset() {
 	d.Lines = make(map[int]bool)
@@ -108,6 +121,7 @@ func (d *Dirty) Reset() {
 	d.Cleared = false
 
 	d.SemanticPrompts = d.SemanticPrompts[:0]
+	d.Clipboards = nil
 }
 
 func (d *Dirty) ScreenChanged() bool {

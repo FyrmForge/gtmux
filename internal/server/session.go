@@ -724,11 +724,10 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 		}
 	}
 
-	// sendPassthrough forwards allow-passthrough bytes to writable clients only —
-	// a read-only (attach -r) client observes, so pane-driven side effects (an
+	// sendWritable sends to writable clients only — a read-only (attach -r)
+	// client observes, so pane-driven side effects (allow-passthrough bytes, an
 	// app's OSC 52 clipboard set) must not reach its terminal.
-	sendPassthrough := func(raw []byte) {
-		msg := &proto.ServerMsg{Passthrough: raw}
+	sendWritable := func(msg *proto.ServerMsg) {
 		for _, a := range attachments {
 			if !a.readOnly {
 				a.enc.Encode(msg)
@@ -1647,7 +1646,17 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 		// scanner always strips the wrapper from emu input regardless; this is only
 		// the forward.
 		if len(rm.hostOut) > 0 && allowPassthrough && w == activeWindow().window {
-			sendPassthrough(rm.hostOut)
+			sendWritable(&proto.ServerMsg{Passthrough: rm.hostOut})
+		}
+		// OSC 52 from an app in a pane: land it in the paste buffer (prefix+]
+		// pastes it, tmux set-clipboard on) and forward to writable clients,
+		// where each applies its own set-clipboard gate. Same staleness recheck
+		// as hostOut: the rm may have been queued before a select-window.
+		if len(rm.clipboards) > 0 && w == activeWindow().window {
+			for _, text := range rm.clipboards {
+				addBuffer("", text)
+			}
+			sendWritable(&proto.ServerMsg{Clipboards: rm.clipboards})
 		}
 		// Alert state is per-view: find THIS session's view of the window. A render
 		// for a window we no longer link (winlink just dropped) has no view — skip.
