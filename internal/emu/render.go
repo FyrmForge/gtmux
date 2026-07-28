@@ -8,11 +8,17 @@ import (
 // WriteLine emits SGR-attributed runs of a line's glyphs, resetting attrs only
 // between runs that differ so we don't emit an SGR code per character. Shared by
 // the client's screen renderer and the server's capture-pane -e.
+//
+// A double-width rune occupies two grid cells: the rune itself and a ' '
+// placeholder written by setChar. The terminal advances two columns on the rune
+// alone, so emitting the placeholder too would shift the rest of the line one
+// column right — over the pane border, in the client's case. Skip it.
 func WriteLine(b *strings.Builder, line Line) {
 	haveAttrs := false
 	var last Glyph
 
-	for _, g := range line {
+	for i := 0; i < len(line); i++ {
+		g := line[i]
 		if g.Char == 0 {
 			continue
 		}
@@ -22,6 +28,7 @@ func WriteLine(b *strings.Builder, line Line) {
 			haveAttrs = true
 		}
 		b.WriteRune(g.Char)
+		i += g.Width() - 1
 	}
 	b.WriteString("\x1b[0m")
 }

@@ -1253,7 +1253,7 @@ func (c *compositor) buildRow(row int) emu.Line {
 			if l, ok := buf[localRow]; ok && x < len(l) {
 				g = l[x]
 			}
-			line[col] = g
+			line[col] = clipWide(g, roomIn(pr.Cols-x, c.contentCols()-col))
 		}
 	}
 
@@ -1582,6 +1582,14 @@ func (c *compositor) buildCopyRow(pr proto.PaneRect, localRow int, line emu.Line
 	if bufY >= 0 && bufY < len(cm.lines) {
 		src = cm.lines[bufY]
 	}
+	// cm.cx is a cell index, so moving right over a wide rune lands it on that
+	// rune's ' ' placeholder — a cell the renderer skips, which would leave the
+	// cursor block invisible. Snap it back onto the rune's own cell (what tmux
+	// highlights too).
+	cursorX := cm.cx
+	if cursorX > 0 && cursorX < len(src) && src[cursorX-1].Width() > 1 {
+		cursorX--
+	}
 	for x := 0; x < pr.Cols; x++ {
 		col := pr.Col + x
 		if col < 0 || col >= c.contentCols() {
@@ -1592,15 +1600,40 @@ func (c *compositor) buildCopyRow(pr proto.PaneRect, localRow int, line emu.Line
 			g = src[x]
 		}
 		switch {
-		case bufY == cm.cy && x == cm.cx:
+		case bufY == cm.cy && x == cursorX:
 			g.FG, g.BG = c.cfg.CopyCursorFG, c.cfg.CopyCursorBG
 			g.Mode &^= emu.AttrReverse // forced colors win; don't let the cell re-swap them
 		case cm.selecting && cm.inSelection(bufY, x):
 			g.FG, g.BG = c.cfg.CopySelectionFG, c.cfg.CopySelectionBG
 			g.Mode &^= emu.AttrReverse
 		}
-		line[col] = g
+		line[col] = clipWide(g, roomIn(pr.Cols-x, c.contentCols()-col))
 	}
+}
+
+// clipWide replaces a double-width glyph with a space when its second cell has
+// nowhere to go: room is the cells left in the region it's being blitted into,
+// counting this one, so a wide rune needs room >= 2. The terminal advances two
+// columns on a wide rune regardless of what the compositor intended, so leaving
+// one at a region's last cell pushes the rest of the physical row — the pane
+// border, the popup frame, a docked strip — one column right.
+//
+// Callers pass the tightest bound that applies: a pane's own width and the
+// window content width both matter, since either edge has a border past it.
+func clipWide(g emu.Glyph, room int) emu.Glyph {
+	if g.Width() > 1 && room < 2 {
+		g.Char = ' '
+	}
+	return g
+}
+
+// roomIn is the smaller of two remaining-cell counts, for callers bounded by
+// both their own region and the window content.
+func roomIn(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // copyFeed drives copy-mode from a chunk of local input and returns the redraw
@@ -1854,7 +1887,7 @@ func (c *compositor) overlayRowSplit(row int, line emu.Line) {
 					if g.Char == 0 {
 						g.Char = ' '
 					}
-					cells[5+leftW+x] = g
+					cells[5+leftW+x] = clipWide(g, rightW-x)
 				}
 			}
 		}
@@ -2236,7 +2269,7 @@ func (c *compositor) popupRow(row int, line emu.Line) {
 		if x < len(src) {
 			g = src[x]
 		}
-		put(startCol+x, g)
+		put(startCol+x, clipWide(g, roomIn(p.cols-x, c.contentCols()-(startCol+x))))
 	}
 }
 

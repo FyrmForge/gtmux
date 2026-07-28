@@ -148,7 +148,18 @@
       "Bash(GTMUX_SOCK=/home/darthvader/FyrmForge/gtmux/.tmp/sock/server ./.tmp/bench/bench benchsess *)",
       "Bash(GTMUX_SOCK=/home/darthvader/FyrmForge/gtmux/.tmp/sock/server ./.tmp/bench/bench snapA *)",
       "Bash(grim -g \"1927,1135 2546x1378\" /home/darthvader/FyrmForge/gtmux/.tmp/full.png)",
-      "Bash(set -e)"
+      "Bash(set -e)",
+      "Bash(git -C /home/darthvader/FyrmForge/gtmux log --oneline -3)",
+      "Bash(git -C /home/darthvader/FyrmForge/gtmux status --short)",
+      "Bash(git -C /home/darthvader/FyrmForge/gtmux diff HEAD~1 --stat -- internal/emu/render.go internal/emu/state.go internal/client/compositor.go)",
+      "Bash(git -C /home/darthvader/FyrmForge/gtmux diff HEAD~1 -- internal/emu/state.go)",
+      "Bash(git -C /home/darthvader/FyrmForge/gtmux diff HEAD~1 -- internal/client/compositor.go)",
+      "Bash(perl -0pi -e 's/if g\\\\.Width\\\\\\(\\\\\\) > 1 && \\\\\\(x\\\\+1 >= paneCols \\\\|\\\\| col\\\\+1 >= c\\\\.contentCols\\\\\\(\\\\\\)\\\\\\) \\\\{\\\\n\\\\t\\\\tg\\\\.Char = . .\\\\n\\\\t\\\\}//' internal/client/compositor.go)",
+      "Bash(git stash *)",
+      "Bash(gofmt -l internal/client/compositor.go internal/emu/render.go)",
+      "Bash(gofmt -d internal/client/compositor.go)",
+      "Bash(git -C /home/darthvader/FyrmForge/gtmux diff internal/client/compositor.go)",
+      "Bash(gofmt -l internal/client/wideclip_test.go internal/emu/widerender_test.go internal/e2e/widechar_test.go internal/emu/render.go)"
     ]
   }
 }
