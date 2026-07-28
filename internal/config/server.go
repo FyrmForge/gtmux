@@ -211,12 +211,19 @@ func parseKeyName(s string) (string, bool) {
 	// the escape-sequence lead and never matches a bind — unbindable, as it
 	// effectively was before too.
 	if len(s) == 3 && s[0] == 'C' && s[1] == '-' {
-		b := s[2] & 0x1f
-		if b >= 0x01 && b <= 0x1a {
-			return "C-" + string(rune('a'+b-1)), true
+		ch := s[2]
+		if lc := ch | 0x20; lc >= 'a' && lc <= 'z' { // a control letter: fold to C-a..C-z
+			return "C-" + string(rune('a'+(ch&0x1f)-1)), true
 		}
-		if b >= 0x1c && b <= 0x1f {
+		if b := ch & 0x1f; b >= 0x1c && b <= 0x1f { // C-\ C-] C-^ C-_
 			return "C-" + string(rune(b|0x40)), true
+		}
+		// Digit or other printable with no C0 code (C-1, C-;, …): a literal token
+		// matching the client's CSI-u / modifyOtherKeys decoder (keyToken). These
+		// only fire when extended-keys negotiation is active — a bare Ctrl+digit
+		// has no distinct legacy byte.
+		if ch >= 0x20 && ch <= 0x7e {
+			return "C-" + string(ch), true
 		}
 	}
 	// M-x: any single following char, case preserved (M-h vs M-H = Shift).

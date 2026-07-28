@@ -62,6 +62,22 @@ type textBox struct {
 	w, h      int
 	interval  int
 	lastRun   time.Time
+	lastSig   string // last canvasSig, so the animation ticker skips unchanged frames
+}
+
+// canvasSig is a cheap content signature (glyph chars per row) used to detect
+// whether a re-run draw actually changed — so the animation ticker only repaints
+// when something moved. Chars only: colour-only changes ride the status tick.
+func (b *textBox) canvasSig() string {
+	if b.canvas == nil {
+		return ""
+	}
+	var sb strings.Builder
+	for r := 0; r < b.canvas.H; r++ {
+		sb.WriteString(b.lineText(r))
+		sb.WriteByte('\n')
+	}
+	return sb.String()
 }
 
 func (b *textBox) reexpand(exp *statusExpander, vars, serverShell map[string]string) {

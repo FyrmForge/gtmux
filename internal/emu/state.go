@@ -52,7 +52,12 @@ type State struct {
 	keyState, altKeyState *KeyProtocolState
 
 	cur, curSaved Cursor
-	top, bottom   int // scroll limits
+	// charsets: whether G0/G1 are designated to DEC line-drawing (ESC ( 0 /
+	// ESC ) 0); charset is the active one, selected by SI/SO. attrGfx on the
+	// cursor mirrors charsets[charset].
+	charsets    [2]bool
+	charset     int
+	top, bottom int // scroll limits
 	mode          ModeFlag
 	tabs          []bool
 	title         string
@@ -279,7 +284,19 @@ func (t *State) defaultCursor() Cursor {
 	return c
 }
 
+// updateGfx syncs the cursor's attrGfx bit to the active charset, after a
+// designation (ESC ( X / ESC ) X) or shift (SI/SO).
+func (t *State) updateGfx() {
+	if t.charsets[t.charset] {
+		t.cur.Attr.Mode |= attrGfx
+	} else {
+		t.cur.Attr.Mode &^= attrGfx
+	}
+}
+
 func (t *State) reset() {
+	t.charsets = [2]bool{}
+	t.charset = 0
 	t.cur = t.defaultCursor()
 	t.saveCursor()
 	for i := range t.tabs {

@@ -42,12 +42,31 @@ func (c *compositor) negotiateKitty() []byte {
 	}
 	out, state := kittyNegotiate(c.kittyFlags, want, c.cfg.ExtendedKeys)
 	c.kittyFlags = state
-	return out
+	// modifyOtherKeys: when extended-keys is on but the active pane isn't in
+	// kitty mode, put the outer terminal in modifyOtherKeys=1 so gtmux still
+	// receives modified keys (Ctrl+1, …) as CSI 27;mods;code~ for its own binds.
+	// Mode 1 leaves Escape/Tab/Enter/plain-Ctrl untouched, so legacy panes are
+	// unaffected. Mutually exclusive with kitty, which supersedes it.
+	return append(out, c.negotiateMOK(c.cfg.ExtendedKeys && state == 0)...)
 }
 
-// restoreKitty pops our kitty entry from the outer terminal on detach, if any.
+// negotiateMOK toggles the outer terminal's xterm modifyOtherKeys=1 mode to
+// `want`, emitting the set/reset sequence only on a change.
+func (c *compositor) negotiateMOK(want bool) []byte {
+	if want == c.mokActive {
+		return nil
+	}
+	c.mokActive = want
+	if want {
+		return []byte("\x1b[>4;1m")
+	}
+	return []byte("\x1b[>4;0m")
+}
+
+// restoreKitty pops our kitty entry from the outer terminal on detach, if any,
+// and clears modifyOtherKeys.
 func (c *compositor) restoreKitty() []byte {
 	out, state := kittyNegotiate(c.kittyFlags, 0, true)
 	c.kittyFlags = state
-	return out
+	return append(out, c.negotiateMOK(false)...)
 }

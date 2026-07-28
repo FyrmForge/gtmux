@@ -666,6 +666,7 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 				"window_index": strconv.Itoa(active + baseIndex),
 				"git_branch":   cachedGitBranch,
 				"clock":        cachedClock,
+				"pane_id":      fmt.Sprintf("%%%d", p.id),
 				"pane_path":    p.cwd(),
 				"pane_command": p.currentCommand(),
 				"pane_title":   p.term.Title(),
@@ -711,6 +712,28 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 	send := func(msg *proto.ServerMsg) {
 		stampStatus(msg)
 		for _, a := range attachments {
+			a.enc.Encode(msg)
+		}
+	}
+
+	// sendRaw broadcasts WITHOUT stamping status — for the per-output-chunk paths
+	// only (pane diffs, popup diffs), which fire once per 4KB pty read. Stamping
+	// there rebuilt the whole status per chunk: /proc reads for the active pane's
+	// command+cwd, the #server() shell cache check, and (with widget clients) a
+	// full cross-session snapshot — then made the client re-expand every Lua
+	// format widget, since compositor.apply keys that work off msg.Status != nil.
+	// A scrolling app made that fire hundreds of times a second.
+	// Status now rides the 1s tick and every user-action send() (window switch,
+	// split, resize, showMessage, …), which all still stamp — so the only thing
+	// that lags is output-derived vars (pane_command/pane_title/pane_path), by at
+	// most one tick. That's exactly tmux's status-interval model.
+	sendRaw := func(msg *proto.ServerMsg) {
+		for _, a := range attachments {
+			a.enc.Encode(msg)
+		}
+	}
+	sendToRaw := func(epoch int, msg *proto.ServerMsg) {
+		if a := attachments[epoch]; a != nil {
 			a.enc.Encode(msg)
 		}
 	}
@@ -1626,7 +1649,7 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 		p := rm.pane
 		w := p.win
 		if rm.content != nil {
-			send(&proto.ServerMsg{PaneContent: []proto.PaneContent{*rm.content}})
+			sendRaw(&proto.ServerMsg{PaneContent: []proto.PaneContent{*rm.content}})
 		}
 		// The pane's app toggled mouse tracking: push the layout so clients
 		// refresh PaneRect.WantsMouse (own-vs-forward decision for that pane).
@@ -3715,7 +3738,7 @@ loop:
 					} else {
 						e.pane.term.Write(e.data)
 						content := e.pane.dirtyContent()
-						sendTo(ep, &proto.ServerMsg{Popup: &proto.PopupMsg{Content: &content}})
+						sendToRaw(ep, &proto.ServerMsg{Popup: &proto.PopupMsg{Content: &content}})
 					}
 					continue
 				}

@@ -69,6 +69,9 @@ type compositor struct {
 	// entry on the terminal's kitty stack; renegotiated when the active pane's
 	// KeyFlags change and popped on detach.
 	kittyFlags int
+	// modifyOtherKeys=1 currently set on the outer terminal (extended-keys on +
+	// active pane legacy) so gtmux receives modified keys for its own binds.
+	mokActive bool
 
 	// Client-owned mouse gesture state (the client recognizes focus/border/
 	// drag-copy from its own Layout, sending semantic requests to the server).
@@ -1000,6 +1003,77 @@ func (c *compositor) restoreTitle() []byte {
 		return []byte("\x1b[23;2t")
 	}
 	return nil
+}
+
+// animateDocks re-runs the draw/component dock widgets from the cached snapshot
+// and repaints just their strips — without waiting for a server Status push — so
+// a Lua draw that animates (a spinner advancing a local frame each call) is
+// smooth instead of ticking once per status interval. STATE still refreshes on
+// the status tick; this only re-runs the paint against data already in memory,
+// so it makes no server round-trip. Returns nil when there's nothing to animate
+// or a modal/copy/prompt/picker owns the screen.
+//
+// ponytail: re-runs every draw/component dock at the animation rate, ignoring
+// each widget's `interval` (which still throttles the status-tick STATE refresh).
+// Fine for the current single dock; add a per-widget "animate" opt-in if a heavy
+// draw dock ever needs a slow cadence.
+func (c *compositor) animateDocks() []byte {
+	if c.layout == nil || c.modal != nil || c.copy != nil || c.prompt != nil || c.picker != nil {
+		return nil
+	}
+	changed := false
+	for _, d := range c.docks {
+		if (d.drawFn == nil && d.component == nil) || d.w == 0 || d.h == 0 {
+			continue
+		}
+		d.rerender() // advances any local frame counter in the Lua draw
+		if sig := d.canvasSig(); sig != d.lastSig {
+			d.lastSig, changed = sig, true
+		}
+	}
+	if !changed { // nothing moved this frame (idle dock) → emit nothing
+		return nil
+	}
+	return c.emitDockStrips()
+}
+
+// emitDockStrips repaints ONLY the left/right dock column strips, leaving pane
+// content untouched — so animating a dock costs a ~size×height write, not a
+// full-screen repaint. Status rows are skipped (the dock doesn't own them).
+// ponytail: top/bottom draw docks aren't strip-optimized here (leftInset/
+// rightInset are horizontal); they still refresh on the status tick. Add if a
+// top/bottom dock ever needs to animate.
+func (c *compositor) emitDockStrips() []byte {
+	left, right := c.leftInset(), c.rightInset()
+	if left == 0 && right == 0 {
+		return nil
+	}
+	var b strings.Builder
+	b.WriteString("\x1b[?2026h\x1b[?25l")
+	for row := 0; row < c.totalRows(); row++ {
+		if is, _ := c.statusRowKind(row); is {
+			continue
+		}
+		line := c.buildRow(row)
+		if left > 0 {
+			end := left
+			if end > len(line) {
+				end = len(line)
+			}
+			fmt.Fprintf(&b, "\x1b[%d;1H", row+1)
+			emu.WriteLine(&b, line[:end])
+		}
+		if right > 0 && len(line) >= right {
+			start := len(line) - right
+			fmt.Fprintf(&b, "\x1b[%d;%dH", row+1, start+1)
+			emu.WriteLine(&b, line[start:])
+		}
+	}
+	if row, col, visible := c.activeCursor(); visible {
+		fmt.Fprintf(&b, "\x1b[%d;%dH\x1b[?25h", row+1, col+1)
+	}
+	b.WriteString("\x1b[?2026l")
+	return []byte(b.String())
 }
 
 // redraw repaints every physical row — used when only the client's own

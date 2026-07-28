@@ -502,6 +502,26 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 		}
 	}()
 
+	// Animation ticker: repaint draw/component docks locally at a fast cadence so
+	// Lua-drawn spinners animate smoothly, decoupled from the server's status
+	// push. animateDocks re-runs the paint against the cached snapshot (no server
+	// round-trip) and returns nil when there's nothing to animate. The write is
+	// held under compMu, serializing with the render goroutine's own writes.
+	go func() {
+		defer guardPanic(restoreTerm)
+		anim := time.NewTicker(150 * time.Millisecond)
+		defer anim.Stop()
+		for range anim.C {
+			compMu.Lock()
+			if comp != nil {
+				if out := comp.animateDocks(); len(out) > 0 {
+					os.Stdout.Write(out)
+				}
+			}
+			compMu.Unlock()
+		}
+	}()
+
 	go func() {
 		defer guardPanic(restoreTerm) // a crash here must not leave the pane wedged
 		buf := make([]byte, 4096)
@@ -661,7 +681,25 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 						if b >= 0x40 && b <= 0x7e {
 							escStage = 0
 							seq := string(escRaw[2:]) // bytes after "ESC ["
-							finishEsc(csiKeyName[seq], seq, escPrefixed, escRaw)
+							// Modified keys (Ctrl+1, …) arrive as kitty CSI-u or xterm
+							// modifyOtherKeys — decode to a bind token. When unbound: a
+							// kitty key falls back to raw so a kitty app still gets it; a
+							// modifyOtherKeys key is down-converted to its legacy bytes
+							// (Alt+b -> ESC b, so readline motions survive) or dropped if
+							// it has no legacy form, never forwarded as a garbage CSI.
+							// ponytail: the drop/down-convert only triggers on the 27;m;c~
+							// form; a terminal that emits modifyOtherKeys as CSI-u instead
+							// would leak unbound exotic combos raw to a legacy pane. Low
+							// severity (unbound exotic keys only); revisit if it bites.
+							if tok, code, mods, form, ok := decodeExtKey(seq); ok && !pasting {
+								raw := escRaw
+								if form == formMOK {
+									raw = mokLegacyBytes(code, mods)
+								}
+								finishEsc(tok, seq, escPrefixed, raw)
+							} else {
+								finishEsc(csiKeyName[seq], seq, escPrefixed, escRaw)
+							}
 						}
 					case 3: // SS3: single final byte after "ESC O"
 						escStage = 0

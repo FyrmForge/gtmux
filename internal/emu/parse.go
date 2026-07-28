@@ -61,6 +61,14 @@ func (t *State) Execute(b byte) {
 	case '\a':
 		// TODO: emit sound
 		// TODO: window alert if not focused
+	// SO - shift out: select G1
+	case 0x0e:
+		t.charset = 1
+		t.updateGfx()
+	// SI - shift in: select G0
+	case 0x0f:
+		t.charset = 0
+		t.updateGfx()
 	}
 }
 
@@ -421,16 +429,27 @@ func (t *State) EscDispatch(intermediates []byte, ignore bool, b byte) {
 		t.restoreCursor(false)
 	case '\\': // ST - stop
 
-	// Character Sets (G0 and G1 Designators)
-	case '0': // line drawing set
-		t.cur.Attr.Mode |= attrGfx
-	case 'B': // USASCII
-		t.cur.Attr.Mode &^= attrGfx
-	case 'A', // UK (ignored)
-		'<', // multinational (ignored)
-		'5', // Finnish (ignored)
-		'C', // Finnish (ignored)
-		'K': // German (ignored)
+	// Character Sets (G0 and G1 Designators): ESC ( X designates G0, ESC ) X
+	// designates G1. Only '0' (DEC line drawing) maps; every other set is
+	// treated as ASCII. Designating is not activating — G1 takes effect only
+	// via SO (see Execute) — which is why tcell's enacs (ESC ( B ESC ) 0) must
+	// NOT flip the visible charset.
+	case '0', // line drawing set
+		'B', // USASCII
+		'A', // UK
+		'<', // multinational
+		'5', // Finnish
+		'C', // Finnish
+		'K': // German
+		if len(intermediates) > 0 {
+			switch intermediates[0] {
+			case '(':
+				t.charsets[0] = b == '0'
+			case ')':
+				t.charsets[1] = b == '0'
+			}
+			t.updateGfx()
+		}
 	}
 }
 
