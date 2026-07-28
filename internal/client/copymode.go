@@ -102,7 +102,7 @@ func (cm *copyMode) scroll() {
 func (cm *copyMode) inSelection(y, x int) bool {
 	if cm.rectSel {
 		ylo, yhi, xlo, xhi := cm.rectBounds()
-		return y >= ylo && y <= yhi && x >= xlo && x <= xhi
+		return y >= ylo && y <= yhi && x >= cm.snapLow(y, xlo) && x <= xhi
 	}
 	y0, x0, y1, x1 := cm.selY, cm.selX, cm.cy, cm.cx
 	if y0 > y1 || (y0 == y1 && x0 > x1) {
@@ -115,10 +115,10 @@ func (cm *copyMode) inSelection(y, x int) bool {
 		return true
 	}
 	if y0 == y1 {
-		return x >= x0 && x <= x1
+		return x >= cm.snapLow(y0, x0) && x <= x1
 	}
 	if y == y0 {
-		return x >= x0
+		return x >= cm.snapLow(y0, x0)
 	}
 	if y == y1 {
 		return x <= x1
@@ -158,7 +158,7 @@ func (cm *copyMode) selectedText() string {
 				end = len(runes)
 			}
 			if start < end {
-				b.WriteString(string(runes[start:end]))
+				b.WriteString(cellText(cm.lines[y], runes, start, end))
 			}
 			if y != yhi {
 				b.WriteRune('\n')
@@ -189,7 +189,7 @@ func (cm *copyMode) selectedText() string {
 			end = len(runes)
 		}
 		if start < end {
-			b.WriteString(string(runes[start:end]))
+			b.WriteString(cellText(cm.lines[y], runes, start, end))
 		}
 		if y != y1 {
 			b.WriteRune('\n')
@@ -221,6 +221,63 @@ func lineRunes(line emu.Line) []rune {
 		end--
 	}
 	return runes[:end]
+}
+
+// isWidePlaceholder reports whether cell i is the second half of a double-width
+// rune. lineRunes emits a ' ' there to keep rune indices equal to cell indices —
+// which every cursor position, selection bound and word motion relies on — but
+// that space isn't real text, so anything LEAVING copy-mode (yanked text, search
+// subjects) has to drop it or "🔨ab" comes out as "🔨 ab".
+func isWidePlaceholder(line emu.Line, i int) bool {
+	return i > 0 && i-1 < len(line) && line[i-1].Width() > 1
+}
+
+// snapLow moves a selection's LOW column edge off a wide rune's placeholder onto
+// the rune itself. The cursor block renders there too (buildCopyRow snaps the
+// same way), so a selection anchored on what looks like the rune must actually
+// take it — otherwise the emoji you saw highlighted is missing from the yank.
+// Applied wherever a low edge is consumed, so the highlight and the copied text
+// always agree.
+func (cm *copyMode) snapLow(y, x int) int {
+	if y >= 0 && y < len(cm.lines) && isWidePlaceholder(cm.lines[y], x) {
+		return x - 1
+	}
+	return x
+}
+
+// cellText renders the cell range [start,end) of a line as text, dropping the
+// wide-rune placeholders. runes must be that line's lineRunes output. start is
+// snapped like the highlight's low edge (see snapLow) so a range beginning on a
+// placeholder still yields the rune it belongs to.
+func cellText(line emu.Line, runes []rune, start, end int) string {
+	if isWidePlaceholder(line, start) {
+		start--
+	}
+	var b strings.Builder
+	for i := start; i < end && i < len(runes); i++ {
+		if isWidePlaceholder(line, i) {
+			continue
+		}
+		b.WriteRune(runes[i])
+	}
+	return b.String()
+}
+
+// lineSearchText is a line's text with wide-rune placeholders dropped, plus the
+// cell index each text rune came from — so a match found in the text maps back to
+// a cursor position in cell space.
+func lineSearchText(line emu.Line) ([]rune, []int) {
+	runes := lineRunes(line)
+	text := make([]rune, 0, len(runes))
+	cells := make([]int, 0, len(runes))
+	for i, r := range runes {
+		if isWidePlaceholder(line, i) {
+			continue
+		}
+		text = append(text, r)
+		cells = append(cells, i)
+	}
+	return text, cells
 }
 
 // Word motions (w/b/e): a word is a maximal run of non-boundary chars. A
@@ -377,14 +434,16 @@ func (cm *copyMode) runSearch(query string) {
 	}
 	q := []rune(query)
 	for y, line := range cm.lines {
-		runes := lineRunes(line)
+		// Search the line's TEXT (placeholders dropped), then map each hit back
+		// to its cell index — matches are cursor positions, which are cell-based.
+		text, cells := lineSearchText(line)
 		start := 0
-		for start <= len(runes) {
-			idx := runeIndex(runes[start:], q)
+		for start <= len(text) {
+			idx := runeIndex(text[start:], q)
 			if idx < 0 {
 				break
 			}
-			cm.matches = append(cm.matches, [2]int{y, start + idx})
+			cm.matches = append(cm.matches, [2]int{y, cells[start+idx]})
 			start += idx + 1
 		}
 	}

@@ -159,7 +159,12 @@
       "Bash(gofmt -l internal/client/compositor.go internal/emu/render.go)",
       "Bash(gofmt -d internal/client/compositor.go)",
       "Bash(git -C /home/darthvader/FyrmForge/gtmux diff internal/client/compositor.go)",
-      "Bash(gofmt -l internal/client/wideclip_test.go internal/emu/widerender_test.go internal/e2e/widechar_test.go internal/emu/render.go)"
+      "Bash(gofmt -l internal/client/wideclip_test.go internal/emu/widerender_test.go internal/e2e/widechar_test.go internal/emu/render.go)",
+      "Bash(gofmt -l internal/client/copymode.go)",
+      "Bash(gofmt -d internal/client/copymode.go)",
+      "Bash(grep -oiE \"\\(shift\\\\+\\)?\\(pageup|pagedown|page up|page down\\)[^\\\\\"'\\\\`,;{}]{0,60}\")",
+      "Bash(grep -oiE \"[^\\\\\"'\\\\`]{0,80}scroll[^\\\\\"'\\\\`]{0,80}\")",
+      "Bash(git *)"
     ]
   }
 }

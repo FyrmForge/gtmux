@@ -3,3 +3,6 @@ make sure we have support for the other clankers
 look at making docks (focusable)
   within normal pane to pane system 
   and as a dedicated <bind> focus/unfocus dock
+figure out pane gaps
+  take out whatever serverside logic ahndles it into the client 
+
