@@ -106,6 +106,9 @@ type compositor struct {
 	// focusedDock is the dock currently owning the keyboard (focus="nav"/"bind"/
 	// "both" widgets): keys route to its on_key until it calls ui:close().
 	focusedDock *textBox
+	// prose toggles prose highlighting in agent panes (gtmux.prose_highlight):
+	// buildRow recolors default-styled text by word category — a dyslexia aid.
+	prose bool
 	// snapshot is the whole-server state the server pushes on each status tick when
 	// this client uses widget queries; the Lua primitives (gtmux.sessions/panes/…)
 	// read it. Nil until the first snapshot arrives.
@@ -1430,15 +1433,20 @@ func (c *compositor) buildRow(row int) emu.Line {
 			c.buildCopyRow(pr, localRow, line)
 			continue
 		}
-		buf := c.panes[pr.ID]
+		paneLine := c.panes[pr.ID][localRow]
+		if c.prose && paneLine != nil {
+			if _, isAgent := c.agentState[pr.ID]; isAgent {
+				paneLine = proseLine(paneLine)
+			}
+		}
 		for x := 0; x < pr.Cols; x++ {
 			col := pr.Col + x
 			if col < 0 || col >= c.contentCols() {
 				continue
 			}
 			g := emu.EmptyGlyph()
-			if l, ok := buf[localRow]; ok && x < len(l) {
-				g = l[x]
+			if x < len(paneLine) {
+				g = paneLine[x]
 			}
 			line[col] = clipWide(g, roomIn(pr.Cols-x, c.contentCols()-col))
 		}
@@ -2318,6 +2326,8 @@ func (c *compositor) openLocal(kind string) []byte {
 		c.prompt = newPrompt(&proto.OpenPrompt{Kind: "session", Prefill: name}, c.editKeys())
 	case "choose-window":
 		c.picker = c.buildWindowPicker()
+	case "prose-highlight":
+		c.prose = !c.prose
 	}
 	return c.redraw()
 }

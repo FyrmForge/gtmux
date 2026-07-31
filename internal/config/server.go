@@ -149,14 +149,40 @@ func DefaultUpdateEnvironment() []string {
 	}
 }
 
-// ServerConfigPath returns ~/.config/gtmux/server.lua, or "" if the user's
-// config directory can't be determined.
+// ServerConfigPath returns the server config path (see configPath), or "" if
+// the user's config directory can't be determined.
 func ServerConfigPath() string {
-	dir, err := os.UserConfigDir()
-	if err != nil {
-		return ""
+	return configPath("server.lua")
+}
+
+// configPath resolves ~/.config/gtmux/<file> ($XDG_CONFIG_HOME respected) on
+// EVERY platform — macOS included: gtmux is a terminal tool, and its config
+// belongs with tmux/nvim/git in ~/.config, not in ~/Library/Application
+// Support (which is what Go's os.UserConfigDir returns on darwin, and why the
+// "same config" used to silently not load on a Mac). A file already sitting
+// in os.UserConfigDir keeps working as a fallback when the ~/.config one
+// doesn't exist; fresh writes (init-config) always land in ~/.config.
+func configPath(file string) string {
+	dir := os.Getenv("XDG_CONFIG_HOME")
+	if dir == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			dir = filepath.Join(home, ".config")
+		}
 	}
-	return filepath.Join(dir, "gtmux", "server.lua")
+	xdg := ""
+	if dir != "" {
+		xdg = filepath.Join(dir, "gtmux", file)
+		if _, err := os.Stat(xdg); err == nil {
+			return xdg
+		}
+	}
+	if legacy, err := os.UserConfigDir(); err == nil {
+		p := filepath.Join(legacy, "gtmux", file)
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return xdg
 }
 
 // parseKeyByte turns a prefix key string into its single input byte: "C-x" for

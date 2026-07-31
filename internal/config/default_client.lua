@@ -159,6 +159,10 @@ gtmux.bind(",", function()
   prompt("rename-window", gtmux.expand("#{window_name}"), function(t) gtmux.rename_window(t) end)
 end)
 gtmux.bind("z", function() gtmux.zoom() end)
+-- prefix+e toggles prose highlighting in agent panes (see gtmux.agents below):
+-- "syntax highlighting for English" — function words dim, Capitalized bold,
+-- numbers/quotes/`code` colored. A readability/dyslexia aid for agent output.
+gtmux.bind("e", function() gtmux.prose_highlight() end)
 gtmux.bind(" ", function() gtmux.next_layout() end)       -- prefix+Space cycles presets
 gtmux.bind("C-o", function() gtmux.rotate_window() end)   -- prefix+C-o rotates panes
 gtmux.bind("{", function() gtmux.swap_pane("prev") end)

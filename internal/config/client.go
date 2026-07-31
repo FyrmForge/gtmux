@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -501,14 +500,10 @@ func ColorByName(name string) (emu.Color, bool) {
 	return c, ok
 }
 
-// ClientConfigPath returns ~/.config/gtmux/client.lua, or "" if the user's
-// config directory can't be determined.
+// ClientConfigPath returns the client config path (see configPath), or "" if
+// the user's config directory can't be determined.
 func ClientConfigPath() string {
-	dir, err := os.UserConfigDir()
-	if err != nil {
-		return ""
-	}
-	return filepath.Join(dir, "gtmux", "client.lua")
+	return configPath("client.lua")
 }
 
 // BindOp is one effect of a client keybind: either an Action to send to the
@@ -1296,6 +1291,7 @@ func LoadClientWith(path string, overrides [][2]string) (ClientConfig, *ClientBi
 	reg("rename_session_prompt", BindOp{Local: "rename-session"})
 	reg("rename_window_prompt", BindOp{Local: "rename-window"})
 	reg("choose_window", BindOp{Local: "choose-window"})
+	reg("prose_highlight", BindOp{Local: "prose-highlight"})
 	reg("send_prefix", BindOp{Action: []string{"send-prefix"}})
 	reg("choose_buffer", BindOp{Action: []string{"choose-buffer"}})
 	reg("respawn_pane", BindOp{Action: []string{"respawn-pane", "-k"}})
