@@ -103,6 +103,9 @@ type compositor struct {
 	// Mutually exclusive with the other input modes; rendered topmost.
 	modal    *textBox
 	modalPos string // "center" (default) | "status" (renders on the status line)
+	// focusedDock is the dock currently owning the keyboard (focus="nav"/"bind"/
+	// "both" widgets): keys route to its on_key until it calls ui:close().
+	focusedDock *textBox
 	// snapshot is the whole-server state the server pushes on each status tick when
 	// this client uses widget queries; the Lua primitives (gtmux.sessions/panes/…)
 	// read it. Nil until the first snapshot arrives.
@@ -124,6 +127,15 @@ type compositor struct {
 	prevCommand     map[int]string
 	progSeeded      bool
 	pendingProgram  []programChange
+	// Agent awareness (gtmux.agents{}): agentDefs comes from the binds VM at
+	// rebuildWidgets; agentState is the derived per-pane state ("busy"/"done"/
+	// "idle", absent = not an agent pane); agentBell tracks per-window bell flags
+	// for its own edge detection (detectAlerts consumes alertPrev first).
+	agentDefs    []config.AgentDef
+	agentState   map[int]string
+	agentBell    map[string]bool
+	agentSeeded  bool
+	pendingAgent []agentChange
 	// borderRunes maps a window-space border cell (row,col) to its box-drawing
 	// glyph for pane_borders="joined": junctions (┼├┤┬┴) computed from the divider
 	// segments, so crossings connect instead of overwriting. Rebuilt on layout/
@@ -525,6 +537,87 @@ func (c *compositor) modalKey(key string) ([]config.BindOp, bool) {
 	return c.modal.binds.RunKey(c.modal.onKey, key, c.modal.state)
 }
 
+// setDockFocus grants or drops a dock's keyboard focus: stamps state.focused
+// (shared with its component/on_key, so the render can show a highlight) and
+// re-renders the dock so the change is visible on the next redraw.
+func (c *compositor) setDockFocus(b *textBox, on bool) {
+	if on {
+		c.focusedDock = b
+	} else if c.focusedDock == b {
+		c.focusedDock = nil
+	}
+	b.state = b.binds.MarkFocused(b.state, on)
+	b.rerender()
+}
+
+// focusDockNav steps keyboard focus into a nav-focusable dock when pane
+// navigation (select-pane flag -L/-R/-U/-D) runs while the active pane already
+// touches that window edge — the dock is "the next pane over". Returns whether
+// it consumed the move.
+func (c *compositor) focusDockNav(flag string) bool {
+	if c.layout == nil || c.focusedDock != nil {
+		return false
+	}
+	side := map[string]string{"-L": "left", "-R": "right", "-U": "top", "-D": "bottom"}[flag]
+	if side == "" {
+		return false
+	}
+	atEdge := false
+	for _, pr := range c.layout.Panes {
+		if !pr.Active {
+			continue
+		}
+		switch side {
+		case "left":
+			atEdge = pr.Col == 0
+		case "right":
+			atEdge = pr.Col+pr.Cols == c.layout.Cols
+		case "top":
+			atEdge = pr.Row == 0
+		case "bottom":
+			atEdge = pr.Row+pr.Rows == c.layout.Rows
+		}
+		break
+	}
+	if !atEdge {
+		return false
+	}
+	for _, d := range c.docks {
+		if d.dock == side && d.onKey != nil && (d.focus == "nav" || d.focus == "both") {
+			c.setDockFocus(d, true)
+			return true
+		}
+	}
+	return false
+}
+
+// toggleDockFocus is gtmux.focus_dock(name): focus the named bind-focusable
+// dock, or drop focus if it already has it.
+func (c *compositor) toggleDockFocus(name string) {
+	if c.focusedDock != nil && c.focusedDock.name == name {
+		c.setDockFocus(c.focusedDock, false)
+		return
+	}
+	for _, d := range c.docks {
+		if d.name == name && d.onKey != nil && (d.focus == "bind" || d.focus == "both") {
+			if c.focusedDock != nil {
+				c.setDockFocus(c.focusedDock, false)
+			}
+			c.setDockFocus(d, true)
+			return
+		}
+	}
+}
+
+// dockKey feeds one key name to the focused dock's on_key; like modalKey, it
+// reports whether the handler asked to unfocus (ui:close()).
+func (c *compositor) dockKey(key string) ([]config.BindOp, bool) {
+	if c.focusedDock == nil {
+		return nil, false
+	}
+	return c.focusedDock.binds.RunKey(c.focusedDock.onKey, key, c.focusedDock.state)
+}
+
 // modalOffset centers the modal box in the content area (over panes, inside the
 // status/dock reserves).
 func (c *compositor) modalOffset() (ox, oy int) {
@@ -787,6 +880,92 @@ func (c *compositor) detectAlerts(snap *proto.StateSnapshot) {
 	c.alertSeeded = true
 }
 
+// agentChange is a pane whose derived agent state changed between snapshots,
+// fed to gtmux.on("agent-state").
+type agentChange struct {
+	session        string
+	window, pane   int
+	command, state string
+}
+
+// detectAgentStates derives a state for every pane whose foreground command
+// matches a gtmux.agents{} definition: "busy" while the title carries the
+// def's busy marker, "done" when the window's bell rings (the agent finished a
+// turn / wants input), "idle" otherwise. Focusing a done pane acknowledges it
+// back to idle. Changes queue for gtmux.on("agent-state"); the first snapshot
+// only primes (agentSeeded), like alerts.
+func (c *compositor) detectAgentStates(snap *proto.StateSnapshot) {
+	if len(c.agentDefs) == 0 {
+		return
+	}
+	if c.agentState == nil {
+		c.agentState = map[int]string{}
+		c.agentBell = map[string]bool{}
+	}
+	seen := map[int]bool{}
+	for _, s := range snap.Sessions {
+		for _, w := range s.Windows {
+			key := s.Name + "\x00" + strconv.Itoa(w.Index)
+			bellEdge := c.agentSeeded && w.Bell && !c.agentBell[key]
+			c.agentBell[key] = w.Bell
+			for _, p := range w.Panes {
+				seen[p.ID] = true
+				var def *config.AgentDef
+				for i := range c.agentDefs {
+					if p.Command != "" && strings.Contains(p.Command, c.agentDefs[i].Match) {
+						def = &c.agentDefs[i]
+						break
+					}
+				}
+				if def == nil {
+					delete(c.agentState, p.ID)
+					continue
+				}
+				prev := c.agentState[p.ID]
+				state := prev
+				if state == "" {
+					state = "idle"
+				}
+				switch {
+				case def.Busy != "" && strings.Contains(p.Title, def.Busy):
+					state = "busy"
+				case bellEdge:
+					state = "done"
+				case prev == "busy":
+					state = "idle" // busy marker gone without a bell
+				}
+				if state == "done" && s.Attached && w.Active && p.Active {
+					state = "idle" // looking at it acknowledges the done flag
+				}
+				c.agentState[p.ID] = state
+				// prev=="" && idle is just the first classification, not a change.
+				if c.agentSeeded && state != prev && !(prev == "" && state == "idle") {
+					c.pendingAgent = append(c.pendingAgent, agentChange{
+						session: s.Name, window: w.Index, pane: p.ID,
+						command: p.Command, state: state,
+					})
+				}
+			}
+		}
+	}
+	for id := range c.agentState {
+		if !seen[id] {
+			delete(c.agentState, id)
+		}
+	}
+	c.agentSeeded = true
+}
+
+// drainAgentChanges returns and clears the queued agent-state changes.
+func (c *compositor) drainAgentChanges() []agentChange {
+	if len(c.pendingAgent) == 0 {
+		return nil
+	}
+	out := c.pendingAgent
+	c.pendingAgent = nil
+	return out
+}
+
 // setPaneBorder overrides pane id's border color (pane:set_border). An empty
 // or unknown color clears the override. Returns the bytes to repaint the
 // affected border rows. Caller holds compMu.
@@ -878,6 +1057,14 @@ func (c *compositor) apply(msg *proto.ServerMsg) []byte {
 			c.snapshot = msg.Status.Snapshot
 			c.detectAlerts(msg.Status.Snapshot)
 			c.detectProgramChanges(msg.Status.Snapshot)
+			c.detectAgentStates(msg.Status.Snapshot)
+		}
+		// #{pane_agent_state}: the active pane's derived agent state, a
+		// client-owned var laid over the server's map before expansion.
+		if id, ok := strings.CutPrefix(msg.Status.Vars["pane_id"], "%"); ok {
+			if n, err := strconv.Atoi(id); err == nil {
+				msg.Status.Vars["pane_agent_state"] = c.agentState[n]
+			}
 		}
 		if c.expander == nil {
 			iv := c.cfg.StatusInterval
@@ -2087,7 +2274,8 @@ func (c *compositor) reload(cfg config.ClientConfig, binds *config.ClientBinds) 
 // rebuildWidgets recreates the status/dock/float widgets from c.cfg.Widgets,
 // dropping the previous set. Shared by attach-time setup and reload.
 func (c *compositor) rebuildWidgets(binds *config.ClientBinds) {
-	c.statusWidget, c.docks, c.overlays = nil, nil, nil
+	c.statusWidget, c.docks, c.overlays, c.focusedDock = nil, nil, nil, nil
+	c.agentDefs = binds.Agents
 	for _, w := range c.cfg.Widgets {
 		b := &textBox{
 			row: w.Row, col: w.Col, format: w.Text,
@@ -2095,6 +2283,7 @@ func (c *compositor) rebuildWidgets(binds *config.ClientBinds) {
 			fg:    w.FG, bg: w.BG, attr: w.Attr,
 			dock: w.Dock, size: w.Size,
 			textFn: w.TextFn, drawFn: w.Draw, component: w.Component, onClick: w.OnClick, binds: binds, interval: w.Interval,
+			onKey: w.OnKey, focus: w.Focus, name: w.Name,
 			w: w.Width, h: w.Height, // float draw size; docks override w/h per tick
 		}
 		switch w.Dock {

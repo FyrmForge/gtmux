@@ -583,11 +583,34 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 						os.Stdout.Write(comp.redraw())
 					}
 					compMu.Unlock()
+				} else if op.Dock != "" {
+					compMu.Lock()
+					if comp != nil {
+						comp.toggleDockFocus(op.Dock)
+						os.Stdout.Write(comp.redraw())
+					}
+					compMu.Unlock()
 				} else if op.Command != "" {
 					if argv := tokenize(op.Command); len(argv) > 0 {
 						dispatch(argv)
 					}
 				} else if len(op.Action) > 0 {
+					// Pane navigation at the window edge steps into a nav-focusable
+					// dock on that side instead of bouncing off the edge server-side.
+					// (select-pane-vim is left alone: the server may hand the key to
+					// vim, which the client can't predict.)
+					if op.Action[0] == "select-pane" && len(op.Action) == 2 {
+						consumed := false
+						compMu.Lock()
+						if comp != nil && comp.focusDockNav(op.Action[1]) {
+							consumed = true
+							os.Stdout.Write(comp.redraw())
+						}
+						compMu.Unlock()
+						if consumed {
+							continue
+						}
+					}
 					dispatch(op.Action)
 				}
 			}
@@ -959,6 +982,24 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 						os.Stdout.Write(comp.redraw())
 						compMu.Unlock()
 						runOps(mops)
+					case comp != nil && comp.focusedDock != nil:
+						// A focused dock grabs every key, like a modal, until its
+						// on_key calls ui:close() to hand focus back to the pane.
+						var dops []config.BindOp
+						for _, name := range decodeKeys(pass) {
+							o, cl := comp.dockKey(name)
+							dops = append(dops, o...)
+							if cl {
+								comp.setDockFocus(comp.focusedDock, false)
+								break
+							}
+						}
+						if comp.focusedDock != nil {
+							comp.focusedDock.rerender()
+						}
+						os.Stdout.Write(comp.redraw())
+						compMu.Unlock()
+						runOps(dops)
 					case comp != nil && comp.copy != nil:
 						out, res := comp.copyFeed(pass)
 						os.Stdout.Write(out)
@@ -1153,6 +1194,7 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 			out := comp.apply(&msg)
 			alerts := comp.drainAlerts()
 			progChanges := comp.drainProgramChanges()
+			agentChanges := comp.drainAgentChanges()
 			compMu.Unlock()
 			os.Stdout.Write(out)
 			// Fire gtmux.on callbacks outside compMu (Run* take vmMu). A callback
@@ -1163,6 +1205,9 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 			}
 			for _, pc := range progChanges {
 				applyHookOps(curBinds().RunProgramChanged(pc.session, pc.window, pc.pane, pc.command, pc.from))
+			}
+			for _, ac := range agentChanges {
+				applyHookOps(curBinds().RunAgentState(ac.session, ac.window, ac.pane, ac.command, ac.state))
 			}
 		}
 		conn.Close()

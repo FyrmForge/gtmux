@@ -92,6 +92,30 @@ end }
 -- edge, live data panels, clickable UIs driven by Lua queries, and 2D drawing —
 -- boxes/borders/separators via a canvas `draw` fn). Off by default; not a tmux
 -- feature. See gtmux.widget / gtmux.sessions / find_panes / draw docs.
+--
+-- A dock can also take keyboard focus: give it `on_key` plus `focus = "nav"`
+-- (pane navigation at the window edge steps into it), "bind"
+-- (gtmux.focus_dock(name), needs `name = ...`), or "both". While focused every
+-- key goes to on_key — ui:state().focused is true so the component can show a
+-- highlight — until on_key calls ui:close() (e.g. on Escape, or the nav key
+-- pointing back at the panes). Example skeleton for a left session list:
+-- gtmux.widget{ dock = "left", size = 20, name = "sessions", focus = "both",
+--   component = function(props, ui)
+--     local st = ui:state(); st.sel = st.sel or 1
+--     for i, s in ipairs(gtmux.sessions()) do
+--       local style = (st.focused and i == st.sel) and "fg=black,bg=yellow" or ""
+--       ui:text(0, i - 1, s.name, style)
+--     end
+--   end,
+--   on_key = function(key, ui)
+--     local st = ui:state(); st.sel = st.sel or 1
+--     if key == "j" or key == "Down" then st.sel = st.sel + 1
+--     elseif key == "k" or key == "Up" then st.sel = math.max(1, st.sel - 1)
+--     elseif key == "Enter" then
+--       local s = gtmux.sessions()[st.sel]; if s then gtmux.switch_session(s.name) end
+--     elseif key == "Escape" or key == "Right" or key == "l" then ui:close()
+--     end
+--   end }
 
 -- Prefix key and keybinds. The client owns all input: it tracks the prefix,
 -- resolves the bound key to an action, and either sends that action to the
@@ -355,16 +379,27 @@ gtmux.bind_root("C-\\", function() gtmux.select_pane_vim("last") end)
 -- {event, session, window, name, command, title}. Needs monitor-bell /
 -- monitor-activity / monitor-silence on for the window to set the flag.
 --
--- Command awareness for agents: coding agents (Claude Code, Codex, opencode…)
--- ring the terminal bell when a turn finishes / they need you. This surfaces
--- that as a desktop notification so you know across windows. Edit the pattern
--- or the action (notify-send is Linux; use terminal-notifier on macOS).
-local agent = "claude codex opencode aider"
-gtmux.on("alert-bell", function(w)
-	if w.command == "" or not agent:find(w.command, 1, true) then return end
+-- Agent awareness: declare which foreground commands are coding agents.
+-- gtmux derives a per-pane state from them — "busy" while the pane title
+-- carries the busy marker, "done" when the bell rings (turn finished / needs
+-- you; focusing the pane clears it), "idle" otherwise. The state shows up
+-- three ways: gtmux.on("agent-state") below, the #{pane_agent_state} status
+-- format var, and pane:set_border from the hook.
+gtmux.agents{
+	{ match = "claude", busy = "✳" }, -- Claude Code spins ✳ in the title while working
+	{ match = "codex" },
+	{ match = "opencode" },
+	{ match = "aider" },
+	{ match = "gemini" },
+	{ match = "amp" },
+}
+-- Desktop notification when an agent finishes, wherever its window is.
+-- (notify-send is Linux; use terminal-notifier on macOS.)
+gtmux.on("agent-state", function(p)
+	if p.state ~= "done" then return end
 	os.execute(string.format(
 		"notify-send 'gtmux' '%s: %s is done' 2>/dev/null &",
-		w.name, w.command))
+		p.session, p.command))
 end)
 
 -- Command-exit awareness (OSC 133 shell integration): fires when a command run

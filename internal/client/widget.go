@@ -54,7 +54,9 @@ type textBox struct {
 	drawFn    *lua.LFunction
 	component *lua.LFunction
 	onClick   *lua.LFunction
-	onKey     *lua.LFunction // modal keyboard handler (gtmux.open on_key)
+	onKey     *lua.LFunction // modal keyboard handler (gtmux.open on_key / focusable dock)
+	focus     string         // dock focusability: "nav" | "bind" | "both" | ""
+	name      string         // dock name for gtmux.focus_dock(name)
 	binds     *config.ClientBinds
 	canvas    *config.Canvas
 	regions   []config.Region // clickable rects emitted by the last draw (component)

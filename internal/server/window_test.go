@@ -42,6 +42,32 @@ func TestZoomedLayout(t *testing.T) {
 	}
 }
 
+func TestClosePaneFocusRestore(t *testing.T) {
+	// Focus order p1 → p3 → p2; killing p2 must return focus to p3 (the
+	// previously-focused pane), not p1 (panes[0]).
+	p1 := &pane{id: 1}
+	p2 := &pane{id: 2}
+	p3 := &pane{id: 3}
+	w := &window{
+		cols: 10, rows: 10,
+		panes: []*pane{p1, p2, p3},
+		root: &layoutNode{
+			dir: splitVertical,
+			a:   &layoutNode{pane: p1},
+			b:   &layoutNode{dir: splitVertical, a: &layoutNode{pane: p2}, b: &layoutNode{pane: p3}},
+		},
+	}
+	w.setActive(p1)
+	w.setActive(p3)
+	w.setActive(p2)
+	if !w.closePane(p2) {
+		t.Fatal("closePane reported last pane")
+	}
+	if w.active != p3 {
+		t.Errorf("focus after close = pane %d, want pane 3", w.active.id)
+	}
+}
+
 func TestWindowLayout(t *testing.T) {
 	active := &pane{id: 1, rect: rect{Row: 0, Col: 0, Rows: 5, Cols: 4}}
 	other := &pane{id: 2, rect: rect{Row: 0, Col: 5, Rows: 5, Cols: 4}}

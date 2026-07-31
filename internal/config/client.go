@@ -140,6 +140,16 @@ type WidgetSpec struct {
 	// Interval throttles TextFn/Draw re-runs to at most once per Interval seconds
 	// (0 = every status tick). A clock wants 1; a session list can be lazier.
 	Interval int
+	// OnKey, if set with Focus, makes a docked widget focusable: while focused
+	// every key routes to OnKey (like a modal) until it calls ui:close(). The
+	// component sees state.focused = true while focused.
+	OnKey *lua.LFunction
+	// Focus says how the dock can gain focus: "nav" (pane navigation at the
+	// window edge steps into it), "bind" (gtmux.focus_dock(name)), "both", or
+	// "" (not focusable, the default).
+	Focus string
+	// Name identifies the dock for gtmux.focus_dock(name).
+	Name string
 }
 
 // Region is a widget-local clickable rectangle a component emits via ui:on_click
@@ -512,6 +522,7 @@ type BindOp struct {
 	Modal   *ModalOpen  // open a modal keyboard widget (gtmux.open{...})
 	Command string      // a raw command line the client tokenizes + dispatches (gtmux.run_command)
 	Border  *PaneBorder // set a pane's border override color (pane:set_border)
+	Dock    string      // toggle focus on the named dock (gtmux.focus_dock)
 }
 
 // PaneBorder is a per-pane border color override (pane:set_border("red")): the
@@ -562,6 +573,23 @@ type ClientBinds struct {
 	// "alert-silence", tmux's alert-* hooks) to the Lua callbacks registered via
 	// gtmux.on. The client fires them on a window's false→true flag edge.
 	Alerts map[string][]*lua.LFunction
+	// Agents are the coding-agent definitions from gtmux.agents{}; the
+	// compositor derives per-pane agent states from them.
+	Agents []AgentDef
+}
+
+// AgentDef declares one coding agent (gtmux.agents{}): Match is a substring of
+// the pane's foreground command; Busy (optional) is a substring of the pane
+// title that means the agent is working (e.g. Claude Code's "✳" spinner).
+type AgentDef struct {
+	Match, Busy string
+}
+
+// RunAgentState fires "agent-state" with a pane object carrying the agent's
+// command and its new state ("busy" | "done" | "idle").
+func (c *ClientBinds) RunAgentState(session string, window, paneID int, command, state string) []BindOp {
+	return c.RunPaneEvent("agent-state", session, window, paneID,
+		map[string]lua.LValue{"command": lua.LString(command), "state": lua.LString(state)})
 }
 
 // AlertEvent describes a window flag transition the client detected in a
@@ -1042,6 +1070,19 @@ func (c *ClientBinds) RunKey(onKey *lua.LFunction, key string, state *lua.LTable
 	return ops, closed
 }
 
+// MarkFocused stamps state.focused for a focusable dock, creating the state
+// table if the widget hasn't rendered yet — so its component/on_key always
+// share one table and the first focused render already sees the flag.
+func (c *ClientBinds) MarkFocused(state *lua.LTable, on bool) *lua.LTable {
+	c.vmMu.Lock()
+	defer c.vmMu.Unlock()
+	if state == nil {
+		state = c.l.NewTable()
+	}
+	state.RawSetString("focused", lua.LBool(on))
+	return state
+}
+
 // RunAlert fires the callbacks registered for ev.Event, each with a table
 // describing the window, and returns the BindOps their primitives recorded (so
 // a callback can select-window, run-command, etc.). Under vmMu, like RunKey.
@@ -1379,7 +1420,23 @@ func LoadClientWith(path string, overrides [][2]string) (ClientConfig, *ClientBi
 		if v, ok := t.RawGetString("size").(lua.LNumber); ok {
 			ws.Size = int(v)
 		}
+		if fn, ok := t.RawGetString("on_key").(*lua.LFunction); ok {
+			ws.OnKey = fn
+		}
+		if v, ok := t.RawGetString("focus").(lua.LString); ok {
+			ws.Focus = string(v)
+		}
+		if v, ok := t.RawGetString("name").(lua.LString); ok {
+			ws.Name = string(v)
+		}
 		cfg.Widgets = append(cfg.Widgets, ws)
+		return 0
+	}))
+	// focus_dock(name) toggles keyboard focus on the named dock (a widget with
+	// focus="bind"/"both"): while focused its on_key receives every key until it
+	// calls ui:close() or the bind fires again.
+	L.SetField(tbl, "focus_dock", L.NewFunction(func(l *lua.LState) int {
+		binds.ops = append(binds.ops, BindOp{Dock: l.CheckString(1)})
 		return 0
 	}))
 
@@ -1783,6 +1840,28 @@ func LoadClientWith(path string, overrides [][2]string) (ClientConfig, *ClientBi
 	L.SetField(tbl, "on", L.NewFunction(func(l *lua.LState) int {
 		event := l.CheckString(1)
 		binds.Alerts[event] = append(binds.Alerts[event], l.CheckFunction(2))
+		return 0
+	}))
+	// agents{ {match="claude", busy="✳"}, ... } declares which foreground
+	// commands are coding agents. The client derives a per-pane state from them
+	// (busy: title contains the busy marker; done: bell rang; idle otherwise),
+	// fires gtmux.on("agent-state") on changes and exposes the active pane's
+	// state as #{pane_agent_state}.
+	L.SetField(tbl, "agents", L.NewFunction(func(l *lua.LState) int {
+		defs := l.CheckTable(1)
+		defs.ForEach(func(_, v lua.LValue) {
+			t, ok := v.(*lua.LTable)
+			if !ok {
+				return
+			}
+			d := AgentDef{
+				Match: lua.LVAsString(t.RawGetString("match")),
+				Busy:  lua.LVAsString(t.RawGetString("busy")),
+			}
+			if d.Match != "" {
+				binds.Agents = append(binds.Agents, d)
+			}
+		})
 		return 0
 	}))
 	// bind_root is tmux's bind -n: no prefix, the bare key fires it.

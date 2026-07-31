@@ -353,7 +353,16 @@ func (w *window) closePane(p *pane) bool {
 	}
 
 	if w.active == p {
-		w.setActive(w.panes[0])
+		// Focus returns to the previously-focused pane: activePoint already
+		// stamps panes in MRU order on every setActive, so the survivor with
+		// the newest stamp IS the focus history — no separate stack needed.
+		best := w.panes[0]
+		for _, pp := range w.panes[1:] {
+			if pp.activePoint > best.activePoint {
+				best = pp
+			}
+		}
+		w.setActive(best)
 	}
 	w.reflow()
 	return true
