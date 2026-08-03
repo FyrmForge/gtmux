@@ -13,6 +13,11 @@ import (
 // that — fine at this scale, revisit if per-session git spawning shows up
 // in profiling.
 func gitBranch(dir string) string {
+	if dir == "" {
+		// Unknown pane cwd (e.g. the lookup failed): report nothing rather
+		// than letting git -C "" answer for the daemon's own directory.
+		return ""
+	}
 	out, err := exec.Command("git", "-C", dir, "rev-parse", "--abbrev-ref", "HEAD").Output()
 	if err != nil {
 		return ""

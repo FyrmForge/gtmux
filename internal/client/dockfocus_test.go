@@ -81,3 +81,10 @@ gtmux.bind("e", function() gtmux.focus_dock("list") end)
 		t.Fatal("focus_dock again should unfocus")
 	}
 }
+
+// addDock registers a dock the way rebuildWidgets does (allDocks + visibility
+// refresh), so tests exercise the same path as config-built docks.
+func (c *compositor) addDock(d *textBox) {
+	c.allDocks = append(c.allDocks, d)
+	c.refreshDocks()
+}

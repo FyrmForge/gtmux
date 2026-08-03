@@ -97,3 +97,23 @@ Gaps then fall out as one parameter of the client's tree walk.
 
 Open ends: e2e harness drives rendering via server rects today — stage 2/4
 touches it; copy-mode geometry (client already has rects, should follow).
+
+# responsive docks + toggle
+
+Small-screen story (phone attach). Custom views are orthogonal; this is all
+client-side. Agreed order: 1+2 now, 3 separately after.
+
+1. `min_cols = N` on a dock definition: dock auto-hides when the client's
+   physical width < N. Per-widget breakpoint, CSS-media-query style.
+2. `gtmux.toggle_dock(name)` bind primitive: manual show/hide. Three states:
+   auto / forced-on / forced-off. Toggle flips between the forced states
+   (override wins over the breakpoint until toggled again).
+3. `gtmux.responsive{ cols_below = N, mode = "maximize" }`: auto-zoom +
+   cycle-stays-zoomed on small clients. Zoom-based for now (caveat: zoom is
+   session state, other attached clients see it); mechanism swaps to
+   client-side after the client-owned-geometry migration.
+
+Mechanics for 1+2: compositor keeps allDocks (registered) vs docks (visible
+subset), refreshed on setPhysical/rebuild/toggle; size reported to the server
+comes from the visible set (comp.reportSize), so hiding a dock gives the
+window its columns back.

@@ -164,7 +164,8 @@
       "Bash(gofmt -d internal/client/copymode.go)",
       "Bash(grep -oiE \"\\(shift\\\\+\\)?\\(pageup|pagedown|page up|page down\\)[^\\\\\"'\\\\`,;{}]{0,60}\")",
       "Bash(grep -oiE \"[^\\\\\"'\\\\`]{0,80}scroll[^\\\\\"'\\\\`]{0,80}\")",
-      "Bash(git *)"
+      "Bash(git *)",
+      "Bash(go run *)"
     ]
   }
 }

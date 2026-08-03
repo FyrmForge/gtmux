@@ -57,6 +57,8 @@ type textBox struct {
 	onKey     *lua.LFunction // modal keyboard handler (gtmux.open on_key / focusable dock)
 	focus     string         // dock focusability: "nav" | "bind" | "both" | ""
 	name      string         // dock name for gtmux.focus_dock(name)
+	minCols   int            // auto-hide when client width < minCols (0 = never)
+	forced    int8           // toggle_dock override: 0 auto, 1 shown, -1 hidden
 	binds     *config.ClientBinds
 	canvas    *config.Canvas
 	regions   []config.Region // clickable rects emitted by the last draw (component)
@@ -65,6 +67,16 @@ type textBox struct {
 	interval  int
 	lastRun   time.Time
 	lastSig   string // last canvasSig, so the animation ticker skips unchanged frames
+}
+
+// hidden reports whether a docked widget should be dropped from the visible
+// set at client width cols: a toggle_dock override wins outright; otherwise
+// the min_cols breakpoint decides (cols 0 = size unknown yet, show it).
+func (b *textBox) hidden(cols int) bool {
+	if b.forced != 0 {
+		return b.forced < 0
+	}
+	return b.minCols > 0 && cols > 0 && cols < b.minCols
 }
 
 // canvasSig is a cheap content signature (glyph chars per row) used to detect

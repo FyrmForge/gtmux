@@ -108,10 +108,16 @@ func statusReserve(sl int) int {
 }
 
 // dockInset sums the size of docked widgets on the given edges (used to shrink
-// the window size the client reports to the server).
-func dockInset(widgets []config.WidgetSpec, edges ...string) int {
+// the window size the client reports to the server). cols is the client's
+// physical width, so min_cols-hidden docks don't count; this static path only
+// serves attach time — after that comp.reportSize (which also knows
+// toggle_dock state) is the source of truth.
+func dockInset(widgets []config.WidgetSpec, cols int, edges ...string) int {
 	n := 0
 	for _, w := range widgets {
+		if w.MinCols > 0 && cols > 0 && cols < w.MinCols {
+			continue
+		}
 		for _, e := range edges {
 			if w.Dock == e {
 				n += w.Size
@@ -133,8 +139,8 @@ func frameReserve(borders string) int {
 // contentRows is the window height the client reports to the server: physical
 // rows minus the status rows, any top/bottom docks, and the framed border (never
 // below 1).
-func contentRows(rows, sl int, widgets []config.WidgetSpec, borders string) int {
-	if r := rows - statusReserve(sl) - dockInset(widgets, "top", "bottom") - frameReserve(borders); r > 0 {
+func contentRows(rows, cols, sl int, widgets []config.WidgetSpec, borders string) int {
+	if r := rows - statusReserve(sl) - dockInset(widgets, cols, "top", "bottom") - frameReserve(borders); r > 0 {
 		return r
 	}
 	return 1
@@ -144,7 +150,7 @@ func contentRows(rows, sl int, widgets []config.WidgetSpec, borders string) int 
 // cols minus the columns reserved by left/right docks and the framed border
 // (never below 1).
 func contentCols(cols int, widgets []config.WidgetSpec, borders string) int {
-	if c := cols - dockInset(widgets, "left", "right") - frameReserve(borders); c > 0 {
+	if c := cols - dockInset(widgets, cols, "left", "right") - frameReserve(borders); c > 0 {
 		return c
 	}
 	return 1
@@ -319,24 +325,31 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 	applyCfg := func(newCfg config.ClientConfig, newBinds *config.ClientBinds) {
 		installHooks(newBinds)
 		bindsPtr.Store(newBinds)
+		reported := false
+		var rc, rr int
 		compMu.Lock()
 		if comp != nil {
 			// newBinds owns the new config's widget fns — reload rebuilds the
 			// widgets against it, so a re-sourced status bar/dock actually changes.
 			os.Stdout.Write(comp.reload(newCfg, newBinds))
+			rc, rr = comp.reportSize()
+			reported = true
 		}
 		compMu.Unlock()
 		// Re-report our size with the NEW insets: docks and pane_borders="framed"
-		// change how many rows/cols the window gets (dockInset/frameReserve), and
-		// the server owns the layout. Without this the compositor renders the new
-		// chrome against the OLD layout until some unrelated resize — toggling
-		// pane_borders live left the dock's box drawn for the old height, so its
-		// bottom border landed on a row framed now treats as frame and vanished.
-		// Sent outside compMu (lock order vs the SIGWINCH goroutine).
-		if cols, rows, err := term.GetSize(int(os.Stdout.Fd())); err == nil {
+		// change how many rows/cols the window gets, and the server owns the
+		// layout. Without this the compositor renders the new chrome against the
+		// OLD layout until some unrelated resize — toggling pane_borders live
+		// left the dock's box drawn for the old height, so its bottom border
+		// landed on a row framed now treats as frame and vanished. From
+		// comp.reportSize so min_cols-hidden docks aren't counted. Sent outside
+		// compMu (lock order vs the SIGWINCH goroutine).
+		if reported {
+			send(&proto.ClientMsg{Resize: &proto.Resize{Cols: rc, Rows: rr}})
+		} else if cols, rows, err := term.GetSize(int(os.Stdout.Fd())); err == nil {
 			send(&proto.ClientMsg{Resize: &proto.Resize{
 				Cols: contentCols(cols, newCfg.Widgets, newCfg.PaneBorders),
-				Rows: contentRows(rows, newCfg.StatusLines, newCfg.Widgets, newCfg.PaneBorders),
+				Rows: contentRows(rows, cols, newCfg.StatusLines, newCfg.Widgets, newCfg.PaneBorders),
 			}})
 		}
 	}
@@ -590,6 +603,22 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 						os.Stdout.Write(comp.redraw())
 					}
 					compMu.Unlock()
+				} else if op.ToggleDock != "" {
+					// Visibility toggle changes the window's usable size, so the
+					// server must re-layout: re-report from the visible set. Send
+					// outside compMu (lock order vs the SIGWINCH goroutine).
+					var rc, rr int
+					toggled := false
+					compMu.Lock()
+					if comp != nil && comp.toggleDock(op.ToggleDock) {
+						os.Stdout.Write(comp.redraw())
+						rc, rr = comp.reportSize()
+						toggled = true
+					}
+					compMu.Unlock()
+					if toggled {
+						send(&proto.ClientMsg{Resize: &proto.Resize{Cols: rc, Rows: rr}})
+					}
 				} else if op.Command != "" {
 					if argv := tokenize(op.Command); len(argv) > 0 {
 						dispatch(argv)
@@ -1049,13 +1078,22 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 			if err != nil {
 				continue
 			}
-			send(&proto.ClientMsg{Resize: &proto.Resize{Cols: contentCols(cols, cliCfg.Widgets, cliCfg.PaneBorders), Rows: contentRows(rows, cliCfg.StatusLines, cliCfg.Widgets, cliCfg.PaneBorders)}})
+			// setPhysical first: the new width may cross a dock's min_cols
+			// breakpoint, and the size we report must match what's visible.
+			rc, rr := contentCols(cols, cliCfg.Widgets, cliCfg.PaneBorders), contentRows(rows, cols, cliCfg.StatusLines, cliCfg.Widgets, cliCfg.PaneBorders)
+			var respAct []string
 			compMu.Lock()
 			if comp != nil {
 				comp.setPhysical(cols, rows)
+				rc, rr = comp.reportSize()
+				respAct = comp.responsiveAction()
 				os.Stdout.Write(comp.redraw())
 			}
 			compMu.Unlock()
+			send(&proto.ClientMsg{Resize: &proto.Resize{Cols: rc, Rows: rr}})
+			if respAct != nil {
+				send(&proto.ClientMsg{Action: &proto.Action{Args: respAct}})
+			}
 		}
 	}()
 
@@ -1084,7 +1122,7 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 				env[kv[:i]] = kv[i+1:]
 			}
 		}
-		if err := send(&proto.ClientMsg{Attach: &proto.Attach{Session: target, Cols: contentCols(cols, cliCfg.Widgets, cliCfg.PaneBorders), Rows: contentRows(rows, cliCfg.StatusLines, cliCfg.Widgets, cliCfg.PaneBorders), Cwd: cwd, Create: create, GroupTarget: groupTarget, ReadOnly: readOnly, StatusCmds: serverCmds, StatusInterval: cliCfg.StatusInterval, Env: env, WantSnapshot: wantSnapshot(cliCfg.Widgets)}}); err != nil {
+		if err := send(&proto.ClientMsg{Attach: &proto.Attach{Session: target, Cols: contentCols(cols, cliCfg.Widgets, cliCfg.PaneBorders), Rows: contentRows(rows, cols, cliCfg.StatusLines, cliCfg.Widgets, cliCfg.PaneBorders), Cwd: cwd, Create: create, GroupTarget: groupTarget, ReadOnly: readOnly, StatusCmds: serverCmds, StatusInterval: cliCfg.StatusInterval, Env: env, WantSnapshot: wantSnapshot(cliCfg.Widgets)}}); err != nil {
 			conn.Close()
 			return err
 		}
@@ -1192,11 +1230,17 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 			}
 			compMu.Lock()
 			out := comp.apply(&msg)
+			respAct := comp.responsiveAction()
 			alerts := comp.drainAlerts()
 			progChanges := comp.drainProgramChanges()
 			agentChanges := comp.drainAgentChanges()
 			compMu.Unlock()
 			os.Stdout.Write(out)
+			if respAct != nil {
+				// responsive maximize: auto-(un)zoom on a breakpoint crossing.
+				// Sent outside compMu like any other action.
+				send(&proto.ClientMsg{Action: &proto.Action{Args: respAct}})
+			}
 			// Fire gtmux.on callbacks outside compMu (Run* take vmMu). A callback
 			// most often notifies via os.execute (zero ops); any set_border /
 			// run_command / action it records applies like a keybind.

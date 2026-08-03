@@ -116,6 +116,19 @@ end }
 --     elseif key == "Escape" or key == "Right" or key == "l" then ui:close()
 --     end
 --   end }
+--
+-- Responsive: `min_cols = 120` on a dock auto-hides it when the client is
+-- narrower (a phone attach sheds chrome; the window gets the columns back).
+-- Bind gtmux.toggle_dock(name) to show/hide it manually — the toggle
+-- overrides the breakpoint until toggled again:
+-- gtmux.bind("b", function() gtmux.toggle_dock("sessions") end)
+--
+-- Small-screen maximize: below cols_below the client keeps the active pane
+-- zoomed (one pane at a time, phone-style); crossing back above unzooms.
+-- next_pane/prev_pane cycle panes KEEPING the zoom. Zoom is session state, so
+-- other attached clients see it too. Pair with min_cols on your docks.
+-- gtmux.responsive{ cols_below = 90 }
+-- gtmux.bind("Tab", function() gtmux.next_pane() end)
 
 -- Prefix key and keybinds. The client owns all input: it tracks the prefix,
 -- resolves the bound key to an action, and either sends that action to the

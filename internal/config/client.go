@@ -62,6 +62,12 @@ type ClientConfig struct {
 	StatusRight        string
 	StatusInterval     int    // #client()/#server() cache cadence, seconds
 	ModeKeys           string // copy-mode keytable: "vi" (default) or "emacs"
+	// gtmux.responsive{}: below RespBelow physical cols the client keeps the
+	// active pane zoomed (RespMode "maximize" — the only mode yet), so a small
+	// client (phone attach) sees one pane at a time; cycle with next_pane/
+	// prev_pane. 0 = off. Zoom is session state: other attached clients see it.
+	RespBelow int
+	RespMode  string
 	StatusKeys         string // command-prompt editing: "emacs" (default; C-u/C-w kill keys) or "vi" (plain — no modal editing, ESC cancels)
 	SetClipboard       string // tmux set-clipboard: "external"/"on" (default; copy-mode yank emits OSC 52 to the outer clipboard) or "off"
 	// Copy-mode mouse behavior. In tmux these are copy-mode-vi keybinds
@@ -149,6 +155,10 @@ type WidgetSpec struct {
 	Focus string
 	// Name identifies the dock for gtmux.focus_dock(name).
 	Name string
+	// MinCols auto-hides a docked widget when the client's physical width is
+	// below it (0 = always shown). A per-widget breakpoint, so small clients
+	// (a phone attach) shed chrome without a separate config.
+	MinCols int
 }
 
 // Region is a widget-local clickable rectangle a component emits via ui:on_click
@@ -518,6 +528,7 @@ type BindOp struct {
 	Command string      // a raw command line the client tokenizes + dispatches (gtmux.run_command)
 	Border  *PaneBorder // set a pane's border override color (pane:set_border)
 	Dock    string      // toggle focus on the named dock (gtmux.focus_dock)
+	ToggleDock string   // toggle visibility of the named dock (gtmux.toggle_dock)
 }
 
 // PaneBorder is a per-pane border color override (pane:set_border("red")): the
@@ -1425,6 +1436,9 @@ func LoadClientWith(path string, overrides [][2]string) (ClientConfig, *ClientBi
 		if v, ok := t.RawGetString("name").(lua.LString); ok {
 			ws.Name = string(v)
 		}
+		if v, ok := t.RawGetString("min_cols").(lua.LNumber); ok {
+			ws.MinCols = int(v)
+		}
 		cfg.Widgets = append(cfg.Widgets, ws)
 		return 0
 	}))
@@ -1433,6 +1447,26 @@ func LoadClientWith(path string, overrides [][2]string) (ClientConfig, *ClientBi
 	// calls ui:close() or the bind fires again.
 	L.SetField(tbl, "focus_dock", L.NewFunction(func(l *lua.LState) int {
 		binds.ops = append(binds.ops, BindOp{Dock: l.CheckString(1)})
+		return 0
+	}))
+	// responsive{cols_below=N, mode="maximize"} keeps the active pane zoomed
+	// while the client is narrower than N cols; cycle with next_pane/prev_pane.
+	L.SetField(tbl, "responsive", L.NewFunction(func(l *lua.LState) int {
+		t := l.CheckTable(1)
+		if v, ok := t.RawGetString("cols_below").(lua.LNumber); ok {
+			cfg.RespBelow = int(v)
+		}
+		cfg.RespMode = "maximize"
+		if v, ok := t.RawGetString("mode").(lua.LString); ok {
+			cfg.RespMode = string(v)
+		}
+		return 0
+	}))
+	// toggle_dock(name) toggles the named dock's visibility. Overrides a
+	// min_cols auto-hide: once toggled the dock stays forced shown/hidden
+	// until toggled again (reload returns it to auto).
+	L.SetField(tbl, "toggle_dock", L.NewFunction(func(l *lua.LState) int {
+		binds.ops = append(binds.ops, BindOp{ToggleDock: l.CheckString(1)})
 		return 0
 	}))
 
@@ -1783,6 +1817,17 @@ func LoadClientWith(path string, overrides [][2]string) (ClientConfig, *ClientBi
 		if flag != "" {
 			binds.ops = append(binds.ops, BindOp{Action: []string{"select-pane-vim", flag}})
 		}
+		return 0
+	}))
+	// next_pane/prev_pane: cycle through panes by index, KEEPING zoom (tmux's
+	// select-pane -Z) — the responsive small-screen idiom: one maximized pane
+	// at a time, a bind flips to the next.
+	L.SetField(tbl, "next_pane", L.NewFunction(func(l *lua.LState) int {
+		binds.ops = append(binds.ops, BindOp{Action: []string{"select-pane", "-t", ":.+", "-Z"}})
+		return 0
+	}))
+	L.SetField(tbl, "prev_pane", L.NewFunction(func(l *lua.LState) int {
+		binds.ops = append(binds.ops, BindOp{Action: []string{"select-pane", "-t", ":.-", "-Z"}})
 		return 0
 	}))
 	L.SetField(tbl, "resize_pane", L.NewFunction(func(l *lua.LState) int {

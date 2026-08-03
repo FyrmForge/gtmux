@@ -267,21 +267,14 @@ func (p *pane) respawn(sessionName, command string) error {
 
 // currentCommand reports the name of the pane's foreground process (tmux's
 // pane_current_command): the process group currently in control of the pty,
-// not just the login shell, so it tracks into vim/nvim/etc.
+// not just the login shell, so it tracks into vim/nvim/etc. The name lookup
+// is per-platform (procfs_*.go): /proc on Linux, sysctl on macOS.
 func (p *pane) currentCommand() string {
 	pgid, err := unix.IoctlGetInt(int(p.pty.Fd()), unix.TIOCGPGRP)
 	if err != nil {
 		return ""
 	}
-	comm, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pgid))
-	if err != nil {
-		return ""
-	}
-	name := string(comm)
-	if n := len(name); n > 0 && name[n-1] == '\n' {
-		name = name[:n-1]
-	}
-	return name
+	return procComm(pgid)
 }
 
 func (p *pane) resize(r rect) {
@@ -293,14 +286,11 @@ func (p *pane) resize(r rect) {
 	p.term.Resize(geom.Vec2{R: r.Rows, C: r.Cols})
 }
 
-// cwd reads the pane's shell's actual current directory via /proc, which
-// reflects any `cd`s the user has run since the shell started.
+// cwd reads the pane's shell's actual current directory (per-platform, see
+// procfs_*.go), which reflects any `cd`s the user has run since the shell
+// started.
 func (p *pane) cwd() string {
-	link, err := os.Readlink(fmt.Sprintf("/proc/%d/cwd", p.cmd.Process.Pid))
-	if err != nil {
-		return ""
-	}
-	return link
+	return procCwd(p.cmd.Process.Pid)
 }
 
 func (p *pane) Close() {

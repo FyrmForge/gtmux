@@ -62,7 +62,7 @@ func TestFramedBorderActiveAndDockRows(t *testing.T) {
 	c := newCompositor()
 	c.cfg.PaneBorders = "framed"
 	c.cfg.InactiveBorderFG = emu.Red
-	c.docks = append(c.docks, &textBox{dock: "left", size: 4, fg: emu.White, bg: emu.Blue})
+	c.addDock(&textBox{dock: "left", size: 4, fg: emu.White, bg: emu.Blue})
 	c.setPhysical(20, 6)
 	c.apply(&proto.ServerMsg{
 		Layout: &proto.Layout{
@@ -98,7 +98,7 @@ func TestFramedBorderActiveAndDockRows(t *testing.T) {
 func TestDockSpansFrameRows(t *testing.T) {
 	c := newCompositor()
 	c.cfg.PaneBorders = "framed"
-	c.docks = append(c.docks, &textBox{dock: "left", size: 6, fg: emu.White, bg: emu.Black})
+	c.addDock(&textBox{dock: "left", size: 6, fg: emu.White, bg: emu.Black})
 	c.setPhysical(20, 6)
 	c.apply(&proto.ServerMsg{
 		Layout: &proto.Layout{Cols: 12, Rows: 3,

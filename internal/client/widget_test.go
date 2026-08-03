@@ -215,7 +215,7 @@ end }
 		dock: "right", size: 10, component: lastWidget(cfg).Component,
 		binds: binds, fg: emu.White, bg: emu.Black,
 	}
-	c.docks = append(c.docks, b) // before apply so rightInset counts it
+	c.addDock(b) // before apply so rightInset counts it
 	c.apply(&proto.ServerMsg{
 		Layout: &proto.Layout{
 			Cols: 20, Rows: 3,
@@ -303,7 +303,7 @@ func TestWidgetFormatReexpandsOnStatus(t *testing.T) {
 func TestLeftDockShiftsContent(t *testing.T) {
 	c := newCompositor()
 	c.setPhysical(10, 2) // 10 physical cols; row 0 = content, row 1 = status bar
-	c.docks = append(c.docks, &textBox{dock: "left", size: 3, lines: []string{"AB"}, fg: emu.White})
+	c.addDock(&textBox{dock: "left", size: 3, lines: []string{"AB"}, fg: emu.White})
 	// The window is laid out at the content width (10 - 3 = 7).
 	c.apply(&proto.ServerMsg{
 		Layout: &proto.Layout{
@@ -334,7 +334,7 @@ func TestLeftDockShiftsContent(t *testing.T) {
 func TestTopDockShiftsContentDown(t *testing.T) {
 	c := newCompositor()
 	c.setPhysical(8, 4) // row0 = top dock, rows1-2 = content, row3 = bottom status
-	c.docks = append(c.docks, &textBox{dock: "top", size: 1, lines: []string{"TOPBAR"}, fg: emu.White})
+	c.addDock(&textBox{dock: "top", size: 1, lines: []string{"TOPBAR"}, fg: emu.White})
 	c.apply(&proto.ServerMsg{
 		Layout: &proto.Layout{
 			Cols: 8, Rows: 2, // physical 4 - 1 top dock - 1 status

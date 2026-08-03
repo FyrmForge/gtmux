@@ -91,7 +91,12 @@ type compositor struct {
 	// or right edge (textBox.dock). They shrink the window content the client
 	// reports to the server; content flows in the middle. Horizontal (top/bottom)
 	// docking is still the status bar's job.
-	docks []*textBox
+	//
+	// docks holds only the currently-VISIBLE ones (min_cols breakpoints and
+	// toggle_dock overrides filter allDocks via refreshDocks) so every layout/
+	// paint/click path sees hidden docks as simply not there.
+	docks    []*textBox
+	allDocks []*textBox
 	// statusWidget, if set, is a component that paints the status rows (a widget
 	// registered with dock="status"). It replaces the bespoke renderBar content
 	// while the scaffolding (statusLines/status_position + the copy-mode/prompt/
@@ -109,6 +114,12 @@ type compositor struct {
 	// prose toggles prose highlighting in agent panes (gtmux.prose_highlight):
 	// buildRow recolors default-styled text by word category — a dyslexia aid.
 	prose bool
+	// Responsive-maximize state (gtmux.responsive): respKnown/respWasBelow
+	// track which side of the cols_below breakpoint the last evaluation saw
+	// (auto-zoom fires on crossings, not continuously — so a manual unzoom on
+	// a small screen sticks); respZoomed remembers WE zoomed, so growing wide
+	// again only unzooms what responsive zoomed, never a manual prefix+z.
+	respKnown, respWasBelow, respZoomed bool
 	// snapshot is the whole-server state the server pushes on each status tick when
 	// this client uses widget queries; the Lua primitives (gtmux.sessions/panes/…)
 	// read it. Nil until the first snapshot arrives.
@@ -250,6 +261,114 @@ func newCompositor() *compositor {
 // window it displays. Called on attach and on SIGWINCH.
 func (c *compositor) setPhysical(cols, rows int) {
 	c.phyCols, c.phyRows = cols, rows
+	c.refreshDocks() // a resize can cross a dock's min_cols breakpoint
+}
+
+// refreshDocks recomputes the visible-dock set from allDocks (min_cols
+// breakpoints at the current width + toggle_dock overrides). A dock that
+// hides while holding keyboard focus drops it.
+func (c *compositor) refreshDocks() {
+	c.docks = c.docks[:0:0]
+	for _, d := range c.allDocks {
+		if d.hidden(c.cols()) {
+			if c.focusedDock == d {
+				c.setDockFocus(d, false)
+			}
+			continue
+		}
+		c.docks = append(c.docks, d)
+	}
+}
+
+// toggleDock flips the named dock between forced-shown and forced-hidden
+// (gtmux.toggle_dock): whichever state it's in now — auto or forced — the
+// toggle forces the opposite, so it always visibly does something and wins
+// over the min_cols breakpoint until toggled again. Returns false if no dock
+// has that name. Config reload resets to auto.
+func (c *compositor) toggleDock(name string) bool {
+	for _, d := range c.allDocks {
+		if d.name != name {
+			continue
+		}
+		if d.hidden(c.cols()) {
+			d.forced = 1
+			// Size the canvas now so a draw/component dock paints this frame
+			// instead of blank-until-next-status-tick (mirrors apply's sizing).
+			if c.layout != nil {
+				if d.dock == "top" || d.dock == "bottom" {
+					d.w, d.h = c.cols(), d.size
+				} else {
+					d.w, d.h = d.size, c.layout.Rows+2*c.frameInset()
+				}
+				d.rerender()
+			}
+		} else {
+			d.forced = -1
+		}
+		c.refreshDocks()
+		return true
+	}
+	return false
+}
+
+// activeZoomed reports whether the current window is zoomed, from the status
+// push (WindowInfo.Zoomed). False until the first status arrives.
+func (c *compositor) activeZoomed() bool {
+	if c.status == nil {
+		return false
+	}
+	for _, w := range c.status.Windows {
+		if w.Active {
+			return w.Zoomed
+		}
+	}
+	return false
+}
+
+// responsiveAction implements gtmux.responsive{cols_below, mode="maximize"}:
+// called after every state change (server message applied, physical resize),
+// it returns the server action to send now — resize-pane -Z to zoom when the
+// client crosses BELOW the breakpoint (or first learns its size there), and
+// to unzoom when it crosses back above, IF the zoom was ours. Nil otherwise.
+// Edge-triggered on breakpoint crossings so the user's own zoom toggles on a
+// small screen aren't fought.
+func (c *compositor) responsiveAction() []string {
+	if c.cfg.RespBelow <= 0 || c.cfg.RespMode != "maximize" ||
+		c.phyCols == 0 || c.status == nil || c.layout == nil {
+		return nil
+	}
+	below := c.phyCols < c.cfg.RespBelow
+	crossed := !c.respKnown || below != c.respWasBelow
+	c.respKnown, c.respWasBelow = true, below
+	if !crossed {
+		return nil
+	}
+	if below && !c.activeZoomed() && len(c.layout.Panes) > 1 {
+		c.respZoomed = true
+		return []string{"resize-pane", "-Z"}
+	}
+	if !below && c.respZoomed {
+		c.respZoomed = false
+		if c.activeZoomed() {
+			return []string{"resize-pane", "-Z"}
+		}
+	}
+	return nil
+}
+
+// reportSize is the window size (cols, rows) the client reports to the server:
+// physical minus the chrome that's actually visible right now — status rows,
+// visible docks, the framed border. The static contentCols/contentRows pair in
+// client.go covers attach time (before any toggle state exists); after that,
+// every Resize should come from here so hidden docks give their space back.
+func (c *compositor) reportSize() (int, int) {
+	cols := c.contentCols()
+	rows := c.totalRows() - c.statusTopRows() - c.statusBottomRows() -
+		c.topDockRows() - c.bottomDockRows() - 2*c.frameInset()
+	if rows < 1 {
+		rows = 1
+	}
+	return cols, rows
 }
 
 // cols is the physical width the compositor draws to — the client's own
@@ -2282,14 +2401,14 @@ func (c *compositor) reload(cfg config.ClientConfig, binds *config.ClientBinds) 
 // rebuildWidgets recreates the status/dock/float widgets from c.cfg.Widgets,
 // dropping the previous set. Shared by attach-time setup and reload.
 func (c *compositor) rebuildWidgets(binds *config.ClientBinds) {
-	c.statusWidget, c.docks, c.overlays, c.focusedDock = nil, nil, nil, nil
+	c.statusWidget, c.docks, c.allDocks, c.overlays, c.focusedDock = nil, nil, nil, nil, nil
 	c.agentDefs = binds.Agents
 	for _, w := range c.cfg.Widgets {
 		b := &textBox{
 			row: w.Row, col: w.Col, format: w.Text,
 			lines: strings.Split(w.Text, "\n"), // shown until the first refresh re-expands
 			fg:    w.FG, bg: w.BG, attr: w.Attr,
-			dock: w.Dock, size: w.Size,
+			dock: w.Dock, size: w.Size, minCols: w.MinCols,
 			textFn: w.TextFn, drawFn: w.Draw, component: w.Component, onClick: w.OnClick, binds: binds, interval: w.Interval,
 			onKey: w.OnKey, focus: w.Focus, name: w.Name,
 			w: w.Width, h: w.Height, // float draw size; docks override w/h per tick
@@ -2300,9 +2419,13 @@ func (c *compositor) rebuildWidgets(binds *config.ClientBinds) {
 		case "":
 			c.overlays = append(c.overlays, b)
 		default:
-			c.docks = append(c.docks, b)
+			c.allDocks = append(c.allDocks, b)
 		}
 	}
+	// ponytail: toggle_dock forced state doesn't survive a reload — the file
+	// is a clean slate (matches reloadConfig). Carry it over by name if that
+	// ever annoys.
+	c.refreshDocks()
 }
 
 // openLocal opens a prompt/picker overlay from the client's own mirrored state

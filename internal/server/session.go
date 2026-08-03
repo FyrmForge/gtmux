@@ -2621,6 +2621,19 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 		case "select-pane":
 			prevFocus := windows[active].actor.active
 			tw, tp, twi, rest, targeted := resolveTarget(args)
+			// -Z (tmux): keep the window zoomed across the pane change — the
+			// zoom follows the newly-active pane instead of dropping to tiles.
+			keepZoom := false
+			flags := rest[:0]
+			for _, a := range rest {
+				if a == "-Z" {
+					keepZoom = true
+					continue
+				}
+				flags = append(flags, a)
+			}
+			rest = flags
+			wasZoomed := tw.zoomed
 			hasDir := len(rest) > 0 && flagDir[rest[0]] != ""
 			if targeted {
 				active = twi
@@ -2632,7 +2645,14 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 			if hasDir {
 				navigate(flagDir[rest[0]])
 			}
-			if targeted {
+			if keepZoom && wasZoomed {
+				// navigate() unzoomed (directional), or a targeted change left
+				// zoom pointing at the old pane's rect: re-zoom onto the new
+				// active pane so its PTY reflows to the full window.
+				w := activeWindow()
+				actorDo(w, func() { w.zoomed = true; w.reflow() })
+				send(fullSync())
+			} else if targeted {
 				// A target may switch windows; navigate only sends Layout (no
 				// cells), so fullSync to redraw the target window's content.
 				send(fullSync())
