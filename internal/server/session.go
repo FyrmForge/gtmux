@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/FyrmForge/gtmux/internal/emu"
@@ -26,6 +27,188 @@ type attachment struct {
 	cols, rows int  // rows is the window (content) height; the client already subtracted its status bar
 	readOnly   bool // attach -r: input never reaches a pane
 	wantSnap   bool // client uses widget queries: keep the registry snapshot count up
+	outMu      sync.Mutex
+	out        []outbound
+	outCond    *sync.Cond
+	outClosed  bool
+}
+
+type outboundKind uint8
+
+const (
+	outboundOrdered outboundKind = iota
+	outboundPaneDiff
+	outboundPopupDiff
+)
+
+type outbound struct {
+	kind outboundKind
+	msg  *proto.ServerMsg
+}
+
+// outboundFrameInterval caps pane/popup rendering at 60 FPS. Without pacing,
+// the writer can move hundreds of tiny PTY diffs out of the coalescing outbox
+// and into the Unix socket buffer faster than the client can compose/write
+// them. Once there, they are an unavoidable stale-frame backlog. The first
+// diff after an idle period is still immediate; only a continuing burst waits
+// for the next frame boundary and coalesces while it waits.
+const outboundFrameInterval = time.Second / 60
+
+// queue hands an ordered message to this client's writer without blocking the
+// session goroutine. Ordered messages are infrequent and form boundaries between
+// diff batches, preserving layout/control/content ordering.
+func (a *attachment) queue(msg *proto.ServerMsg) {
+	a.queueOutbound(outbound{kind: outboundOrdered, msg: msg})
+}
+
+// queuePaneDiff coalesces adjacent pane diffs. Each dirty line is a complete
+// pane-local row, so keeping the latest copy of every touched row plus the
+// latest cursor is lossless. A flood therefore leaves at most one pending diff
+// batch instead of making interactive output wait behind hundreds of stale
+// patches. The clone is required because one ServerMsg is fanned out to several
+// attachments and each attachment coalesces independently.
+func (a *attachment) queuePaneDiff(msg *proto.ServerMsg) {
+	a.queueOutbound(outbound{kind: outboundPaneDiff, msg: clonePaneDiff(msg)})
+}
+
+// queuePopupDiff applies the same rule to the one popup owned by this client.
+func (a *attachment) queuePopupDiff(msg *proto.ServerMsg) {
+	a.queueOutbound(outbound{kind: outboundPopupDiff, msg: clonePopupDiff(msg)})
+}
+
+func (a *attachment) queueOutbound(item outbound) {
+	a.outMu.Lock()
+	defer a.outMu.Unlock()
+	if a.outClosed {
+		return
+	}
+	if item.kind != outboundOrdered && len(a.out) > 0 && a.out[len(a.out)-1].kind == item.kind {
+		mergeDiff(a.out[len(a.out)-1].msg, item.msg, item.kind)
+	} else {
+		a.out = append(a.out, item)
+	}
+	a.outCond.Signal()
+}
+
+func clonePaneContent(pc proto.PaneContent) proto.PaneContent {
+	lines := make(map[int]emu.Line, len(pc.Lines))
+	for row, line := range pc.Lines {
+		lines[row] = line
+	}
+	pc.Lines = lines
+	return pc
+}
+
+func clonePaneDiff(msg *proto.ServerMsg) *proto.ServerMsg {
+	cloned := &proto.ServerMsg{PaneContent: make([]proto.PaneContent, len(msg.PaneContent))}
+	for i, pc := range msg.PaneContent {
+		cloned.PaneContent[i] = clonePaneContent(pc)
+	}
+	return cloned
+}
+
+func clonePopupDiff(msg *proto.ServerMsg) *proto.ServerMsg {
+	cloned := &proto.ServerMsg{}
+	if msg.Popup != nil {
+		popup := *msg.Popup
+		if popup.Content != nil {
+			content := clonePaneContent(*popup.Content)
+			popup.Content = &content
+		}
+		cloned.Popup = &popup
+	}
+	return cloned
+}
+
+func mergePaneContent(dst *proto.PaneContent, src proto.PaneContent) {
+	for row, line := range src.Lines {
+		dst.Lines[row] = line
+	}
+	dst.Cursor = src.Cursor
+	dst.CursorVisible = src.CursorVisible
+}
+
+func mergeDiff(dst, src *proto.ServerMsg, kind outboundKind) {
+	if kind == outboundPopupDiff {
+		if dst.Popup != nil && dst.Popup.Content != nil && src.Popup != nil && src.Popup.Content != nil {
+			mergePaneContent(dst.Popup.Content, *src.Popup.Content)
+		}
+		return
+	}
+	for _, next := range src.PaneContent {
+		found := false
+		for i := range dst.PaneContent {
+			if dst.PaneContent[i].PaneID == next.PaneID {
+				mergePaneContent(&dst.PaneContent[i], next)
+				found = true
+				break
+			}
+		}
+		if !found {
+			dst.PaneContent = append(dst.PaneContent, next)
+		}
+	}
+}
+
+func (a *attachment) closeOutput() {
+	a.outMu.Lock()
+	a.outClosed = true
+	a.outCond.Broadcast()
+	a.outMu.Unlock()
+}
+
+func (a *attachment) nextOutbound(diffReady time.Time) (outbound, bool) {
+	for {
+		a.outMu.Lock()
+		for len(a.out) == 0 && !a.outClosed {
+			a.outCond.Wait()
+		}
+		if len(a.out) == 0 {
+			a.outMu.Unlock()
+			return outbound{}, false
+		}
+		item := a.out[0]
+		// Leave a diff in the outbox until its frame boundary. Incoming PTY
+		// chunks then merge into this item instead of escaping into the socket
+		// as individually encoded stale frames. Closing bypasses the delay so
+		// a session-switch handoff flushes promptly.
+		wait := time.Duration(0)
+		if !a.outClosed && item.kind != outboundOrdered {
+			wait = time.Until(diffReady)
+		}
+		if wait <= 0 {
+			a.out[0] = outbound{}
+			a.out = a.out[1:]
+			a.outMu.Unlock()
+			return item, true
+		}
+		a.outMu.Unlock()
+
+		timer := time.NewTimer(wait)
+		<-timer.C
+	}
+}
+
+// writer is the per-client output goroutine — the only user of this client's
+// encoder. It exits when closeClient closes the outbox (flushing it first) or
+// when a write fails or times out, and closes the conn either way so the
+// client's reader sees EOF. The deadline bounds a wedged client.
+func (a *attachment) writer() {
+	var diffReady time.Time
+	for {
+		item, ok := a.nextOutbound(diffReady)
+		if !ok {
+			break
+		}
+		a.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		if a.enc.Encode(item.msg) != nil {
+			break
+		}
+		if item.kind != outboundOrdered {
+			diffReady = time.Now().Add(outboundFrameInterval)
+		}
+	}
+	a.conn.Close()
 }
 
 // session is one gtmux session: a set of windows/panes that keep running
@@ -493,7 +676,10 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 	// bell/silence detection). Forward-declared so actorDo can pump it while it
 	// waits; assigned once its dependencies (monitor opts, showMessage) exist.
 	var handleRender func(renderMsg)
-	renderCh := make(chan renderMsg, 256) // actors push here; drained by the main select and actorDo's pump
+	// Actors signal a view, not an individual frame. Each view owns a bounded
+	// coalescing mailbox, so this channel contains at most one token per view
+	// instead of hundreds of stale, destructive dirty-row diffs.
+	renderCh := make(chan *view, 256)
 
 	// buffers is the session's paste-buffer stack, newest first (buffers[0] is
 	// the default paste target, tmux's "buffer0"). Set by copy-mode's yank and
@@ -704,15 +890,17 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 	// send broadcasts a message to every attached client, stamping the
 	// current status onto it: the status bar (window list, clock, git
 	// branch, or a prompt) can change independently of anything else, so
-	// every outgoing message carries it.
-	// ponytail: writes to all encoders sequentially on the session
-	// goroutine, so one wedged client stalls the others — same failure mode
-	// as the old single-client path, just wider. Upgrade path if it bites:
-	// a per-client output goroutine with its own buffered queue.
+	// every outgoing message carries it. Delivery goes through each
+	// client's own writer goroutine (attachment.queue), so a wedged client
+	// cannot stall the session. Pane and popup diffs take the coalescing raw
+	// paths below; ordered messages come through here as boundaries. Messages
+	// are immutable once queued: pane content is copied out of the grid
+	// (fullContent/dirtyContent) and status maps are built fresh, so async
+	// encoding doesn't race the actors.
 	send := func(msg *proto.ServerMsg) {
 		stampStatus(msg)
 		for _, a := range attachments {
-			a.enc.Encode(msg)
+			a.queue(msg)
 		}
 	}
 
@@ -729,12 +917,12 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 	// most one tick. That's exactly tmux's status-interval model.
 	sendRaw := func(msg *proto.ServerMsg) {
 		for _, a := range attachments {
-			a.enc.Encode(msg)
+			a.queuePaneDiff(msg)
 		}
 	}
 	sendToRaw := func(epoch int, msg *proto.ServerMsg) {
 		if a := attachments[epoch]; a != nil {
-			a.enc.Encode(msg)
+			a.queuePopupDiff(msg)
 		}
 	}
 
@@ -743,7 +931,7 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 	sendTo := func(epoch int, msg *proto.ServerMsg) {
 		stampStatus(msg)
 		if a := attachments[epoch]; a != nil {
-			a.enc.Encode(msg)
+			a.queue(msg)
 		}
 	}
 
@@ -753,7 +941,7 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 	sendWritable := func(msg *proto.ServerMsg) {
 		for _, a := range attachments {
 			if !a.readOnly {
-				a.enc.Encode(msg)
+				a.queue(msg)
 			}
 		}
 	}
@@ -795,55 +983,49 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 	// call a nil handleRender and panic. Dropping such an early render is safe: no
 	// client is attached yet, so nothing renders, and the first attach fullSyncs
 	// the grid state anyway.
-	pumpRender := func(rm renderMsg) {
-		if handleRender != nil {
-			handleRender(rm)
+	pumpRender := func(vw *view) {
+		for _, rm := range vw.takeRenders() {
+			if handleRender != nil {
+				handleRender(rm)
+			}
 		}
 	}
 	actorDo := func(wa *windowActor, fn func()) {
+		// ctl has priority on the actor (checked before queued output), so
+		// this completes within ~one output chunk's parse even mid-flood —
+		// routing through wa.events would wait behind the whole backlog, and
+		// a select-send racing the parked reader goroutines starves outright.
 		done := make(chan struct{})
-		msg := doMsg{fn: fn, done: done}
-		for enq := false; !enq; {
-			select {
-			case wa.events <- msg:
-				enq = true
-			case rm := <-renderCh:
-				pumpRender(rm)
-			}
-		}
+		wa.ctl <- doMsg{fn: fn, done: done}
 		for {
 			select {
 			case <-done:
 				return
-			case rm := <-renderCh:
-				pumpRender(rm)
+			case vw := <-renderCh:
+				pumpRender(vw)
 			}
 		}
 	}
 
-	// finishStop ends a window actor's run() so it touches no more pane state,
-	// discarding renderCh meanwhile so a final render can't deadlock the wait.
+	// finishStop ends a window actor's run() so it touches no more pane state.
 	// After it returns the window's panes are safe to Close (both applyOutput and
-	// p.Close touch p.pipeW). Renders are discarded, not handled: mid-session that
-	// dodges reading the mid-adjustment `active`, and a dropped render self-heals
-	// (a fullSync on window switch, or the next output chunk).
+	// p.Close touch p.pipeW). Render delivery cannot deadlock this wait: actors
+	// only merge into per-view mailboxes, and notifier goroutines own the possibly
+	// blocking send to renderCh. In particular, do not drain arbitrary tokens
+	// here; one can belong to another live window and contains destructive dirty
+	// rows that must reach the session.
 	//
-	// It enqueues stopMsg rather than close(wa.events): a pane reader goroutine
-	// sends outputMsg straight to origin.events (watchPane), and a straggler read
-	// after a close would panic on a closed channel — fatal to the whole server.
-	// FIFO drains everything already queued first; late reader sends land unread
-	// in the buffer. Session-goroutine ptyOutput stragglers are still guarded by
-	// wa.stopped in the handler below.
+	// It enqueues stopMsg (on ctl) rather than close(wa.events): a pane reader
+	// goroutine sends outputMsg straight to origin.events (watchPane), and a
+	// straggler read after a close would panic on a closed channel — fatal to
+	// the whole server. ctl priority means queued-but-unparsed output is
+	// dropped at stop (the window is dying, so nothing is lost). Session-
+	// goroutine ptyOutput stragglers are still guarded by wa.stopped in the
+	// handler below.
 	finishStop := func(wa *windowActor) {
 		wa.stopped = true // late reader events (exit) must skip this actor now
-		wa.events <- stopMsg{}
-		for {
-			select {
-			case <-wa.done:
-				return
-			case <-renderCh:
-			}
-		}
+		wa.ctl <- stopMsg{}
+		<-wa.done
 	}
 
 	// stopActor tears a window actor down — unless it still relays panes that
@@ -902,8 +1084,8 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 	// actor — actor-coordinated, so it's safe to call on an actor another session
 	// already runs (link-window). The caller keeps the returned view as its winlink
 	// handle.
-	subscribeView := func(wa *windowActor, renders chan<- renderMsg, notify chan<- any) *view {
-		vw := &view{renders: renders, notify: notify}
+	subscribeView := func(wa *windowActor, renders chan<- *view, notify chan<- any) *view {
+		vw := newView(renders, notify)
 		actorDo(wa, func() { wa.views = append(wa.views, vw) })
 		return vw
 	}
@@ -925,6 +1107,7 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 				wa.recomputeSize(nil)
 			}
 		})
+		vw.stopRenders()
 		return last
 	}
 
@@ -1049,7 +1232,9 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 			if a.wantSnap {
 				reg.wantSnapshot(-1)
 			}
-			a.conn.Close()
+			// The writer flushes what's queued (a SwitchSession handoff must
+			// reach the client), then closes the conn itself.
+			a.closeOutput()
 			delete(attachments, epoch)
 		}
 	}
@@ -1780,7 +1965,6 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 			removeWindowAt(idx)
 		}
 	}
-
 
 	// linkWindow links a window from another session into this one: it obtains
 	// that window's actor from the source session (a request on the source's event
@@ -3171,7 +3355,7 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 			if target == "" {
 				detach()
 			} else if at := strings.IndexByte(target, '@'); at > 0 && strings.HasPrefix(target, "client-") {
-				ep, err := strconv.Atoi(target[len("client-") : at])
+				ep, err := strconv.Atoi(target[len("client-"):at])
 				sess := target[at+1:]
 				if err != nil {
 					return "detach-client: bad target " + target
@@ -3481,14 +3665,17 @@ loop:
 				reg.putSnapshot(s.name, buildSnapSession())
 			}
 			send(&proto.ServerMsg{})
-		case rm := <-renderCh:
-			handleRender(rm)
+		case vw := <-renderCh:
+			pumpRender(vw)
 		case ev := <-s.events:
 			switch e := ev.(type) {
 			case attachEvent:
 				nextEpoch++
 				ep := nextEpoch
-				attachments[ep] = &attachment{conn: e.conn, enc: e.enc, cols: e.cols, rows: e.rows, readOnly: e.readOnly, wantSnap: e.wantSnap}
+				a := &attachment{conn: e.conn, enc: e.enc, cols: e.cols, rows: e.rows, readOnly: e.readOnly, wantSnap: e.wantSnap}
+				a.outCond = sync.NewCond(&a.outMu)
+				attachments[ep] = a
+				go a.writer()
 				if e.wantSnap {
 					reg.wantSnapshot(1)
 				}

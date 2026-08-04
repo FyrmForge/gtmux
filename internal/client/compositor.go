@@ -1152,13 +1152,18 @@ func (c *compositor) apply(msg *proto.ServerMsg) []byte {
 			continue
 		}
 		if pr, ok := c.rectFor(pc.PaneID); ok {
+			// pr.Row is content-space; physical row = content row + contentOffset
+			// (top status/docks + framed inset). Without the offset every diff
+			// repaints the row ABOVE the changed one under pane_borders="framed",
+			// leaving typed characters invisible until a full repaint.
+			off := c.contentOffset()
 			for localRow := range pc.Lines {
-				dirty[pr.Row+localRow] = true
+				dirty[pr.Row+localRow+off] = true
 			}
 			// The cursor/selection highlight can move even over rows that
 			// didn't get new Lines (rare in practice, since copy-mode
 			// resends every visible row on each keystroke) — mark it too.
-			dirty[pr.Row+pc.Cursor.R] = true
+			dirty[pr.Row+pc.Cursor.R+off] = true
 		}
 	}
 

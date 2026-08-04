@@ -5,6 +5,46 @@ effort are tracked in TODO.md, not here.
 
 ---
 
+## Bugfix: stale pane rows under framed borders (August 2026)
+
+Symptom: with `pane_borders = "framed"`, typed/deleted characters didn't
+appear until something forced a bigger repaint — ~1s lag with the animated
+sidebar visible (its 1s status tick marks all content rows dirty), stuck
+indefinitely with the sidebar hidden until a Ctrl-C or pane switch. The cursor
+still moved, which made it look like a server-side dropped-frame problem.
+
+Root cause (client, `internal/client/compositor.go` `apply()`): pane diffs
+marked dirty rows as `pr.Row + localRow` — **content-space** rows — but
+`emit()`/`buildRow()` paint **physical** rows. Physical = content +
+`contentOffset()` (top status/docks + the framed inset). With `framed` the
+offset is 1, so every diff repainted the row *above* the changed one; the
+changed row itself only rendered when a layout/status/copy-mode path called
+`markAll` or marked full-content spans. `activeCursor()` already applied the
+offset for the same rect; the dirty-marking site didn't. Latent since framed
+borders landed — invisible with the default `simple` borders (offset 0) and
+invisible to the e2e suite, which ran the default config.
+
+Fix: add `contentOffset()` to both dirty marks in the `PaneContent` loop
+(changed lines + cursor row).
+
+Debugging notes for next time:
+
+- The server-side rework done while chasing this (per-view coalescing render
+  mailbox in `actor.go`, per-attachment ordered outbox in `session.go`) fixed
+  a real but *different* bug: destructive `dirtyContent()` diffs dropped on a
+  full channel under flood. It could not explain idle-typing latency — a
+  drained queue never drops.
+- What cracked it was reproducing with the **user's real `client.lua`** in the
+  pty harness (`harness.StartWithConfig`), then bisecting config options one
+  per run. Only `pane_borders = "framed"` failed; HEAD and older commits
+  failed too, proving it predated the uncommitted work.
+- "Appears after exactly N seconds / on Ctrl-C" means the bytes are being
+  *painted wrong or not at all*, not delayed in a queue — every queue in the
+  path was flushed by the 1s status tick, which the dock-hidden case proved
+  wasn't the flush that mattered.
+
+---
+
 ## Runtime options — live config via Lua re-eval (July 2026)
 
 Was `RUNTIME_OPTIONS.md`. All four steps landed; late-attach inheritance

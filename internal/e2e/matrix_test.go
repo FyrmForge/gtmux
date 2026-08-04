@@ -1642,7 +1642,10 @@ func TestWindowSizeSmallest(t *testing.T) {
 	c := harness.StartWithConfig(t, "", srv) // this client is 80x24
 	c.WaitForStatus("1:")
 	peer := c.NewPeer(40, 24) // narrower peer -> grid shrinks to 40
-	peer.WaitForStatus("1:")
+	// At 40 columns the right-side git widget can crowd the automatic window
+	// name out of the status line, so use the always-visible session label as
+	// the peer-ready marker. The assertion below is what this test exercises.
+	peer.WaitForStatus("[default]")
 	// On the 80-wide client, columns past 40 are now dot-fill.
 	c.WaitFor(func(s *harness.Screen) bool { return s.Cell(0, 60).Char == '·' })
 }

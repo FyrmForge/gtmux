@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"sync"
 	"time"
 
 	"github.com/FyrmForge/gtmux/internal/emu"
@@ -17,7 +18,14 @@ import (
 // renderMsgs back for the session to fan out + run alert detection on.
 type windowActor struct {
 	*window
-	events   chan any
+	events chan any
+	// ctl carries doMsg/stopMsg with priority over events: under a flood the
+	// events buffer stays full of queued pty output (with reader goroutines
+	// parked on its sendq), so a control message routed through events would
+	// wait behind seconds of parse work — or, worse, an actorDo select-send
+	// competing with parked readers starves forever. run() checks ctl first
+	// on every iteration, so control runs within one output chunk's parse.
+	ctl      chan any
 	views    []*view                // sessions displaying this window (P1: always exactly one)
 	relay    map[*pane]*windowActor // panes that migrated away: forward their output to the new actor
 	done     chan struct{}          // closed when run() exits (stopActor waits on it)
@@ -37,9 +45,22 @@ type windowActor struct {
 // whether this window is that session's current one. Winlinks make the set >1
 // (one window in several sessions). See the fan-out note in run().
 type view struct {
-	renders  chan<- renderMsg
+	renders  chan<- *view
 	notify   chan<- any // the viewing session's event channel (winlinkGone, etc.)
 	isActive bool
+
+	// renderMu protects a bounded, coalescing mailbox between the window actor
+	// and this viewing session. dirtyContent() is destructive: once a pane's
+	// changed rows have been copied out, dropping that render permanently loses
+	// them. Keep the newest complete copy of every pending row per pane instead.
+	// The notifier puts at most one *view token on renders, so a slow/dead session
+	// can neither block the actor nor accumulate a FIFO of stale frames.
+	renderMu       sync.Mutex
+	renderPending  []renderMsg
+	renderNotified bool
+	renderWake     chan struct{}
+	renderStop     chan struct{}
+	renderDone     chan struct{}
 	// This session's size vote for the window (its effectiveSize) and whether it
 	// wants aggressive-resize; seq is the actor's stamp for "latest". cols == 0
 	// means the session hasn't sized this window yet (skipped in the combine).
@@ -56,6 +77,123 @@ type view struct {
 	silenceTmr *time.Timer // fires a silenceEvent after the interval; reset on each output
 }
 
+func newView(renders chan<- *view, notify chan<- any) *view {
+	v := &view{
+		renders:    renders,
+		notify:     notify,
+		renderWake: make(chan struct{}, 1),
+		renderStop: make(chan struct{}),
+		renderDone: make(chan struct{}),
+	}
+	go v.forwardRenderNotice()
+	return v
+}
+
+// forwardRenderNotice is the only potentially-blocking part of render
+// delivery. It sends a lightweight view token, not a frame. While it waits for
+// the session, queueRender continues folding new pane state into the mailbox.
+func (v *view) forwardRenderNotice() {
+	defer close(v.renderDone)
+	for {
+		select {
+		case <-v.renderWake:
+			select {
+			case v.renders <- v:
+			case <-v.renderStop:
+				return
+			}
+		case <-v.renderStop:
+			return
+		}
+	}
+}
+
+func cloneRenderMsg(rm renderMsg) renderMsg {
+	if rm.content != nil {
+		content := *rm.content
+		content.Lines = make(map[int]emu.Line, len(rm.content.Lines))
+		for row, line := range rm.content.Lines {
+			content.Lines[row] = line
+		}
+		rm.content = &content
+	}
+	rm.hostOut = append([]byte(nil), rm.hostOut...)
+	rm.cmdExits = append([]int(nil), rm.cmdExits...)
+	rm.clipboards = append([]string(nil), rm.clipboards...)
+	return rm
+}
+
+func mergeRenderMsg(dst *renderMsg, src renderMsg) {
+	if src.content != nil {
+		if dst.content == nil {
+			cloned := cloneRenderMsg(renderMsg{content: src.content})
+			dst.content = cloned.content
+		} else {
+			for row, line := range src.content.Lines {
+				dst.content.Lines[row] = line
+			}
+			dst.content.Cursor = src.content.Cursor
+			dst.content.CursorVisible = src.content.CursorVisible
+		}
+	}
+	dst.bell = dst.bell || src.bell
+	dst.modeFlip = dst.modeFlip || src.modeFlip
+	dst.hostOut = append(dst.hostOut, src.hostOut...)
+	dst.cmdExits = append(dst.cmdExits, src.cmdExits...)
+	dst.clipboards = append(dst.clipboards, src.clipboards...)
+}
+
+func (v *view) queueRender(rm renderMsg) {
+	v.renderMu.Lock()
+	for i := range v.renderPending {
+		if v.renderPending[i].pane == rm.pane {
+			mergeRenderMsg(&v.renderPending[i], rm)
+			rm = renderMsg{}
+			break
+		}
+	}
+	if rm.pane != nil {
+		v.renderPending = append(v.renderPending, cloneRenderMsg(rm))
+	}
+	wake := !v.renderNotified
+	if wake {
+		v.renderNotified = true
+	}
+	v.renderMu.Unlock()
+
+	if wake {
+		select {
+		case v.renderWake <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// takeRenders consumes the freshest coalesced state represented by one view
+// token. Resetting renderNotified under the same lock makes an output racing
+// with this drain schedule a new token rather than getting stranded.
+func (v *view) takeRenders() []renderMsg {
+	v.renderMu.Lock()
+	pending := v.renderPending
+	v.renderPending = nil
+	v.renderNotified = false
+	v.renderMu.Unlock()
+	return pending
+}
+
+func (v *view) stopRenders() {
+	// The view has already been removed from wa.views on the actor goroutine, so
+	// no producer can add more. Clear anything represented by a token that may
+	// already be sitting in the session channel; takeRenders will then be a no-op
+	// instead of painting a window after it was unlinked.
+	v.renderMu.Lock()
+	v.renderPending = nil
+	v.renderNotified = false
+	v.renderMu.Unlock()
+	close(v.renderStop)
+	<-v.renderDone
+}
+
 // outputMsg is pty output for a pane (gen guards against a pre-respawn reader).
 type outputMsg struct {
 	pane *pane
@@ -70,12 +208,12 @@ type doMsg struct {
 	done chan struct{}
 }
 
-// stopMsg ends run(). finishStop enqueues it instead of closing wa.events: pane
-// reader goroutines send outputMsg straight to origin.events (session.go), and a
-// straggler read landing after a close() would panic ("send on closed channel")
-// — which, being in a goroutine, would take the whole server down. FIFO means
-// run() drains everything queued before the sentinel; anything a reader sends
-// AFTER it just sits unread in the buffered channel until GC.
+// stopMsg ends run(). finishStop enqueues it (on ctl) instead of closing
+// wa.events: pane reader goroutines send outputMsg straight to origin.events
+// (session.go), and a straggler read landing after a close() would panic
+// ("send on closed channel") — which, being in a goroutine, would take the
+// whole server down. ctl priority means queued-but-unparsed output is dropped
+// at stop — fine, the window is being torn down.
 type stopMsg struct{}
 
 // renderMsg is what the actor hands back to the session on each applied output:
@@ -83,15 +221,15 @@ type stopMsg struct{}
 // visible — the session fans it out), and whether the chunk contained a BEL (for
 // monitor-bell). The session also does activity/silence detection off this.
 type renderMsg struct {
-	pane      *pane
-	content   *proto.PaneContent
-	bell      bool
+	pane    *pane
+	content *proto.PaneContent
+	bell    bool
 	// modeFlip: the pane's app toggled a mode the client mirrors in PaneRect —
 	// mouse tracking (WantsMouse) or kitty keyboard (KeyFlags) → resend Layout.
 	// One flag because the only consumer (session.go) reacts identically to both.
-	modeFlip  bool
-	hostOut   []byte // un-doubled allow-passthrough payload to forward raw to the client terminal
-	cmdExits  []int  // OSC 133 command-finished exit codes in this chunk (gtmux.on("command-exited"))
+	modeFlip bool
+	hostOut  []byte // un-doubled allow-passthrough payload to forward raw to the client terminal
+	cmdExits []int  // OSC 133 command-finished exit codes in this chunk (gtmux.on("command-exited"))
 	// clipboards: OSC 52 set-clipboard payloads an app emitted in this chunk,
 	// forwarded to the outer terminal (set-clipboard) + the paste buffer. Rides
 	// the same visibility gate as hostOut: only views that see the pane.
@@ -99,7 +237,7 @@ type renderMsg struct {
 }
 
 func newWindowActor(w *window) *windowActor {
-	wa := &windowActor{window: w, events: make(chan any, 256), relay: map[*pane]*windowActor{}, done: make(chan struct{})}
+	wa := &windowActor{window: w, events: make(chan any, 256), ctl: make(chan any, 16), relay: map[*pane]*windowActor{}, done: make(chan struct{})}
 	w.actor = wa // back-ref: pane.win.actor reaches the owner (routes PTY events)
 	return wa
 }
@@ -107,8 +245,8 @@ func newWindowActor(w *window) *windowActor {
 // start subscribes the owning session (its render + event channels) as this
 // window's first view and launches the actor goroutine. The returned view is the
 // session's handle for toggling isActive via setActive.
-func (wa *windowActor) start(renders chan<- renderMsg, notify chan<- any) *view {
-	vw := &view{renders: renders, notify: notify}
+func (wa *windowActor) start(renders chan<- *view, notify chan<- any) *view {
+	vw := newView(renders, notify)
 	wa.views = append(wa.views, vw)
 	go wa.run()
 	return vw
@@ -116,7 +254,37 @@ func (wa *windowActor) start(renders chan<- renderMsg, notify chan<- any) *view 
 
 func (wa *windowActor) run() {
 	defer close(wa.done) // signal stopActor that the goroutine has drained + exited
-	for e := range wa.events {
+	// handleCtl runs one control message; true means stop.
+	handleCtl := func(e any) bool {
+		switch ev := e.(type) {
+		case doMsg:
+			ev.fn()
+			close(ev.done)
+		case stopMsg:
+			return true
+		}
+		return false
+	}
+	for {
+		// Control first (see the ctl field comment): actorDo must not wait
+		// behind a flood's queued output.
+		select {
+		case c := <-wa.ctl:
+			if handleCtl(c) {
+				return // defer close(wa.done) fires; unread stragglers are dropped
+			}
+			continue
+		default:
+		}
+		var e any
+		select {
+		case c := <-wa.ctl:
+			if handleCtl(c) {
+				return
+			}
+			continue
+		case e = <-wa.events:
+		}
 		switch ev := e.(type) {
 		case outputMsg:
 			if ev.gen != ev.pane.gen { // stale reader from before a respawn
@@ -149,17 +317,14 @@ func (wa *windowActor) run() {
 				ev.pane.term.KeyState() != keyBefore
 			// Fan out to every viewing session, gating content per-view on that
 			// session's current-window choice (spike4/spike5 discipline):
-			//   - non-blocking send, drop on a full view — one slow/dead viewer must
-			//     never stall the actor (that's what froze a shared window / would
-			//     deadlock every other session). A live session drains continuously
-			//     so its 256-buffer never fills → no drops → identical to blocking;
-			//     only a hung/dying view drops, and dropped content self-heals (the
-			//     next output chunk, or a fullSync on window switch).
+			//   - queue in each view's bounded coalescing mailbox. One slow/dead
+			//     viewer must never stall the actor, but dirty rows must not be
+			//     dropped either: dirtyContent consumes them, and a later cursor-only
+			//     diff cannot reconstruct a discarded character update.
 			//   - compute the destructive diff ONCE and share the (read-only) pointer
-			//     across current views, since dirtyContent consumes dirty state.
-			// ponytail: a bell riding a dropped frame is a missed alert — tolerable
-			// best-effort (drops need sustained backpressure to a live session, which
-			// doesn't happen); reliable alert delivery isn't worth a second channel.
+			//     across current views, since dirtyContent consumes dirty state. Each
+			//     mailbox clones it before merging and also preserves bell/mode/hook
+			//     side effects across a coalesced burst.
 			var content *proto.PaneContent
 			for _, vw := range wa.views {
 				rm := renderMsg{pane: ev.pane, bell: bell, modeFlip: modeFlip, cmdExits: cmdExits}
@@ -176,16 +341,8 @@ func (wa *windowActor) run() {
 					rm.hostOut = hostOut
 					rm.clipboards = clips
 				}
-				select {
-				case vw.renders <- rm:
-				default: // view not draining (hung/dying) — drop; self-heals
-				}
+				vw.queueRender(rm)
 			}
-		case doMsg:
-			ev.fn()
-			close(ev.done)
-		case stopMsg:
-			return // defer close(wa.done) fires; unread stragglers are dropped
 		}
 	}
 }
