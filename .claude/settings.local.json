@@ -231,7 +231,22 @@
       "Bash(env GOCACHE=/tmp/gtmux-go-cache GOFLAGS=-buildvcs=false go test ./.tmp/repro/ -run 'TestBisect/\\(framed|empty\\)' -v -count=1)",
       "Bash(env GOCACHE=/tmp/gtmux-go-cache go test ./.tmp/repro/ -v -count=1)",
       "Bash(env GOCACHE=/tmp/gtmux-go-cache go test ./...)",
-      "Bash(env GOCACHE=/tmp/gtmux-go-cache go test -tags=e2e ./internal/e2e/ -count=1 -parallel=1)"
+      "Bash(env GOCACHE=/tmp/gtmux-go-cache go test -tags=e2e ./internal/e2e/ -count=1 -parallel=1)",
+      "Bash(env GOCACHE=/tmp/gtmux-go-cache go build ./...)",
+      "Bash(env GOCACHE=/tmp/gtmux-go-cache go test -tags=e2e ./internal/e2e/ -run 'TestCopyMode$|TestCopyModePrefixBinds' -count=1 -parallel=1 -v)",
+      "Bash(env GOCACHE=/tmp/gtmux-go-cache go test -tags=e2e ./internal/e2e/ -run 'TestCopyModePrefixBinds' -count=1 -v)",
+      "Bash(env GOCACHE=/tmp/gtmux-go-cache go test -tags=e2e ./internal/e2e/ -run 'TestCopyMode$|TestCopyModePrefixBinds|TestCopyCommand' -count=1 -parallel=1 -v)",
+      "Bash(env GOCACHE=/tmp/gtmux-go-cache go test -tags=e2e ./internal/e2e/ -run 'TestCopyMode$|TestCopyModePrefixBinds|TestCopyCommand' -count=1 -parallel=1)",
+      "Bash(env -u TMUX tmux -L valtest list-windows -t val -F '#{window_index}:#{window_name} active=#{window_active}')",
+      "Bash(env -u TMUX tmux -L valtest set -g mode-keys vi)",
+      "Bash(env -u TMUX tmux -L valtest select-window -t val:0)",
+      "Bash(env -u TMUX tmux -L valtest list-windows -t val -F '#{window_index} active=#{window_active}')",
+      "Bash(env -u TMUX tmux -L valtest kill-server)",
+      "Bash(env GOCACHE=/tmp/gtmux-go-cache go test -tags=e2e ./internal/e2e/ -run 'TestCopyModeMouseFramed' -count=1 -v)",
+      "Bash(env GOCACHE=/tmp/gtmux-go-cache go test ./internal/client/ ./internal/e2e/ -count=1)",
+      "Bash(env GOCACHE=/tmp/gtmux-go-cache go test ./internal/e2e/)",
+      "Bash(env GOCACHE=/tmp/gtmux-go-cache go test -tags=e2e ./internal/e2e/ -run 'TestKillWindowUnderFlood' -count=3 -parallel=1 -v)",
+      "Bash(env GOCACHE=/tmp/gtmux-go-cache go test -tags=e2e ./internal/e2e/ -run 'TestKillWindowUnderFlood' -count=1 -v)"
     ]
   }
 }
