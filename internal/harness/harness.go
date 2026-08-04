@@ -160,6 +160,10 @@ func StartWithConfig(t *testing.T, clientLua, serverLua string) *Client {
 	// Isolate config from the developer's real ~/.config/gtmux so tests are
 	// hermetic, and let a test inject its own client/server config.
 	cfgDir := filepath.Join(dir, "config")
+	// The default status_right ends in #{clock}; a wall clock in the status bar
+	// makes substring asserts time-of-day dependent (WaitForStatus("2:") matches
+	// "22:34"). Pin it empty — a test's own clientLua, appended after, still wins.
+	clientLua = `gtmux.options.status_right = ""` + "\n" + clientLua
 	for name, body := range map[string]string{"client.lua": clientLua, "server.lua": serverLua} {
 		if body == "" {
 			continue

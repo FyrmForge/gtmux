@@ -52,6 +52,71 @@ func TestCopyMode(t *testing.T) {
 	c.Ctrl('c')
 }
 
+// TestCopyModePrefixBinds: the prefix key wins over copy-mode (tmux behavior) —
+// a prefixed bind (new-window here) fires while browsing scrollback.
+func TestCopyModePrefixBinds(t *testing.T) {
+	c := harness.Start(t)
+	promptReady(c)
+	c.TypeLine("echo marker")
+	c.WaitForText("marker")
+
+	c.Prefix("[")
+	c.WaitForStatus("q quit")
+
+	c.Prefix("c") // prefixed bind must fire despite copy-mode
+	// Window 2 (fresh shell) replaces window 1's content; wait for the switch
+	// before typing more, or the pty coalesces 'q' into the same read chunk.
+	c.WaitFor(func(s *harness.Screen) bool { return !strings.Contains(s.String(), "marker") })
+	c.Type("q") // quit copy-mode: its help line overlays the status row
+	// "2:zsh", not "2:" — the status clock (e.g. "22:34") contains "2:".
+	c.WaitForStatus("2:zsh")
+}
+
+// TestCopyModeMouseFramed: mouse drag-select in copy-mode under framed borders.
+// copyMouse maps physical mouse rows to content-space; without undoing
+// contentOffset the selection lands one row below the pointer (yanking item4
+// when item3 was dragged).
+func TestCopyModeMouseFramed(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "yank.txt")
+	c := harness.StartWithConfig(t, "gtmux.options.mouse = true\ngtmux.options.pane_borders = \"framed\"", "")
+	c.WaitForText("$")
+	c.Run("run", "default", "set-option", "copy-command", "cat > "+out)
+	c.TypeLine("for i in $(seq 1 5); do echo item$i; done")
+	c.WaitForText("item5")
+
+	c.Prefix("[")
+	c.WaitForStatus("q quit")
+
+	// Locate "item3" in physical screen space, then drag across it.
+	prow, pcol := -1, -1
+	c.WaitFor(func(s *harness.Screen) bool {
+		for r := 0; r < 24; r++ {
+			// Cell column, not strings.Index: the frame glyph │ is 3 UTF-8 bytes.
+			if i := strings.Index(s.Row(r).String(), "item3"); i >= 0 {
+				prow, pcol = r, len([]rune(s.Row(r).String()[:i]))
+				return true
+			}
+		}
+		return false
+	})
+	t.Logf("item3 at prow=%d pcol=%d row=%q", prow, pcol, c.Screen().Row(prow).String())
+	c.Drag(pcol+1, prow+1, pcol+len("item3"), prow+1)
+	// Drag-release yanks + exits (copy_drag_finish default); the yank pipes
+	// through copy-command async — poll the file for what was selected.
+	c.WaitFor(func(s *harness.Screen) bool { return !s.Status().Has("q quit") })
+	var got string
+	for i := 0; i < 50; i++ {
+		if b, err := os.ReadFile(out); err == nil && len(b) > 0 {
+			got = string(b)
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got != "item3" {
+		t.Fatalf("drag across item3 yanked %q", got)
+	}
+}
+
 // TestCopyCommand: with copy-command set, a copy-mode yank pipes the selection
 // to the command's stdin (server-side), on top of the normal paste-buffer set.
 func TestCopyCommand(t *testing.T) {

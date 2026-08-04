@@ -1030,6 +1030,18 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 						compMu.Unlock()
 						runOps(dops)
 					case comp != nil && comp.copy != nil:
+						// tmux behavior: the prefix key wins over copy-mode. A chunk
+						// that starts with the prefix (or continues a pending prefix /
+						// prefixed escape) runs through the normal bind machine, so
+						// detach / select-pane / kill-session etc. still work while
+						// browsing scrollback. Shadows copy-mode's own binding of the
+						// prefix byte (e.g. C-b page-up in vi mode), same as tmux.
+						if bd := curBinds(); prefixPending || (escStage != 0 && escPrefixed) ||
+							pass[0] == bd.Prefix || (bd.Prefix2 != 0 && pass[0] == bd.Prefix2) {
+							compMu.Unlock()
+							processInput(pass)
+							break
+						}
 						out, res := comp.copyFeed(pass)
 						os.Stdout.Write(out)
 						compMu.Unlock()

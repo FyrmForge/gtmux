@@ -50,7 +50,8 @@ func TestKillWindowUnderFlood(t *testing.T) {
 	// The survivor (window 2, now shown at index 1 since gtmux indexes by slice
 	// position) becomes current. A teardown panic would kill the session; instead
 	// its shell stays responsive.
-	c.WaitFor(func(s *harness.Screen) bool { return !s.Status().Has("2:") })
+	// "2:zsh", not "2:" — the status clock (e.g. "22:34") contains "2:".
+	c.WaitFor(func(s *harness.Screen) bool { return !s.Status().Has("2:zsh") })
 	c.TypeLine("echo ALIVE-AFTER-KILL")
 	c.WaitForText("ALIVE-AFTER-KILL")
 }

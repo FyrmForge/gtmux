@@ -2342,7 +2342,10 @@ func (c *compositor) copyMouse(me proto.MouseEvent) ([]byte, copyResult) {
 	if !ok {
 		return c.redraw(), copyResult{}
 	}
-	row, col := me.Y-1, me.X-1-c.contentColOffset()
+	// me.Y/me.X are physical; pr is content-space — undo BOTH offsets, like
+	// mouseAction. Row was missing contentOffset, so under framed borders (or
+	// status/dock at top) clicks landed one row below the pointer.
+	row, col := me.Y-1-c.contentOffset(), me.X-1-c.contentColOffset()
 	isWheel := me.Cb&0x40 != 0
 	isMotion := me.Cb&0x20 != 0
 	isLeft := me.Cb&3 == 0
