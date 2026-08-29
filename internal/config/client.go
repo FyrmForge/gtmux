@@ -467,6 +467,23 @@ func applyOption(cfg *ClientConfig, binds *ClientBinds, name, value string) bool
 	return true
 }
 
+// optValStr coerces a Lua option value to the string applyOption expects, so
+// both gtmux.options.X = Y and gtmux.set_option("X", Y) accept real Lua types:
+// numbers render without a trailing ".0" (15, not "15.0"), bools as true/false,
+// strings verbatim. Second result is false for a type with no option string
+// (a table/nil) — the caller treats that as "not set", not a zero value.
+func optValStr(v lua.LValue) (string, bool) {
+	switch val := v.(type) {
+	case lua.LString:
+		return string(val), true
+	case lua.LNumber:
+		return lua.LVAsString(val), true
+	case lua.LBool:
+		return boolStr(bool(val)), true
+	}
+	return "", false
+}
+
 // applyStyle parses a tmux style string (comma-separated fg=/bg=/attr tokens,
 // e.g. "fg=white,bg=dark_grey,bold") into the given fg/bg/attr fields. Only the
 // components present are changed (partial, cumulative — like tmux);
@@ -1290,8 +1307,13 @@ func LoadClientWith(path string, overrides [][2]string) (ClientConfig, *ClientBi
 	reg("previous_layout", BindOp{Action: []string{"previous-layout"}})
 	reg("rotate_window", BindOp{Action: []string{"rotate-window"}})
 	reg("source_file", BindOp{Action: []string{"source-file"}}) // reload this client's config live
+	// split_v/split_h name the DIVIDER orientation, which reads backwards next to
+	// tmux's flags (split_v is `-h`). split_right/split_down name where the NEW
+	// pane lands — unambiguous. All four are kept; prefer the *_right/_down pair.
 	reg("split_v", BindOp{Action: []string{"split-window", "-h"}})
 	reg("split_h", BindOp{Action: []string{"split-window"}})
+	reg("split_right", BindOp{Action: []string{"split-window", "-h"}}) // new pane to the right
+	reg("split_down", BindOp{Action: []string{"split-window"}})        // new pane below
 	reg("kill_pane", BindOp{Action: []string{"kill-pane"}})
 	reg("detach", BindOp{Action: []string{"detach"}})
 	reg("show_pane_numbers", BindOp{Action: []string{"display-panes"}})
@@ -1963,7 +1985,14 @@ func LoadClientWith(path string, overrides [][2]string) (ClientConfig, *ClientBi
 	}
 	L.SetField(tbl, "set_option", L.NewFunction(func(l *lua.LState) int {
 		name := l.CheckString(1)
-		if !applyOption(&cfg, binds, name, l.CheckString(2)) {
+		// Value may be a string, number, or bool — same coercion as
+		// gtmux.options.X = Y, so the two surfaces are interchangeable.
+		val, ok := optValStr(l.CheckAny(2))
+		if !ok {
+			noteUnknown(name) // a table/nil value is as much a mistake as a bad name
+			return 0
+		}
+		if !applyOption(&cfg, binds, name, val) {
 			noteUnknown(name)
 		}
 		return 0
@@ -1997,15 +2026,12 @@ func LoadClientWith(path string, overrides [][2]string) (ClientConfig, *ClientBi
 			if !ok {
 				return
 			}
-			switch val := v.(type) {
-			case lua.LString:
-				if !applyOption(&cfg, binds, string(name), string(val)) {
-					noteUnknown(string(name))
-				}
-			case lua.LBool:
-				if !applyOption(&cfg, binds, string(name), boolStr(bool(val))) {
-					noteUnknown(string(name))
-				}
+			val, ok := optValStr(v)
+			if !ok {
+				return
+			}
+			if !applyOption(&cfg, binds, string(name), val) {
+				noteUnknown(string(name))
 			}
 		})
 	}

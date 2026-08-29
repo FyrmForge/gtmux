@@ -50,7 +50,7 @@ gtmux.options.copy_selection_bg = "light_cyan"
 
 -- status_interval: refresh cadence (structural) — how often the bar re-renders
 -- and #client/#server shell output is cached, in seconds.
-gtmux.set_option("status_interval", "15")
+gtmux.options.status_interval = 15
 
 -- Status bar: a component (dock="status"). gtmux composes the bar in Lua rather
 -- than from format-string options — reshape it by editing this. It reads
@@ -81,8 +81,8 @@ end }
 -- Cap status-left / status-right to N cells (tmux status-left-length /
 -- status-right-length). 0 = unlimited (gtmux default; tmux's 10/40 would cut
 -- gtmux's longer default status-left).
--- gtmux.set_option("status_left_length", "0")
--- gtmux.set_option("status_right_length", "0")
+-- gtmux.options.status_left_length = 0
+-- gtmux.options.status_right_length = 0
 
 -- Style (fg=/bg=/attr) of transient status messages + the command prompt
 -- (tmux message-style). The copy-mode selection style is copy_selection_fg/bg.
@@ -128,21 +128,23 @@ end }
 -- next_pane/prev_pane cycle panes KEEPING the zoom. Zoom is session state, so
 -- other attached clients see it too. Pair with min_cols on your docks.
 -- gtmux.responsive{ cols_below = 90 }
--- gtmux.bind("Tab", function() gtmux.next_pane() end)
+-- gtmux.bind("Tab", gtmux.next_pane)
 
 -- Prefix key and keybinds. The client owns all input: it tracks the prefix,
 -- resolves the bound key to an action, and either sends that action to the
 -- server or opens a local overlay (prompts/pickers). Edit freely.
-gtmux.set_option("prefix", "C-b")
+gtmux.options.prefix = "C-b"
 
-gtmux.bind("c", function() gtmux.new_window() end)
-gtmux.bind("n", function() gtmux.next_window() end)
-gtmux.bind("p", function() gtmux.prev_window() end)
-gtmux.bind("%", function() gtmux.split_v() end)
-gtmux.bind("\"", function() gtmux.split_h() end)
-gtmux.bind("x", function() gtmux.kill_pane() end)
-gtmux.bind("d", function() gtmux.detach() end)
-gtmux.bind("q", function() gtmux.show_pane_numbers() end)
+-- Nullary verbs pass straight to bind (no wrapper closure); only binds that pass
+-- an argument or run several statements keep a `function() ... end`.
+gtmux.bind("c", gtmux.new_window)
+gtmux.bind("n", gtmux.next_window)
+gtmux.bind("p", gtmux.prev_window)
+gtmux.bind("%", gtmux.split_right) -- new pane to the right
+gtmux.bind("\"", gtmux.split_down) -- new pane below
+gtmux.bind("x", gtmux.kill_pane)
+gtmux.bind("d", gtmux.detach)
+gtmux.bind("q", gtmux.show_pane_numbers)
 -- prompt: a one-line text-input widget on the status/message line (position =
 -- "status" — placeable elsewhere via gtmux.open). Type to edit, Enter submits
 -- the text to on_submit, Esc cancels. Basis for rename (and command-prompt).
@@ -171,20 +173,20 @@ end)
 gtmux.bind(",", function()
   prompt("rename-window", gtmux.expand("#{window_name}"), function(t) gtmux.rename_window(t) end)
 end)
-gtmux.bind("z", function() gtmux.zoom() end)
+gtmux.bind("z", gtmux.zoom)
 -- prefix+e toggles prose highlighting in agent panes (see gtmux.agents below):
 -- "syntax highlighting for English" — function words dim, Capitalized bold,
 -- numbers/quotes/`code` colored. A readability/dyslexia aid for agent output.
-gtmux.bind("e", function() gtmux.prose_highlight() end)
-gtmux.bind(" ", function() gtmux.next_layout() end)       -- prefix+Space cycles presets
-gtmux.bind("C-o", function() gtmux.rotate_window() end)   -- prefix+C-o rotates panes
+gtmux.bind("e", gtmux.prose_highlight)
+gtmux.bind(" ", gtmux.next_layout)     -- prefix+Space cycles presets
+gtmux.bind("C-o", gtmux.rotate_window) -- prefix+C-o rotates panes
 gtmux.bind("{", function() gtmux.swap_pane("prev") end)
 gtmux.bind("}", function() gtmux.swap_pane("next") end)
 gtmux.bind("<", function() gtmux.swap_window("prev") end)
 gtmux.bind(">", function() gtmux.swap_window("next") end)
-gtmux.bind("!", function() gtmux.break_pane() end)
-gtmux.bind("m", function() gtmux.mark_pane() end)
-gtmux.bind("J", function() gtmux.join_marked() end)
+gtmux.bind("!", gtmux.break_pane)
+gtmux.bind("m", gtmux.mark_pane)
+gtmux.bind("J", gtmux.join_marked)
 -- choose-tree (prefix+w): a cross-session tree (every session's windows), type
 -- to filter, arrows to move, Enter switches to that session AND focuses that
 -- window. Composed in Lua over gtmux.sessions()/windows() + switch_session(name,idx).
@@ -301,7 +303,7 @@ function gtmux.choose_buffer()
     function(b) return b.name .. ": " .. b.preview end,
     function(b) gtmux.paste_buffer(b.name) end)
 end
-gtmux.bind("=", function() gtmux.choose_buffer() end)
+gtmux.bind("=", gtmux.choose_buffer)
 
 -- clock (prefix+t): a live clock overlay; any key dismisses. Re-renders on the
 -- status tick, so #{clock} stays current.
@@ -347,12 +349,13 @@ end
 gtmux.bind(":", function()
   prompt(":", "", function(t) gtmux.run_command(t) end)
 end)
-gtmux.bind("[", function() gtmux.enter_copy_mode() end)
-gtmux.bind("]", function() gtmux.paste() end)
+gtmux.bind("[", gtmux.enter_copy_mode)
+gtmux.bind("]", gtmux.paste)
 
--- Splits (new panes already open in the active pane's cwd).
-gtmux.bind("|", function() gtmux.split_v() end)
-gtmux.bind("-", function() gtmux.split_h() end)
+-- Splits (new panes already open in the active pane's cwd). split_right/split_down
+-- name where the new pane lands; split_v/split_h are kept as aliases.
+gtmux.bind("|", gtmux.split_right)
+gtmux.bind("-", gtmux.split_down)
 
 -- Directional pane resize, repeatable (tmux's `bind -r`): after the first
 -- prefix+key, the bare key keeps resizing until the repeat window lapses.
@@ -382,14 +385,14 @@ gtmux.bind_root("C-\\", function() gtmux.select_pane_vim("last") end)
 -- gtmux.bind_repeat("L", function() gtmux.resize_pane("right", 10) end)
 -- gtmux.bind_repeat("K", function() gtmux.resize_pane("up", 10) end)
 -- gtmux.bind_repeat("J", function() gtmux.resize_pane("down", 10) end)
--- gtmux.bind_repeat("m", function() gtmux.zoom() end)
+-- gtmux.bind_repeat("m", gtmux.zoom)
 
 -- Custom key tables (tmux bind -T / switch-client -T): key_table() switches the
 -- client into a named table for the *next* key only (one-shot), so multi-key
 -- sequences work. Example — prefix+g then n/p cycles windows:
 -- gtmux.bind("g", function() gtmux.key_table("mygroup") end)
--- gtmux.bind_table("mygroup", "n", function() gtmux.next_window() end)
--- gtmux.bind_table("mygroup", "p", function() gtmux.prev_window() end)
+-- gtmux.bind_table("mygroup", "n", gtmux.next_window)
+-- gtmux.bind_table("mygroup", "p", gtmux.prev_window)
 
 -- Alert hooks (tmux's alert-bell / alert-activity / alert-silence): gtmux fires
 -- the callback when a window's flag rises (edge, not every tick), with a table
