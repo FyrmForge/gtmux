@@ -152,14 +152,15 @@ func TestFramedTwoPaneOuterFrameFullyActive(t *testing.T) {
 		}
 	}
 
-	// The shared interior divider (content col 13 = left pane's right edge) IS
-	// half-split: top half active, bottom half inactive (left pane active).
+	// In framed mode the active pane's full box is the cue, so the shared
+	// interior divider (content col 13 = left pane's right edge) lights FULLY —
+	// no half-split. Both top and bottom of the left pane's edge are active.
 	topFg, _, _ := c.borderStyleAt(13, 0)
 	botFg, _, _ := c.borderStyleAt(13, 5)
 	if topFg != act {
 		t.Errorf("shared divider top: FG=%v, want active", topFg)
 	}
-	if botFg == act {
-		t.Errorf("shared divider bottom should be inactive (two-pane indicator), got active")
+	if botFg != act {
+		t.Errorf("shared divider bottom: FG=%v, want fully active in framed mode", botFg)
 	}
 }

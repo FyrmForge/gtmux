@@ -2737,7 +2737,10 @@ func (c *compositor) borderStyleAt(col, row int) (emu.Color, emu.Color, int16) {
 		// outer frame in framed mode) is touched by one pane and must light fully.
 		// Applying the split to the frame made it half-green/half-inactive, which
 		// read as broken.
-		if twoPanes && c.sharedBorderCell(col, row, i) && !activeBorderHalf(p, col, row) {
+		// Framed mode already outlines the active pane in a full box, so the
+		// shared divider lights fully (its whole edge) — the half-split is only
+		// needed when there's no outer frame and the divider is the sole cue.
+		if twoPanes && c.frameInset() == 0 && c.sharedBorderCell(col, row, i) && !activeBorderHalf(p, col, row) {
 			continue // the neighbour's half of the shared divider stays inactive
 		}
 		fg, bg, mode = c.cfg.ActiveBorderFG, emu.DefaultBG, 0
