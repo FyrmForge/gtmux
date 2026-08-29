@@ -27,6 +27,7 @@ Commands:
   kill, kill-session <session>          kill one session
   has-session, has <session>            exit 0 if the session exists, else non-zero
   kill-server                           shut down the daemon and all sessions
+  upgrade                               re-exec the daemon into the installed binary, sessions kept
   init-config [--force]                 write default server.lua + client.lua to ~/.config/gtmux
   help, -h, --help                      show this help
 `
@@ -50,7 +51,17 @@ func main() {
 	var err error
 	switch os.Args[1] {
 	case "server":
-		err = server.Run()
+		// server [--resume <state-file>]: --resume is set by an in-place upgrade
+		// (the old daemon exec'd us with its PTYs and socket inherited).
+		resume := ""
+		for i := 2; i+1 < len(os.Args); i++ {
+			if os.Args[i] == "--resume" {
+				resume = os.Args[i+1]
+			}
+		}
+		err = server.Run(resume)
+	case "upgrade":
+		err = client.Upgrade()
 	case "new", "new-session":
 		// new-session [<name>] [-d] [-t <group>]: -d creates without attaching
 		// (build via `run`, attach later); -t joins a group. Name is the first

@@ -573,7 +573,7 @@ end }
 	if lastWidget(cfg).Draw == nil {
 		t.Fatal("expected a draw function")
 	}
-	cv, _ := binds.RunDraw(lastWidget(cfg).Draw, 6, 4, emu.White, emu.Black, 0)
+	cv, _, _ := binds.RunDraw(lastWidget(cfg).Draw, 6, 4, emu.White, emu.Black, 0)
 	// Corners of the box.
 	if g, _ := cv.At(0, 0); g.Char != '┌' {
 		t.Errorf("top-left = %q, want ┌", g.Char)
@@ -618,7 +618,7 @@ end }
 	if lastWidget(cfg).Component == nil {
 		t.Fatal("expected a component function")
 	}
-	cv, regions, _ := binds.RunComponent(lastWidget(cfg).Component, nil, 10, 4, emu.White, emu.Black, 0)
+	cv, regions, _, _ := binds.RunComponent(lastWidget(cfg).Component, nil, 10, 4, emu.White, emu.Black, 0)
 	// Child text painted at the child's offset (2,1)..(4,1).
 	if g, _ := cv.At(2, 1); g.Char != 'B' {
 		t.Errorf("child (2,1) = %q, want B", g.Char)
@@ -674,7 +674,7 @@ end }
 	}
 
 	// First render: fresh state, n=0. Keep the returned state table.
-	cv, regions, state := binds.RunComponent(fn, nil, 8, 1, emu.White, emu.Black, 0)
+	cv, regions, state, _ := binds.RunComponent(fn, nil, 8, 1, emu.White, emu.Black, 0)
 	if got := rowText(cv, 3); got != "n=0" {
 		t.Fatalf("first render = %q, want n=0", got)
 	}
@@ -685,7 +685,7 @@ end }
 	for want := 1; want <= 2; want++ {
 		binds.RunClick(regions[0].OnClick, 0, "", 0)
 		var cv2 *Canvas
-		cv2, regions, state = binds.RunComponent(fn, state, 8, 1, emu.White, emu.Black, 0)
+		cv2, regions, state, _ = binds.RunComponent(fn, state, 8, 1, emu.White, emu.Black, 0)
 		if got := rowText(cv2, 3); got != "n="+string(rune('0'+want)) {
 			t.Fatalf("after %d clicks = %q, want n=%d (state must persist)", want, got, want)
 		}
@@ -706,7 +706,7 @@ end }
 	}
 	cfg, binds := LoadClient(path)
 	defer binds.Close()
-	cv, _ := binds.RunDraw(lastWidget(cfg).Draw, 6, 5, emu.White, emu.Black, 0)
+	cv, _, _ := binds.RunDraw(lastWidget(cfg).Draw, 6, 5, emu.White, emu.Black, 0)
 	if g, _ := cv.At(0, 2); g.Char != '├' {
 		t.Errorf("left border at hline = %q, want ├", g.Char)
 	}
@@ -732,7 +732,7 @@ func TestWidgetDrawRoundedBox(t *testing.T) {
 	}
 	cfg, binds := LoadClient(path)
 	defer binds.Close()
-	cv, _ := binds.RunDraw(lastWidget(cfg).Draw, 4, 4, emu.White, emu.Black, 0)
+	cv, _, _ := binds.RunDraw(lastWidget(cfg).Draw, 4, 4, emu.White, emu.Black, 0)
 	for _, tc := range []struct {
 		x, y int
 		want rune
@@ -754,7 +754,7 @@ func TestWidgetDrawBoxTitle(t *testing.T) {
 	}
 	cfg, binds := LoadClient(path)
 	defer binds.Close()
-	cv, _ := binds.RunDraw(lastWidget(cfg).Draw, 10, 3, emu.White, emu.Black, 0)
+	cv, _, _ := binds.RunDraw(lastWidget(cfg).Draw, 10, 3, emu.White, emu.Black, 0)
 	// top border row 0, " hi " centred in the 8-wide interior (cols 1..8): the
 	// 4-char label starts at col 1 + (8-4)/2 = 3 → cells 3.." ",4 'h',5 'i',6 ' '.
 	row := make([]rune, cv.W)
@@ -764,5 +764,33 @@ func TestWidgetDrawBoxTitle(t *testing.T) {
 	}
 	if got := string(row); got != "┌── hi ──┐" {
 		t.Fatalf("titled top border = %q, want %q", got, "┌── hi ──┐")
+	}
+}
+
+// A draw fn may emit ops (gtmux.run_command) and read server-global @options
+// from the snapshot (gtmux.global_option): the cross-client widget state path.
+func TestDrawEmitsOpsAndReadsGlobalOption(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "client.lua")
+	os.WriteFile(path, []byte(`gtmux.widget{ dock = "left", size = 5, draw = function(c)
+  if gtmux.global_option("@seen_1") == "" then gtmux.run_command("set -g @seen_1 1") end
+  c:text(0, 0, gtmux.global_option("@x"))
+end }`), 0o644)
+	cfg, binds := LoadClient(path)
+	defer binds.Close()
+	binds.Hooks.Snapshot = func() *proto.StateSnapshot {
+		return &proto.StateSnapshot{Options: map[string]string{"@x": "hi"}}
+	}
+	cv, _, ops := binds.RunDraw(lastWidget(cfg).Draw, 5, 1, emu.White, emu.Black, 0)
+	if len(ops) != 1 || ops[0].Command != "set -g @seen_1 1" {
+		t.Fatalf("ops = %+v, want one set -g command", ops)
+	}
+	if g, _ := cv.At(0, 0); g.Char != 'h' {
+		t.Errorf("cell = %q, want h (global_option read)", g.Char)
+	}
+	binds.Hooks.Snapshot = func() *proto.StateSnapshot {
+		return &proto.StateSnapshot{Options: map[string]string{"@seen_1": "1"}}
+	}
+	if _, _, ops := binds.RunDraw(lastWidget(cfg).Draw, 5, 1, emu.White, emu.Black, 0); len(ops) != 0 {
+		t.Errorf("ops after seen = %+v, want none", ops)
 	}
 }

@@ -63,6 +63,7 @@ type textBox struct {
 	canvas    *config.Canvas
 	regions   []config.Region // clickable rects emitted by the last draw (component)
 	state     *lua.LTable     // component's persistent ui:state() store (survives redraws)
+	ops       []config.BindOp // ops the last draw emitted (gtmux.run_command), drained by the client
 	w, h      int
 	interval  int
 	lastRun   time.Time
@@ -117,9 +118,13 @@ func (b *textBox) rerender() {
 	b.lastRun = time.Now()
 	switch {
 	case b.component != nil:
-		b.canvas, b.regions, b.state = b.binds.RunComponent(b.component, b.state, b.w, b.h, b.fg, b.bg, b.attr)
+		var ops []config.BindOp
+		b.canvas, b.regions, b.state, ops = b.binds.RunComponent(b.component, b.state, b.w, b.h, b.fg, b.bg, b.attr)
+		b.ops = append(b.ops, ops...)
 	case b.drawFn != nil:
-		b.canvas, b.regions = b.binds.RunDraw(b.drawFn, b.w, b.h, b.fg, b.bg, b.attr)
+		var ops []config.BindOp
+		b.canvas, b.regions, ops = b.binds.RunDraw(b.drawFn, b.w, b.h, b.fg, b.bg, b.attr)
+		b.ops = append(b.ops, ops...)
 	case b.textFn != nil:
 		b.lines = strings.Split(b.binds.RunText(b.textFn), "\n")
 	}

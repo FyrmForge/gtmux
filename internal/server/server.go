@@ -90,6 +90,16 @@ type registry struct {
 	// replayed to a late-attaching client so it inherits runtime option changes
 	// (HISTORY.md, runtime-options). Guarded by mu with the rest of the registry.
 	clientOpts map[string]string
+	// userOpts is the server-global @foo store (set -g @foo / set -gu @foo):
+	// shared widget state across every client and session, exported in each
+	// StateSnapshot. Guarded by mu.
+	userOpts map[string]string
+	// upgrading is set while an in-place upgrade dumps state; connections
+	// accepted meanwhile are parked (their fds handed to the new image).
+	upgrading bool
+	parked    []*os.File
+	// lnFile is the listening socket as a file, for the upgrade handoff.
+	lnFile *os.File
 	// wait-for channels: script sync primitives. Guarded by waitMu (separate from
 	// mu since a lock/wait blocks the connection goroutine while held-registered).
 	waitMu sync.Mutex
@@ -250,6 +260,28 @@ func (r *registry) setClientOpt(name, value string) {
 	r.clientOpts[name] = value
 }
 
+// setUserOpt stores (or with unset, removes) a global @foo user option.
+func (r *registry) setUserOpt(name, value string, unset bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if unset {
+		delete(r.userOpts, name)
+	} else {
+		r.userOpts[name] = value
+	}
+}
+
+// userOptsCopy returns a snapshot of the global @foo options.
+func (r *registry) userOptsCopy() map[string]string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	m := make(map[string]string, len(r.userOpts))
+	for k, v := range r.userOpts {
+		m[k] = v
+	}
+	return m
+}
+
 // clientOptsCopy returns a snapshot of the recorded client options.
 func (r *registry) clientOptsCopy() map[string]string {
 	r.mu.Lock()
@@ -281,7 +313,7 @@ func (r *registry) resolveGroup(name string, create bool, cols, rows int, cwd, g
 		}
 		s := newSession(name)
 		r.sessions[name] = s
-		go s.run(r, cols, rows, cwd, groupTarget)
+		go s.run(r, cols, rows, cwd, groupTarget, nil)
 		return s, nil
 	}
 
@@ -486,21 +518,41 @@ func clearStaleSocket(sockPath string) error {
 }
 
 // Run starts the gtmux daemon and blocks until the listener errors out.
-func Run() error {
+func Run(resumePath string) error {
 	sockPath := proto.SockPath()
-	if err := os.MkdirAll(filepath.Dir(sockPath), 0700); err != nil {
-		return err
-	}
-	if err := clearStaleSocket(sockPath); err != nil {
-		return err
-	}
-
-	ln, err := net.Listen("unix", sockPath)
-	if err != nil {
-		return err
+	var resume *savedServer
+	var ln net.Listener
+	if resumePath != "" {
+		// In-place upgrade: the previous image handed us its listening socket
+		// (clients that reconnected meanwhile are queued in its backlog).
+		st, err := loadResume(resumePath)
+		if err != nil {
+			return fmt.Errorf("resume: %w", err)
+		}
+		resume = st
+		lf := os.NewFile(uintptr(st.ListenFD), "gtmux-listener")
+		l, err := net.FileListener(lf)
+		lf.Close()
+		if err != nil {
+			return fmt.Errorf("resume listener: %w", err)
+		}
+		ln = l
+		log.Printf("gtmux server resumed on %s (%d sessions)", sockPath, len(st.Sessions))
+	} else {
+		if err := os.MkdirAll(filepath.Dir(sockPath), 0700); err != nil {
+			return err
+		}
+		if err := clearStaleSocket(sockPath); err != nil {
+			return err
+		}
+		l, err := net.Listen("unix", sockPath)
+		if err != nil {
+			return err
+		}
+		ln = l
+		log.Printf("gtmux server listening on %s", sockPath)
 	}
 	defer ln.Close()
-	log.Printf("gtmux server listening on %s", sockPath)
 
 	// Read the server options once at startup.
 	cfg := config.LoadServer(config.ServerConfigPath())
@@ -543,13 +595,53 @@ func Run() error {
 		hooks:             cfg.Hooks,
 		globalEnv:         map[string]string{},
 		clientOpts:        map[string]string{},
+		userOpts:          map[string]string{},
 		waitCh:            map[string]*waitChan{},
+	}
+	if lf, err := ln.(*net.UnixListener).File(); err == nil {
+		reg.lnFile = lf
+	}
+	if resume != nil {
+		for k, v := range resume.GlobalEnv {
+			reg.globalEnv[k] = v
+		}
+		for k, v := range resume.ClientOpts {
+			reg.clientOpts[k] = v
+		}
+		for k, v := range resume.UserOpts {
+			reg.userOpts[k] = v
+		}
+		for k, v := range resume.RuntimeBinds {
+			reg.recordBind(k, v)
+		}
+		reg.lastSession = resume.LastSession
+		nextPaneID.Store(resume.NextPaneID)
+		for i := range resume.Sessions {
+			ss := resume.Sessions[i]
+			s := newSession(ss.Name)
+			reg.sessions[ss.Name] = s
+			go s.run(reg, ss.Cols, ss.Rows, "", "", &ss)
+		}
+		for _, fd := range resume.ParkedFDs {
+			f := os.NewFile(uintptr(fd), "parked")
+			if c, err := net.FileConn(f); err == nil {
+				go acceptConn(reg, c)
+			}
+			f.Close()
+		}
 	}
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			return err
+		}
+		if uc, ok := conn.(*net.UnixConn); ok {
+			if f, err := uc.File(); err == nil && reg.park(f) {
+				continue // upgrade in flight: fd goes to the new image
+			} else if f != nil {
+				f.Close()
+			}
 		}
 		go acceptConn(reg, conn)
 	}
@@ -609,6 +701,32 @@ func acceptConn(reg *registry, conn net.Conn) {
 			enc.Encode(&proto.ServerMsg{Ack: &proto.Ack{Ok: true}})
 		}
 		conn.Close()
+		return
+	}
+	if msg.Upgrade != nil {
+		enc.Encode(&proto.ServerMsg{Ack: &proto.Ack{Ok: true}})
+		conn.Close()
+		if err := reg.upgrade(reg.lnFile); err != nil {
+			log.Printf("gtmux: upgrade failed: %v", err)
+			reg.mu.Lock()
+			reg.upgrading = false
+			parked := reg.parked
+			reg.parked = nil
+			sessions := make([]*session, 0, len(reg.sessions))
+			for _, s := range reg.sessions {
+				sessions = append(sessions, s)
+			}
+			reg.mu.Unlock()
+			for _, s := range sessions { // lift the dump freeze so they serve again
+				s.events <- unfreezeEvent{}
+			}
+			for _, f := range parked { // serve what we parked ourselves
+				if c, err := net.FileConn(f); err == nil {
+					go acceptConn(reg, c)
+				}
+				f.Close()
+			}
+		}
 		return
 	}
 	if msg.KillServer != nil {

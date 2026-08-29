@@ -98,7 +98,7 @@ type pane struct {
 	// breaks a tie between multiple neighbors by picking the highest — the
 	// most-recently-active — so left-then-right returns to where you came from.
 	activePoint int64
-	gen    int  // bumped on respawn; tags PTY-reader events so a stale reader's
+	gen         int // bumped on respawn; tags PTY-reader events so a stale reader's
 	// output/exit (from the pre-respawn process) is dropped, not applied.
 	// origin is the actor this pane's reader posts to (its birth window). It never
 	// changes; break/join set origin.relay[p] so the origin forwards to the pane's

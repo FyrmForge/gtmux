@@ -1079,6 +1079,29 @@ func (c *compositor) detectAgentStates(snap *proto.StateSnapshot) {
 }
 
 // drainAgentChanges returns and clears the queued agent-state changes.
+// drainDrawOps collects the ops draw/component widgets emitted on their last
+// render (gtmux.run_command from a draw fn) so the client can dispatch them
+// after apply, like click ops.
+func (c *compositor) drainDrawOps() []config.BindOp {
+	var out []config.BindOp
+	take := func(w widget) {
+		if b, ok := w.(*textBox); ok && len(b.ops) > 0 {
+			out = append(out, b.ops...)
+			b.ops = nil
+		}
+	}
+	for _, w := range c.overlays {
+		take(w)
+	}
+	for _, d := range c.docks {
+		take(d)
+	}
+	if c.statusWidget != nil {
+		take(c.statusWidget)
+	}
+	return out
+}
+
 func (c *compositor) drainAgentChanges() []agentChange {
 	if len(c.pendingAgent) == 0 {
 		return nil
@@ -1515,7 +1538,8 @@ func (c *compositor) buildRow(row int) emu.Line {
 	// pane's own ring cells override with their fg-only color.
 	// twoPanes: tmux's pane-border-indicators=colour lights only HALF the shared
 	// divider when a window has exactly two panes, so you can tell which is
-	// active (a full-length divider is ambiguous between the two). See
+	// active (a full-length divider is ambiguous between the two). Suppressed in
+	// framed mode, where the active pane's full box is the cue instead. See
 	// onActiveBorder.
 	borderGlyph := func(char rune, col int) emu.Glyph {
 		fg, bg, mode := c.borderStyleAt(col, row)

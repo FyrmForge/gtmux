@@ -169,6 +169,9 @@ type StatusInfo struct {
 // query tables — no separate data bus, just a fatter StatusInfo.
 type StateSnapshot struct {
 	Sessions []SnapSession
+	// Options is the server-global @foo user-option store (set -g @foo), the
+	// cross-client shared state widgets read via gtmux.global_option().
+	Options map[string]string
 }
 
 // SnapSession is one session's summary in a StateSnapshot.
@@ -300,6 +303,10 @@ type SessionList struct {
 // Attach; the server replies once with Ack and then exits.
 type KillServerRequest struct{}
 
+// UpgradeRequest asks the daemon to re-exec its binary in place, handing its
+// PTYs and listening socket to the new image (gtmux upgrade). Panes survive.
+type UpgradeRequest struct{}
+
 // KillSessionRequest asks the server to tear down a named session. Sent
 // instead of Attach; the server replies once with Ack and closes the
 // connection.
@@ -360,6 +367,7 @@ type ClientMsg struct {
 	HasSession    *HasSessionRequest
 	NewSession    *NewSessionRequest
 	KillServer    *KillServerRequest
+	Upgrade       *UpgradeRequest
 	RenameSession *RenameSessionRequest
 	Command       *CommandRequest
 	SetPaste      *SetPasteBuffer

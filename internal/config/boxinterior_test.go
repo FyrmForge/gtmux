@@ -23,7 +23,7 @@ func TestBoxReturnsClippedInterior(t *testing.T) {
 		cfg, b := LoadClient(p)
 		defer b.Close()
 		w := cfg.Widgets[len(cfg.Widgets)-1]
-		cv, _ := b.RunDraw(w.Draw, 15, 6, 0, 0, 0)
+		cv, _, _ := b.RunDraw(w.Draw, 15, 6, 0, 0, 0)
 		rows := make([][]rune, cv.H)
 		for y := 0; y < cv.H; y++ {
 			rows[y] = make([]rune, cv.W)

@@ -1246,8 +1246,20 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 			alerts := comp.drainAlerts()
 			progChanges := comp.drainProgramChanges()
 			agentChanges := comp.drainAgentChanges()
+			drawOps := comp.drainDrawOps()
 			compMu.Unlock()
 			os.Stdout.Write(out)
+			// Draw-emitted ops: only command/action ops make sense from a draw
+			// (no key table / overlay context here); dispatch never holds compMu.
+			for _, op := range drawOps {
+				if op.Command != "" {
+					if argv := tokenize(op.Command); len(argv) > 0 {
+						dispatch(argv)
+					}
+				} else if len(op.Action) > 0 {
+					dispatch(op.Action)
+				}
+			}
 			if respAct != nil {
 				// responsive maximize: auto-(un)zoom on a breakpoint crossing.
 				// Sent outside compMu like any other action.

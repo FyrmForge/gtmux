@@ -984,13 +984,14 @@ func (c *ClientBinds) buildUI(cv *Canvas, regions *[]Region, state *lua.LTable) 
 // it emitted. Base style = the widget's fg/bg/attr so undrawn cells match the
 // background. twoArg picks the calling convention — a draw=function(c) fn must
 // keep being called fn(ui), never fn(props, ui), or its `c` binds to props.
-func (c *ClientBinds) runPaint(fn *lua.LFunction, twoArg bool, state *lua.LTable, w, h int, fg, bg emu.Color, attr int16) (*Canvas, []Region, *lua.LTable) {
+func (c *ClientBinds) runPaint(fn *lua.LFunction, twoArg bool, state *lua.LTable, w, h int, fg, bg emu.Color, attr int16) (*Canvas, []Region, *lua.LTable, []BindOp) {
 	cv := newCanvas(w, h, fg, bg, attr)
 	if fn == nil {
-		return cv, nil, state
+		return cv, nil, state, nil
 	}
 	c.vmMu.Lock()
 	defer c.vmMu.Unlock()
+	c.ops = nil // a draw may emit ops (gtmux.run_command) like a click does
 	if state == nil {
 		state = c.l.NewTable() // first render: create the widget's persistent state
 	}
@@ -1005,7 +1006,9 @@ func (c *ClientBinds) runPaint(fn *lua.LFunction, twoArg bool, state *lua.LTable
 	if err != nil {
 		log.Printf("gtmux: widget paint error: %v", err)
 	}
-	return cv, regions, state
+	ops := c.ops
+	c.ops = nil
+	return cv, regions, state, ops
 }
 
 // RunDraw runs a widget's one-arg draw function fn(ui). Back-compat: the ui it
@@ -1013,15 +1016,15 @@ func (c *ClientBinds) runPaint(fn *lua.LFunction, twoArg bool, state *lua.LTable
 // fns work unchanged, and they may now also call ui:on_click. Draw fns get a
 // throwaway state table (they're the stateless legacy form); use component for
 // persistent state.
-func (c *ClientBinds) RunDraw(fn *lua.LFunction, w, h int, fg, bg emu.Color, attr int16) (*Canvas, []Region) {
-	cv, regions, _ := c.runPaint(fn, false, nil, w, h, fg, bg, attr)
-	return cv, regions
+func (c *ClientBinds) RunDraw(fn *lua.LFunction, w, h int, fg, bg emu.Color, attr int16) (*Canvas, []Region, []BindOp) {
+	cv, regions, _, ops := c.runPaint(fn, false, nil, w, h, fg, bg, attr)
+	return cv, regions, ops
 }
 
 // RunComponent runs a two-arg component fn(props, ui) as a widget's root. state
 // is the widget's persistent store (nil on first render); the returned table is
 // the same one, to be passed back next render so ui:state() survives redraws.
-func (c *ClientBinds) RunComponent(fn *lua.LFunction, state *lua.LTable, w, h int, fg, bg emu.Color, attr int16) (*Canvas, []Region, *lua.LTable) {
+func (c *ClientBinds) RunComponent(fn *lua.LFunction, state *lua.LTable, w, h int, fg, bg emu.Color, attr int16) (*Canvas, []Region, *lua.LTable, []BindOp) {
 	return c.runPaint(fn, true, state, w, h, fg, bg, attr)
 }
 
@@ -1640,6 +1643,14 @@ func LoadClientWith(path string, overrides [][2]string) (ClientConfig, *ClientBi
 			}
 		}
 		l.Push(t)
+		return 1
+	}))
+
+	// gtmux.global_option(name): a server-global @foo user option (set -g @foo)
+	// from the snapshot — shared state visible to every client across sessions.
+	// "" when unset.
+	L.SetField(tbl, "global_option", L.NewFunction(func(l *lua.LState) int {
+		l.Push(lua.LString(snap().Options[l.CheckString(1)]))
 		return 1
 	}))
 

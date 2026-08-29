@@ -20,6 +20,13 @@ func KillServer() error {
 	return gob.NewEncoder(conn).Encode(&proto.ClientMsg{KillServer: &proto.KillServerRequest{}})
 }
 
+// Upgrade asks the running daemon to re-exec into the currently installed
+// binary, keeping every session and pane process alive.
+func Upgrade() error {
+	_, err := oneShot(&proto.ClientMsg{Upgrade: &proto.UpgradeRequest{}})
+	return err
+}
+
 // Command executes one command-mode command in a session from outside
 // (`gtmux run <session> <command...>`).
 func Command(session string, args []string) (string, error) {

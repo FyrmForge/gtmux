@@ -4,9 +4,11 @@ import (
 	"encoding/gob"
 	"fmt"
 	"log"
+	"maps"
 	"net"
 	"os"
 	"os/exec"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -443,7 +445,9 @@ func (s *session) rename(name string) {
 // run is the session's owner goroutine: the sole mutator of its windows,
 // panes, and attachment state. Removes the session from reg when its last
 // pane exits.
-func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
+// resume, when set, rebuilds the session from an in-place upgrade's dump
+// (adopted panes) instead of spawning a first window.
+func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string, resume *savedSession) {
 	// The client reserves its own status rows and reports the window (content)
 	// height directly, so the server sizes the grid to rows as-is — status-bar
 	// reservation is entirely client-side. (winRows stays a func for the many
@@ -497,6 +501,11 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 	// created earlier (future panes only, like tmux). ponytail: session-scoped;
 	// tmux -g (global) deferred.
 	sessionEnv := map[string]string{}
+	if resume != nil {
+		for k, v := range resume.Env {
+			sessionEnv[k] = v
+		}
+	}
 
 	// new-session -t <group>: display the target session's current windows (a
 	// snapshot — this session subscribes a view to each of the target's actors
@@ -519,7 +528,31 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 	// only borrows the target's windows — no window of its own to start/watch).
 	var first *windowActor
 	var windows []winlink
-	if len(groupActors) > 0 {
+	var resumed []*windowActor // upgrade-adopted windows beyond the first (started below)
+	if resume != nil {
+		for _, sw := range resume.Windows {
+			win, err := resumeWindow(sw, cols, winRows(), s.name, sessionEnv, reg.globalEnvCopy())
+			if err != nil {
+				log.Printf("session %s: upgrade: window dropped: %v", s.name, err)
+				continue
+			}
+			wa := newWindowActor(win)
+			for _, p := range win.panes {
+				watchPane(p)
+			}
+			windows = append(windows, winlink{actor: wa})
+			if first == nil {
+				first = wa
+			} else {
+				resumed = append(resumed, wa)
+			}
+		}
+		if first == nil {
+			log.Printf("session %s: upgrade: no windows survived", s.name)
+			reg.remove(s.name)
+			return
+		}
+	} else if len(groupActors) > 0 {
 		for _, a := range groupActors {
 			windows = append(windows, winlink{actor: a}) // view filled in below
 		}
@@ -576,9 +609,28 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 	// session-scoped (not cross-session -g) — one session covers the POC use.
 	userOpts := map[string]string{}
 	cmdAlias := map[string]string{}
+	// globalUserOpts is a session-local copy of the registry's global @foo store
+	// (set -g @foo), refreshed on the 1s tick and right after a local set -g @ —
+	// so withUserOpts reads it lock-free instead of taking r.mu on every status
+	// stamp (that contended the registry lock on the flood hot path). Cross-session
+	// set -g @ shows within a tick, like every other cross-session widget datum.
+	globalUserOpts := reg.userOptsCopy()
+	if resume != nil {
+		for k, v := range resume.UserOpts {
+			userOpts[k] = v
+		}
+		for k, v := range resume.CmdAlias {
+			cmdAlias[k] = v
+		}
+	}
 	// withUserOpts merges the @foo options into a freshly-built format var map so
 	// #{@foo} resolves like any other variable.
 	withUserOpts := func(m map[string]string) map[string]string {
+		// Global @foo options (set -g) first, session @foo (set) on top so a
+		// session-scoped value overrides a global one — tmux's precedence.
+		for k, v := range globalUserOpts {
+			m[k] = v
+		}
 		for k, v := range userOpts {
 			m[k] = v
 		}
@@ -661,6 +713,9 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 	if first != nil {
 		initWindowBorder(first)
 	}
+	for _, wa := range resumed {
+		initWindowBorder(wa)
+	}
 
 	// hooks is this session's own copy of the global event→command bindings, so
 	// a runtime set-hook stays session-local (no shared mutable state). fireHook
@@ -669,6 +724,11 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 	hooks := map[string][]string{}
 	for k, v := range reg.hooks {
 		hooks[k] = append([]string(nil), v...)
+	}
+	if resume != nil {
+		for k, v := range resume.Hooks {
+			hooks[k] = append([]string(nil), v...)
+		}
 	}
 	firing := map[string]bool{} // hook names currently firing, for per-name re-entry guard
 	var fireHook func(string)
@@ -687,6 +747,11 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 	// are server-global) — keeps the no-mutex owner model; a global store would
 	// need a lock. bufSeq names auto buffers buffer0, buffer1, …
 	var buffers []pbuf
+	if resume != nil {
+		for _, b := range resume.Buffers {
+			buffers = append(buffers, pbuf{name: b.Name, data: b.Data})
+		}
+	}
 	bufSeq := 0
 	// addBuffer prepends a buffer. A given name replaces any existing same-named
 	// one; an empty name gets the next auto name.
@@ -759,6 +824,7 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 	// client that triggered them rather than broadcasting.
 	actingEpoch := 0
 	var killReplyCh chan struct{}
+	frozen := false // upgrade dumped: ignore every further event (see dumpEvent)
 	killed := false // session ends by kill (not last-window-close): detach-on-destroy applies
 
 	hostname, _ := os.Hostname()
@@ -878,7 +944,7 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 			// session — reflects a window change immediately instead of lagging a
 			// tick. Other sessions stay from their last self-report.
 			reg.putSnapshot(s.name, buildSnapSession())
-			info.Snapshot = &proto.StateSnapshot{Sessions: reg.allSnapshots()}
+			info.Snapshot = &proto.StateSnapshot{Sessions: reg.allSnapshots(), Options: reg.userOptsCopy()}
 		}
 		return info
 	}
@@ -1150,6 +1216,9 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 	// target's already-running actors, so it only subscribes a view to each.
 	if first != nil {
 		windows[0].view = first.start(renderCh, s.events)
+		for i := range resumed {
+			windows[i+1].view = resumed[i].start(renderCh, s.events)
+		}
 	} else {
 		for i := range windows {
 			windows[i].view = subscribeView(windows[i].actor, renderCh, s.events)
@@ -1167,6 +1236,26 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 			gc, gr = wl.actor.cols, wl.actor.rows
 		})
 		winGrid[wl.actor] = [2]int{gc, gr}
+	}
+	if resume != nil {
+		// Restore the current/last window, then nudge every child so full-screen
+		// apps repaint over the replayed approximation.
+		if resume.Active > 0 && resume.Active < len(windows) {
+			setActive(windows[0], false)
+			active = resume.Active
+			setActive(windows[active], true)
+		}
+		if resume.LastWindow >= 0 && resume.LastWindow < len(windows) {
+			lastWindow = resume.LastWindow
+		}
+		for _, wl := range windows {
+			wl := wl
+			actorDo(wl.actor, func() {
+				for _, p := range wl.actor.panes {
+					bounceSize(p)
+				}
+			})
+		}
 	}
 
 	// fullSync reports the active window's full layout and every pane's
@@ -2440,7 +2529,10 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 				// ponytail: unsetting a session-scoped scalar back to its config
 				// default isn't wired (each is a plain Go var); add per-option if it
 				// ever matters — the map-backed overrides are the real -u use.
-				if strings.HasPrefix(a[0], "@") {
+				if strings.HasPrefix(a[0], "@") && global {
+					reg.setUserOpt(a[0], "", true)
+					globalUserOpts = reg.userOptsCopy()
+				} else if strings.HasPrefix(a[0], "@") {
 					delete(userOpts, a[0])
 				} else if perWindow {
 					delete(targetW.opts, strings.ReplaceAll(a[0], "-", "_"))
@@ -2461,7 +2553,13 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 				switch key {
 				case "@":
 					// User option: store the whole value, readable in formats as #{@foo}.
-					userOpts[a[0]] = strings.Join(a[1:], " ")
+					// -g makes it server-global (StateSnapshot.Options) instead of session-scoped.
+					if global {
+						reg.setUserOpt(a[0], strings.Join(a[1:], " "), false)
+						globalUserOpts = reg.userOptsCopy()
+					} else {
+						userOpts[a[0]] = strings.Join(a[1:], " ")
+					}
 				case "command_alias":
 					// "name=expansion" → alias resolved at dispatch.
 					if def := strings.Join(a[1:], " "); strings.Contains(def, "=") {
@@ -2678,6 +2776,16 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string) {
 				{"visual-bell", offOn(visualBell)},
 				{"pane-border-status", paneBorderStatus},
 				{"pane-border-format", paneBorderFormat},
+			}
+			// @foo user options: the session's, or with -g the server-global ones.
+			uo := userOpts
+			for _, x := range rest {
+				if x == "-g" {
+					uo = reg.userOptsCopy()
+				}
+			}
+			for _, k := range slices.Sorted(maps.Keys(uo)) {
+				all = append(all, [2]string{k, uo[k]})
 			}
 			var lines []string
 			for _, kv := range all {
@@ -3660,6 +3768,7 @@ loop:
 	for {
 		select {
 		case <-ticker.C:
+			globalUserOpts = reg.userOptsCopy() // pick up cross-session set -g @foo
 			refreshStatus()
 			if reg.snapshotsActive() {
 				reg.putSnapshot(s.name, buildSnapSession())
@@ -3668,6 +3777,12 @@ loop:
 		case vw := <-renderCh:
 			pumpRender(vw)
 		case ev := <-s.events:
+			if frozen {
+				if _, ok := ev.(unfreezeEvent); ok {
+					frozen = false
+				}
+				continue
+			}
 			switch e := ev.(type) {
 			case attachEvent:
 				nextEpoch++
@@ -3735,6 +3850,25 @@ loop:
 				cmdOut = ""
 				errText := runCommand(e.args)
 				e.replyCh <- cmdReply{out: cmdOut, err: errText}
+			case dumpEvent:
+				// In-place upgrade: snapshot this session's shape, tell every
+				// client to reconnect (it lands on the new image), then freeze —
+				// no event may mutate or close panes between here and the exec.
+				ss := savedSession{Name: s.name, Env: sessionEnv, UserOpts: userOpts, CmdAlias: cmdAlias,
+					Hooks: hooks, Active: active, LastWindow: lastWindow, Cols: cols, Rows: rows}
+				for _, b := range buffers {
+					ss.Buffers = append(ss.Buffers, savedBuffer{Name: b.name, Data: b.data})
+				}
+				for _, wl := range windows {
+					var sw savedWindow
+					actorDo(wl.actor, func() { sw = dumpWindow(wl.actor.window) })
+					ss.Windows = append(ss.Windows, sw)
+				}
+				for ep := range attachments {
+					sendTo(ep, &proto.ServerMsg{SwitchSession: s.name})
+				}
+				e.reply <- ss
+				frozen = true
 			case messageEvent:
 				// Route through showMessage so async messages (run-shell
 				// output) get the same 3s auto-clear as synchronous ones —
