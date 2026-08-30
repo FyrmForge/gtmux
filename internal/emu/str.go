@@ -61,6 +61,12 @@ func (t *State) setColorName(j Color, p *string) error {
 	return nil
 }
 
+// DefaultColorFallback answers OSC 10/11 "?" queries for the default fg/bg
+// when no OSC 10/11 override was set. Nil (the zero value) means the query is
+// dropped — which is what leaves auto-theming apps (Claude Code, nvim) guessing
+// dark. The server installs one that follows ~/.theme-mode.
+var DefaultColorFallback func(num int) (r, g, b int, ok bool)
+
 func (t *State) oscColorResponse(j Color, num int) {
 	k, ok := t.colorOverride[j]
 	if ok {
@@ -68,6 +74,9 @@ func (t *State) oscColorResponse(j Color, num int) {
 	}
 
 	r, g, b, ok := j.RGB()
+	if !ok && DefaultColorFallback != nil {
+		r, g, b, ok = DefaultColorFallback(num)
+	}
 	if !ok {
 		return
 	}

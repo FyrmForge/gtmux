@@ -794,3 +794,23 @@ end }`), 0o644)
 		t.Errorf("ops after seen = %+v, want none", ops)
 	}
 }
+
+// c:text advances one cell per rune: a multibyte glyph must not leave a gap
+// (a range over the string gave byte offsets, so "⠋x" put x two cells late).
+func TestWidgetDrawTextRuneCells(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "client.lua")
+	src := `
+gtmux.widget{ dock = "top", size = 1, draw = function(c)
+  c:text(0, 0, "⠋x")
+end }
+`
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, binds := LoadClient(path)
+	defer binds.Close()
+	cv, _, _ := binds.RunDraw(lastWidget(cfg).Draw, 4, 1, emu.White, emu.Black, 0)
+	if g, _ := cv.At(1, 0); g.Char != 'x' {
+		t.Errorf("cell 1 = %q, want x right after the spinner", g.Char)
+	}
+}

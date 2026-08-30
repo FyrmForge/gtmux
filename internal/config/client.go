@@ -313,7 +313,18 @@ func splitFields(s string) []string {
 // (set_option + the gtmux.options.* readout) and runtime set-option both go
 // through it, so a new option is added in exactly one place.
 func applyOption(cfg *ClientConfig, binds *ClientBinds, name, value string) bool {
+	// "default" = the terminal's own colour, so light themes (where all 16
+	// ANSI names are dark) can paint chrome on the terminal background.
+	// fg/bg defaults differ, so it's resolved by the slot's name, not the map.
 	setColor := func(dst *emu.Color) {
+		if value == "default" {
+			if strings.HasSuffix(name, "_bg") {
+				*dst = emu.DefaultBG
+			} else {
+				*dst = emu.DefaultFG
+			}
+			return
+		}
 		if c, ok := colorNames[value]; ok {
 			*dst = c
 		}
@@ -492,6 +503,10 @@ func applyStyle(value string, fg, bg *emu.Color, attr *int16) {
 	for _, tok := range strings.Split(value, ",") {
 		tok = strings.TrimSpace(tok)
 		switch {
+		case tok == "fg=default":
+			*fg = emu.DefaultFG
+		case tok == "bg=default":
+			*bg = emu.DefaultBG
 		case strings.HasPrefix(tok, "fg="):
 			if c, ok := colorNames[strings.TrimPrefix(tok, "fg=")]; ok {
 				*fg = c
@@ -847,7 +862,9 @@ func (c *ClientBinds) buildUI(cv *Canvas, regions *[]Region, state *lua.LTable) 
 		L.SetField(t, "text", L.NewFunction(func(l *lua.LState) int {
 			x, y := l.CheckInt(2), l.CheckInt(3)
 			g := cv.style(l.OptString(5, ""))
-			for i, r := range l.CheckString(4) {
+			// index by rune, not byte: a range over a string yields byte
+			// offsets, so "⠋" (3 bytes) used to leave two blank cells behind it
+			for i, r := range []rune(l.CheckString(4)) {
 				put(x+i, y, r, g)
 			}
 			return 0

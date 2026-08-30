@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/FyrmForge/gtmux/internal/emu"
 )
 
 // status_fg / status_bg were parsed but silently DROPPED — applyOption only
@@ -46,5 +48,22 @@ gtmux.options.status_bg = "red"`), 0o644); err != nil {
 	want, _ := ColorByName("red")
 	if cfg.StatusBG != want {
 		t.Errorf("StatusBG=%v, want %v — a valid option must still apply alongside unknown ones", cfg.StatusBG, want)
+	}
+}
+
+// "default" resolves to the terminal's own fg/bg (distinct values), for light
+// themes where every ANSI name is dark.
+func TestStatusDefaultColor(t *testing.T) {
+	d := t.TempDir()
+	p := filepath.Join(d, "c.lua")
+	os.WriteFile(p, []byte(`gtmux.options.status_bg = "default"
+gtmux.options.status_fg = "default"`), 0o644)
+	cfg, b := LoadClient(p)
+	defer b.Close()
+	if cfg.StatusBG != emu.DefaultBG {
+		t.Errorf("status_bg = %v, want DefaultBG", cfg.StatusBG)
+	}
+	if cfg.StatusFG != emu.DefaultFG {
+		t.Errorf("status_fg = %v, want DefaultFG", cfg.StatusFG)
 	}
 }
