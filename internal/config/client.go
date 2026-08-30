@@ -19,6 +19,16 @@ import (
 //go:embed default_client.lua
 var defaultClientLua string
 
+// Bundled Lua modules, reachable from a config via require("gtmux.<name>").
+// Compiled only when required, so a config that doesn't use one pays nothing.
+// ponytail: the seed of a plugin system — a user plugins dir slots in as
+// another loader here when there's a second plugin to install.
+//
+//go:embed sidebar.lua
+var sidebarLua string
+
+var bundledModules = map[string]string{"gtmux.sidebar": sidebarLua}
+
 // WriteDefaultClient writes the embedded default client.lua to the user's
 // config path. See writeConfig for the overwrite/force semantics.
 func WriteDefaultClient(force bool) (string, error) {
@@ -142,8 +152,10 @@ type WidgetSpec struct {
 	// sub-components (ui:child) and emit clickable regions (ui:on_click). Takes
 	// precedence over Draw. Draw stays as the one-arg fn(ui) form for back-compat.
 	Component *lua.LFunction
-	// Interval throttles TextFn/Draw re-runs to at most once per Interval seconds
-	// (0 = every status tick). A clock wants 1; a session list can be lazier.
+	// Interval throttles TextFn re-runs to at most once per Interval seconds
+	// (0 = every status tick). NOTE: inert for Draw/Component docks — the
+	// client's 150ms animation tick re-runs every visible draw dock regardless
+	// (compositor.animateDocks), which is what keeps spinners smooth.
 	Interval int
 	// OnKey, if set with Focus, makes a docked widget focusable: while focused
 	// every key routes to OnKey (like a modal) until it calls ui:close(). The
@@ -650,6 +662,10 @@ type WidgetHooks struct {
 	Context  func() map[string]string    // gtmux.context(): session/window/pane/prefix/width/height
 	Expand   func(string) string         // gtmux.expand()
 	Option   func(string) string         // gtmux.get_option()
+	// AgentState reports the client's classified agent state for a pane id
+	// ("busy"/"done"/"idle" per gtmux.agents{}, "" = not an agent pane / no
+	// classifier). Surfaced as the `state` field on find_panes rows.
+	AgentState func(paneID int) string
 }
 
 func (c *ClientBinds) Close() { c.l.Close() }
@@ -1648,7 +1664,13 @@ func LoadClientWith(path string, overrides [][2]string) (ClientConfig, *ClientBi
 					if filter != "" && !strings.Contains(p.Command, filter) {
 						continue
 					}
-					arr.Append(pushPane(l, p, sess.Name, w.Index))
+					row := pushPane(l, p, sess.Name, w.Index)
+					state := ""
+					if binds.Hooks.AgentState != nil {
+						state = binds.Hooks.AgentState(p.ID)
+					}
+					row.RawSetString("state", lua.LString(state))
+					arr.Append(row)
 				}
 			}
 		}
@@ -2015,6 +2037,18 @@ func LoadClientWith(path string, overrides [][2]string) (ClientConfig, *ClientBi
 		return 0
 	}))
 	L.SetGlobal("gtmux", tbl)
+	for name, src := range bundledModules {
+		name, src := name, src
+		L.PreloadModule(name, func(l *lua.LState) int {
+			fn, err := l.LoadString(src)
+			if err != nil {
+				l.RaiseError("gtmux: bundled module %s is broken: %v", name, err)
+			}
+			l.Push(fn)
+			l.Call(0, 1)
+			return 1
+		})
+	}
 
 	if err := L.DoString(defaultClientLua); err != nil {
 		log.Fatalf("gtmux: embedded default client config is broken: %v", err)

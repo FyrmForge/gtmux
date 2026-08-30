@@ -437,3 +437,10 @@ end)
 -- gtmux.on("program-changed", function(p)
 --   if p.command == "nvim" or p.command == "vim" then p:set_border("blue") end
 -- end)
+
+-- Bundled widgets are Lua modules: require("gtmux.<name>") returns a setup
+-- function taking an options table (see the module's header for the fields).
+-- gtmux.sidebar: left dock with a SESSIONS list and a Clanker (agent panes)
+-- section; click a row to switch there. Pair it with a toggle bind:
+-- require("gtmux.sidebar"){ size = 25, min_cols = 110 }
+-- gtmux.bind("B", function() gtmux.toggle_dock("sidebar") end)

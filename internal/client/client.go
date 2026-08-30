@@ -306,6 +306,12 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 				}
 				return ""
 			},
+			AgentState: func(paneID int) string {
+				if comp != nil {
+					return comp.agentState[paneID]
+				}
+				return ""
+			},
 		}
 	}
 	installHooks(binds0)

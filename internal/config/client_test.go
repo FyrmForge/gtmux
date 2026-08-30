@@ -814,3 +814,33 @@ end }
 		t.Errorf("cell 1 = %q, want x right after the spinner", g.Char)
 	}
 }
+
+// require("gtmux.sidebar") is a bundled module: calling it registers the
+// sidebar dock widget with the given options; a config that never requires
+// it registers no widget for it.
+func TestBundledSidebarModule(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "client.lua")
+	if err := os.WriteFile(path, []byte(`require("gtmux.sidebar"){ size = 30, name = "sb" }`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, binds := LoadClient(path)
+	defer binds.Close()
+	w := lastWidget(cfg)
+	if w.Dock != "left" || w.Size != 30 || w.Name != "sb" || w.Draw == nil || w.OnClick == nil {
+		t.Fatalf("sidebar widget = %+v, want left dock, size 30, name sb, draw+on_click", w)
+	}
+	cv, _, _ := binds.RunDraw(w.Draw, 30, 5, emu.White, emu.Black, 0)
+	if g, _ := cv.At(2, 1); g.Char != 'S' { // "SESSIONS" header inside the box
+		t.Errorf("cell (2,1) = %q, want S of SESSIONS", g.Char)
+	}
+	if err := os.WriteFile(path, []byte(`gtmux.options.status_bg = "red"`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg2, binds2 := LoadClient(path)
+	defer binds2.Close()
+	for _, w := range cfg2.Widgets {
+		if w.Name == "sidebar" || w.Name == "sb" {
+			t.Errorf("sidebar registered without require: %+v", w)
+		}
+	}
+}
