@@ -491,8 +491,15 @@ func (r *registry) list() []proto.SessionInfo {
 // targetSession returns the session component of a `-t sess:...` target in
 // args, or "" if there's no -t or the target has no session (a leading ":win"
 // or a bare "%id"/"win.pane"). It's the name→owner test for cross-session
-// command routing.
+// command routing. Client-scoped commands (switch-client) return "": their -t
+// names where the CLIENT goes, so they must run on the session the client is
+// attached to, never be routed to the target. ponytail: an aliased
+// switch-client (command-alias) still slips through — aliases are per-session
+// state, expanded after routing; use the unaliased name for -t sess:pane.
 func targetSession(args []string) string {
+	if len(args) > 0 && args[0] == "switch-client" {
+		return ""
+	}
 	for i := 0; i+1 < len(args); i++ {
 		if args[i] == "-t" {
 			if c := strings.Index(args[i+1], ":"); c > 0 {
@@ -820,7 +827,8 @@ func acceptConn(reg *registry, conn net.Conn) {
 			// that session (tmux's cross-session keybinds). Run on the connection
 			// goroutine via command() — not a session goroutine, so no deadlock.
 			// Same-session (or overlay-opening) actions take the local path so the
-			// acting epoch is known for client-targeted replies.
+			// acting epoch is known for client-targeted replies. (switch-client
+			// is exempt inside targetSession: its -t names where the CLIENT goes.)
 			if ts := targetSession(m.Action.Args); ts != "" && ts != s.name {
 				if peer, ok := reg.get(ts); ok {
 					peer.command(m.Action.Args)

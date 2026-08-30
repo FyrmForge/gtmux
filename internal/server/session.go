@@ -220,6 +220,7 @@ func (a *attachment) writer() {
 type session struct {
 	name   string
 	events chan interface{}
+	gone   chan struct{} // closed when the run loop exits; unblocks command()
 }
 
 // ptyOutput is a chunk of output read from one pane's PTY, or its
@@ -350,8 +351,17 @@ type commandEvent struct {
 
 type cmdReply struct{ out, err string }
 
+// switchHandoffEvent is posted back to a session's own goroutine by the
+// detached cross-session focus goroutine (see switchToSession): focus the
+// target first, hand the client off second, without ever blocking this
+// session's goroutine on another's.
+type switchHandoffEvent struct {
+	epoch int
+	name  string
+}
+
 func newSession(name string) *session {
-	return &session{name: name, events: make(chan interface{}, 64)}
+	return &session{name: name, events: make(chan interface{}, 64), gone: make(chan struct{})}
 }
 
 // attach hands a freshly connected client off to the session's owner
@@ -425,11 +435,22 @@ func (s *session) kill() {
 
 // command asks the session's owner goroutine to execute one command-mode
 // command (from `gtmux run`), returning its error message or "".
+// A dead session (run loop exited) returns an error instead of blocking
+// forever — callers on other goroutines (cross-session focus, choose-tree)
+// race session teardown.
 func (s *session) command(args []string) (out, errText string) {
 	ch := make(chan cmdReply, 1)
-	s.events <- commandEvent{args: args, replyCh: ch}
-	r := <-ch
-	return r.out, r.err
+	select {
+	case s.events <- commandEvent{args: args, replyCh: ch}:
+	case <-s.gone:
+		return "", "session gone"
+	}
+	select {
+	case r := <-ch:
+		return r.out, r.err
+	case <-s.gone:
+		return "", "session gone"
+	}
 }
 
 // rename tells the session's owner goroutine its new display name. s.name is
@@ -448,6 +469,7 @@ func (s *session) rename(name string) {
 // resume, when set, rebuilds the session from an in-place upgrade's dump
 // (adopted panes) instead of spawning a first window.
 func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string, resume *savedSession) {
+	defer close(s.gone)
 	// The client reserves its own status rows and reports the window (content)
 	// height directly, so the server sizes the grid to rows as-is — status-bar
 	// reservation is entirely client-side. (winRows stays a func for the many
@@ -1429,10 +1451,30 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string, re
 	}
 	detach := func() { detachEpoch(actingEpoch) }
 
+	// finishSwitch completes a client handoff to another session: record where
+	// it came from (for switch-client -l), tell the client to reconnect, detach
+	// here. Re-checks epoch and peer — a switchHandoffEvent arrives after a
+	// detached focus ran, and either side may have died meanwhile.
+	finishSwitch := func(epoch int, name string) {
+		if _, ok := attachments[epoch]; !ok {
+			return
+		}
+		if _, ok := reg.get(name); !ok {
+			return
+		}
+		reg.setLastSession(s.name)
+		sendTo(epoch, &proto.ServerMsg{SwitchSession: name})
+		detachEpoch(epoch)
+		fireHook("client-session-changed")
+	}
 	// switchToSession hands the acting client off to another live session (the
-	// choose-session picker and switch-client share this): record where it came
-	// from (for switch-client -l), tell the client to reconnect, then detach here.
-	switchToSession := func(name string, winIdx int) {
+	// choose-session picker and switch-client share this). With a window/pane
+	// to focus (choose-tree row, switch-client -t sess:pane), the focus runs on
+	// a detached goroutine — peer.command is serviced by the peer's OWN
+	// goroutine, so calling it inline deadlocks both sessions when two clients
+	// click into each other at once — and the handoff is posted back as an
+	// event afterwards, preserving focus-before-reattach ordering.
+	switchToSession := func(name string, winIdx int, paneSpec string) {
 		if name == "" || name == s.name {
 			return
 		}
@@ -1440,16 +1482,28 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string, re
 		if !ok {
 			return
 		}
-		// choose-tree window row: focus the chosen window in the target session
-		// before the client reattaches, so it lands on that window. Runs on the
-		// peer's goroutine (a different one than ours), so it can't self-deadlock.
-		if winIdx >= 0 {
-			peer.command([]string{"select-window", "-t", strconv.Itoa(winIdx)})
+		ep := actingEpoch
+		if _, ok := attachments[ep]; !ok {
+			// No acting client attached here (e.g. `gtmux run <sess>
+			// switch-client`): nothing to hand off — never yank a bystander.
+			return
 		}
-		reg.setLastSession(s.name)
-		sendTo(actingEpoch, &proto.ServerMsg{SwitchSession: name})
-		detach()
-		fireHook("client-session-changed")
+		if winIdx < 0 && paneSpec == "" {
+			finishSwitch(ep, name)
+			return
+		}
+		go func() {
+			if winIdx >= 0 {
+				peer.command([]string{"select-window", "-t", strconv.Itoa(winIdx)})
+			}
+			if paneSpec != "" {
+				peer.command([]string{"select-pane", "-t", paneSpec})
+			}
+			select {
+			case s.events <- switchHandoffEvent{epoch: ep, name: name}:
+			case <-s.gone:
+			}
+		}()
 	}
 
 	// adjacentSession returns the session `step` places from `cur` in the sorted
@@ -2403,7 +2457,8 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string, re
 	// runCommand executes one command (prefix+: line, or `gtmux run` from
 	// outside). Names and flags follow tmux; commands act on the active
 	// pane/window (no -t targets). Returns an error message, or "".
-	runCommand := func(fields []string) string {
+	var runCommand func(fields []string) string // declared first so it can recurse
+	runCommand = func(fields []string) string {
 		if len(fields) == 0 {
 			return ""
 		}
@@ -2819,7 +2874,7 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string, re
 						idx = n
 					}
 				}
-				switchToSession(fields[1], idx)
+				switchToSession(fields[1], idx, "")
 			}
 		case "bind-key", "bind":
 			// Runtime bind: record for list-keys, then push to this session's
@@ -2851,9 +2906,11 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string, re
 			// closures in each client's VM.
 			cmdOut = strings.Join(reg.listBinds(), "\n")
 		case "switch-client":
-			// switch-client [-t name | -n | -p | -l]: retarget the acting client to
-			// another session — -t by name, -n/-p cycle the sorted list, -l the last
-			// switched-from. Reuses the choose-session handoff.
+			// switch-client [-t name[:pane] | -n | -p | -l]: retarget the acting
+			// client to another session — -t by name, -n/-p cycle the sorted list,
+			// -l the last switched-from. Reuses the choose-session handoff. A
+			// "sess:pane" target (any select-pane spec, e.g. %7 or 1.0) also
+			// focuses that pane, so a sidebar click lands on the agent's pane.
 			target := ""
 			for i := 0; i < len(args); i++ {
 				switch args[i] {
@@ -2870,7 +2927,21 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string, re
 					target = reg.getLastSession()
 				}
 			}
-			switchToSession(target, -1)
+			// sess:pane form: split only when the WHOLE target isn't a live
+			// session name — session names aren't validated anywhere, so a
+			// colon-named session (and any -l/-n/-p result) must stay targetable.
+			paneSpec := ""
+			if _, ok := reg.get(target); !ok {
+				// LAST colon: a pane spec never contains one, a session name may
+				// (sess "a:b" + pane %7 arrives as "a:b:%7").
+				if i := strings.LastIndex(target, ":"); i >= 0 {
+					target, paneSpec = target[:i], target[i+1:]
+				}
+			}
+			if paneSpec != "" && (target == "" || target == s.name) {
+				return runCommand([]string{"select-pane", "-t", paneSpec}) // already here
+			}
+			switchToSession(target, -1, paneSpec)
 		case "kill-pane":
 			tw, tp, twi, _, _ := resolveTarget(args)
 			closePaneAt(tw, tp, twi)
@@ -3846,6 +3917,8 @@ loop:
 				s.name = e.name
 				e.replyCh <- struct{}{}
 				fireHook("session-renamed")
+			case switchHandoffEvent:
+				finishSwitch(e.epoch, e.name)
 			case commandEvent:
 				cmdOut = ""
 				errText := runCommand(e.args)

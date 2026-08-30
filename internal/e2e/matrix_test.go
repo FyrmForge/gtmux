@@ -1907,3 +1907,29 @@ func TestNewSession(t *testing.T) {
 		t.Fatalf("new-session -s spawned not in list-sessions: %q", out)
 	}
 }
+
+// TestSwitchClientPaneTarget covers switch-client -t sess:pane: the client
+// lands on the named session AND that pane is active there (a sidebar click
+// on an agent row jumps straight to the agent's pane, not just its session).
+func TestSwitchClientPaneTarget(t *testing.T) {
+	c := harness.StartWithConfig(t, `gtmux.bind("J", function() gtmux.switch_client("-t", "work:1.1") end)`, "")
+	c.WaitForStatus("default")
+	peer := c.AttachSession("work")
+	promptReady(peer)
+	peer.Prefix("%") // two panes in work; the NEW one (index 2) is active
+	peer.WaitFor(func(s *harness.Screen) bool { return s.Col(3, '│') >= 0 })
+
+	c.Prefix("J") // switch to work AND focus window 1 pane 1 (both 1-based)
+	c.WaitForStatus("work")
+	// The focus runs detached on the peer's goroutine (deadlock avoidance), so
+	// it can land just after the client does: poll briefly.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if got := strings.TrimSpace(c.Run("run", "work", "display-message", "-p", "#{pane_index}")); got == "1" {
+			break
+		} else if time.Now().After(deadline) {
+			t.Fatalf("active pane_index in work = %q, want 1 (switch-client -t sess:pane did not focus the pane)", got)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
