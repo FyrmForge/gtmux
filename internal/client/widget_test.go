@@ -437,3 +437,43 @@ func TestFramedOuterBorder(t *testing.T) {
 		t.Errorf("bottom frame = %q, want └────┘", got)
 	}
 }
+
+// Framed pane borders shift the whole content area down one row, and docks
+// span the frame rows too (dock row 0 = the frame's top row). The click
+// hit-test used to hand the dock winRow without that shift, so every framed
+// click landed one row ABOVE the line on screen — the sidebar switched to
+// the session above the one clicked.
+func TestDockClickRowUnderFramedBorders(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "client.lua")
+	src := `
+gtmux.widget{ dock = "left", size = 10, component = function(props, ui)
+  ui:child(0, 2, 10, 1, function(p, c)
+    c:on_click(function() gtmux.switch_session("target") end)
+  end)
+end }
+`
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, binds := config.LoadClient(path)
+	defer binds.Close()
+	c := newCompositor()
+	c.cfg = cfg
+	c.cfg.PaneBorders = "framed"
+	c.setPhysical(30, 6) // 6 rows: frame + 3 content + frame + status
+	b := &textBox{dock: "left", size: 10, component: lastWidget(cfg).Component,
+		binds: binds, fg: emu.White, bg: emu.Black}
+	c.addDock(b)
+	c.apply(&proto.ServerMsg{
+		Layout: &proto.Layout{Cols: 18, Rows: 3,
+			Panes: []proto.PaneRect{{ID: 1, Row: 0, Col: 0, Rows: 3, Cols: 18, Active: true}}},
+		Status: &proto.StatusInfo{},
+	})
+	// Dock row 2 is physical row 2 (frame row is dock row 0) -> me.Y=3.
+	if _, fn, _, _, _ := c.clickWidget(proto.MouseEvent{X: 1, Y: 3, Press: true}); fn == nil {
+		t.Fatal("click on the drawn row resolved no handler (row off by the frame inset)")
+	}
+	if _, fn, _, _, _ := c.clickWidget(proto.MouseEvent{X: 1, Y: 4, Press: true}); fn != nil {
+		t.Error("click one row below should resolve no handler")
+	}
+}

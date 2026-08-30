@@ -484,7 +484,10 @@ func (c *compositor) topBottomDockRow(row int) (*textBox, int) {
 			start += d.size
 		}
 	}
-	start = c.totalRows() - c.bottomReserve()
+	// bottomReserve includes the framed border row, which sits ABOVE the bottom
+	// docks (buildRow tests row == totalRows-bottomReserve for it): docks start
+	// one row further down, or they'd swallow the frame line in framed mode.
+	start = c.totalRows() - c.bottomReserve() + c.frameInset()
 	for _, d := range c.docks {
 		if d.dock == "bottom" {
 			if row >= start && row < start+d.size {
@@ -552,12 +555,17 @@ func (c *compositor) clickWidget(me proto.MouseEvent) (*textBox, *lua.LFunction,
 	}
 	winRow := row - c.contentOffset()
 	contentH := c.totalRows() - c.contentOffset() - c.bottomReserve()
-	if winRow >= 0 && winRow < contentH {
+	// Left/right docks are painted at winRow+frameInset (composeContentRow) and
+	// span the frame rows too, so the hit-test must use the same row or every
+	// framed click lands one row above what's on screen.
+	frame := c.frameInset()
+	dockRow := winRow + frame
+	if dockRow >= 0 && dockRow < contentH+2*frame {
 		x := 0 // left docks fill [0, leftInset) in c.docks order
 		for _, d := range c.docks {
 			if d.dock == "left" {
 				if col >= x && col < x+d.size {
-					return hit(d, winRow, col-x)
+					return hit(d, dockRow, col-x)
 				}
 				x += d.size
 			}
@@ -566,7 +574,7 @@ func (c *compositor) clickWidget(me proto.MouseEvent) (*textBox, *lua.LFunction,
 		for _, d := range c.docks {
 			if d.dock == "right" {
 				if col >= rx && col < rx+d.size {
-					return hit(d, winRow, col-rx)
+					return hit(d, dockRow, col-rx)
 				}
 				rx += d.size
 			}
