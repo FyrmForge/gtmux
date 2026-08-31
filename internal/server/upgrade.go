@@ -35,6 +35,7 @@ type savedPane struct {
 	Marked               bool
 	Content              string // rendered history + screen, CRLF-separated, SGR kept
 	CurR, CurC           int
+	Modes                string // escape sequences re-requesting the app's emu modes (mouse, 2004, DECCKM, kitty) — see modeSeqs
 }
 
 type savedNode struct {
@@ -93,6 +94,43 @@ type dumpEvent struct{ reply chan savedSession }
 // failed), so the session keeps serving instead of being deaf forever.
 type unfreezeEvent struct{}
 
+// modeSeqs renders the mode state a pane's app had requested as the escape
+// sequences that request it, replayed into the resumed image's fresh emu.
+// Sequences rather than raw ModeFlag bits: the gob crosses binary versions
+// (old image writes, new image reads), and bit layouts can shift between
+// them while the wire sequences never do. Without this, an upgrade silently
+// dropped mouse tracking, bracketed paste, app-cursor keys, and kitty
+// keyboard flags in every running full-screen app until it was restarted.
+// ponytail: alt-screen and the kitty push-stack aren't carried — replaying
+// 1049h would blank the replayed content, and the size bounce makes the app
+// repaint (and re-assert cursor state) anyway; only the current kitty flags
+// survive, not flags pushed beneath them.
+func modeSeqs(t emu.Terminal) string {
+	var b strings.Builder
+	mode := t.Mode()
+	for _, m := range []struct {
+		bit emu.ModeFlag
+		num int
+	}{
+		{emu.ModeAppCursor, 1},
+		{emu.ModeMouseX10, 9},
+		{emu.ModeMouseButton, 1000},
+		{emu.ModeMouseMotion, 1002},
+		{emu.ModeMouseMany, 1003},
+		{emu.ModeFocus, 1004},
+		{emu.ModeMouseSgr, 1006},
+		{emu.ModeBracketedPaste, 2004},
+	} {
+		if mode&m.bit != 0 {
+			fmt.Fprintf(&b, "\x1b[?%dh", m.num)
+		}
+	}
+	if f := t.KeyState(); f != 0 {
+		fmt.Fprintf(&b, "\x1b[=%d;1u", int(f))
+	}
+	return b.String()
+}
+
 // dumpPane renders a pane's scrollback + screen with attributes kept, so the
 // replay into a fresh emu restores both text and colors.
 func dumpPane(p *pane) savedPane {
@@ -113,6 +151,7 @@ func dumpPane(p *pane) savedPane {
 		ID: p.id, PID: p.cmd.Process.Pid, FD: rawFD(p.pty),
 		Row: p.rect.Row, Col: p.rect.Col, Rows: p.rect.Rows, Cols: p.rect.Cols,
 		Marked: p.marked, Content: b.String(), CurR: cur.R, CurC: cur.C,
+		Modes: modeSeqs(p.term),
 	}
 }
 
@@ -288,6 +327,7 @@ func adoptPane(w *window, sp savedPane) (*pane, error) {
 	}
 	p.term.Write([]byte(sp.Content))
 	p.term.Write([]byte(fmt.Sprintf("\x1b[0m\x1b[%d;%dH", sp.CurR+1, sp.CurC+1)))
+	p.term.Write([]byte(sp.Modes))
 	return p, nil
 }
 
