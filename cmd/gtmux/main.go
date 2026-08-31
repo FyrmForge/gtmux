@@ -82,7 +82,7 @@ func main() {
 		} else {
 			err = client.RunGroup(name, true, group, false)
 		}
-	case "attach":
+	case "a","attach":
 		// attach [-r] [<session>]: -r is read-only; first non-flag is the name.
 		readOnly, name := false, ""
 		for i := 2; i < len(os.Args); i++ {
