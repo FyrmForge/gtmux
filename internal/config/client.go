@@ -76,10 +76,10 @@ type ClientConfig struct {
 	// active pane zoomed (RespMode "maximize" — the only mode yet), so a small
 	// client (phone attach) sees one pane at a time; cycle with next_pane/
 	// prev_pane. 0 = off. Zoom is session state: other attached clients see it.
-	RespBelow int
-	RespMode  string
-	StatusKeys         string // command-prompt editing: "emacs" (default; C-u/C-w kill keys) or "vi" (plain — no modal editing, ESC cancels)
-	SetClipboard       string // tmux set-clipboard: "external"/"on" (default; copy-mode yank emits OSC 52 to the outer clipboard) or "off"
+	RespBelow    int
+	RespMode     string
+	StatusKeys   string // command-prompt editing: "emacs" (default; C-u/C-w kill keys) or "vi" (plain — no modal editing, ESC cancels)
+	SetClipboard string // tmux set-clipboard: "external"/"on" (default; copy-mode yank emits OSC 52 to the outer clipboard) or "off"
 	// Copy-mode mouse behavior. In tmux these are copy-mode-vi keybinds
 	// (WheelUp/Down `send -N<n> -X scroll`, MouseDragEnd `copy-selection-and-cancel`);
 	// gtmux has no copy-mode keytable, so they're options.
@@ -565,14 +565,14 @@ func ClientConfigPath() string {
 // from its own state (prompts/pickers whose data it already mirrors — so no
 // server round-trip, no type-before-prompt-opens race). Exactly one is set.
 type BindOp struct {
-	Action  []string    // send as proto.Action
-	Local   string      // "command-prompt" | "rename-window" | "rename-session" | "choose-window"
-	Table   string      // switch the client into this key table for the next key (tmux switch-client -T)
-	Modal   *ModalOpen  // open a modal keyboard widget (gtmux.open{...})
-	Command string      // a raw command line the client tokenizes + dispatches (gtmux.run_command)
-	Border  *PaneBorder // set a pane's border override color (pane:set_border)
-	Dock    string      // toggle focus on the named dock (gtmux.focus_dock)
-	ToggleDock string   // toggle visibility of the named dock (gtmux.toggle_dock)
+	Action     []string    // send as proto.Action
+	Local      string      // "command-prompt" | "rename-window" | "rename-session" | "choose-window"
+	Table      string      // switch the client into this key table for the next key (tmux switch-client -T)
+	Modal      *ModalOpen  // open a modal keyboard widget (gtmux.open{...})
+	Command    string      // a raw command line the client tokenizes + dispatches (gtmux.run_command)
+	Border     *PaneBorder // set a pane's border override color (pane:set_border)
+	Dock       string      // toggle focus on the named dock (gtmux.focus_dock)
+	ToggleDock string      // toggle visibility of the named dock (gtmux.toggle_dock)
 }
 
 // PaneBorder is a per-pane border color override (pane:set_border("red")): the
@@ -631,8 +631,11 @@ type ClientBinds struct {
 // AgentDef declares one coding agent (gtmux.agents{}): Match is a substring of
 // the pane's foreground command; Busy (optional) is a substring of the pane
 // title that means the agent is working (e.g. Claude Code's "✳" spinner).
+// BusyScreen (optional) is the same test against the pane's bottom rows, for
+// agents that show their working state on screen and never in the title
+// (opencode's "esc interrupt" hint). Either match means busy.
 type AgentDef struct {
-	Match, Busy string
+	Match, Busy, BusyScreen string
 }
 
 // RunAgentState fires "agent-state" with a pane object carrying the agent's
@@ -1957,7 +1960,8 @@ func LoadClientWith(path string, overrides [][2]string) (ClientConfig, *ClientBi
 	}))
 	// agents{ {match="claude", busy="✳"}, ... } declares which foreground
 	// commands are coding agents. The client derives a per-pane state from them
-	// (busy: title contains the busy marker; done: bell rang; idle otherwise),
+	// (busy: title contains the busy marker, or the pane's bottom rows contain
+	// busy_screen; done: bell rang; idle otherwise),
 	// fires gtmux.on("agent-state") on changes and exposes the active pane's
 	// state as #{pane_agent_state}.
 	L.SetField(tbl, "agents", L.NewFunction(func(l *lua.LState) int {
@@ -1968,8 +1972,9 @@ func LoadClientWith(path string, overrides [][2]string) (ClientConfig, *ClientBi
 				return
 			}
 			d := AgentDef{
-				Match: lua.LVAsString(t.RawGetString("match")),
-				Busy:  lua.LVAsString(t.RawGetString("busy")),
+				Match:      lua.LVAsString(t.RawGetString("match")),
+				Busy:       lua.LVAsString(t.RawGetString("busy")),
+				BusyScreen: lua.LVAsString(t.RawGetString("busy_screen")),
 			}
 			if d.Match != "" {
 				binds.Agents = append(binds.Agents, d)

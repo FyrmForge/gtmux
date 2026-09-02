@@ -48,3 +48,8 @@ func procCwd(pid int) string {
 	}
 	return ""
 }
+
+// procCommand is comm on macOS. The Linux build unwraps interpreters (`node
+// /usr/bin/codex` -> "codex") from /proc/<pid>/cmdline; the sysctl equivalent
+// (KERN_PROCARGS2) is a separate job, and nobody has asked for it yet.
+func procCommand(pid int) string { return procComm(pid) }

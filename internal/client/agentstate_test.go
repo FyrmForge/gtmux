@@ -47,3 +47,36 @@ func TestDetectAgentStates(t *testing.T) {
 		t.Fatal("state survived the agent exiting")
 	}
 }
+
+// opencode never marks the title while working and never rings the bell — its
+// only live signal is an "esc interrupt" hint on the pane's bottom rows, which
+// the server ships as PaneInfo.ScreenTail. Without busy_screen the pane sat at
+// idle forever, so the dock showed a permanent "awaiting you" flag.
+func TestDetectAgentStatesBusyFromScreenTail(t *testing.T) {
+	c := newCompositor()
+	c.agentDefs = []config.AgentDef{{Match: "opencode", BusyScreen: "esc interrupt"}}
+	tail := func(s string) *proto.StateSnapshot {
+		sn := snap("opencode", "OC | count to ten", false, false)
+		sn.Sessions[0].Windows[0].Panes[0].ScreenTail = s
+		return sn
+	}
+
+	c.detectAgentStates(tail("  /tmp   9.1K (1%)\n")) // seed: not working
+	c.drainAgentChanges()
+	if c.agentState[7] != "idle" {
+		t.Fatalf("state with no marker = %q, want idle", c.agentState[7])
+	}
+
+	c.detectAgentStates(tail(" ⬝⬝■■■■  esc interrupt      tab agents\n"))
+	ch := c.drainAgentChanges()
+	if len(ch) != 1 || ch[0].state != "busy" || ch[0].pane != 7 {
+		t.Fatalf("screen marker changes = %+v, want one busy for pane 7", ch)
+	}
+
+	// Marker gone and no bell: opencode goes back to idle, not done.
+	c.detectAgentStates(tail("  /tmp   9.1K (1%)\n"))
+	ch = c.drainAgentChanges()
+	if len(ch) != 1 || ch[0].state != "idle" {
+		t.Fatalf("marker cleared changes = %+v, want one idle", ch)
+	}
+}

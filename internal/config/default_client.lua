@@ -405,10 +405,13 @@ gtmux.bind_root("C-\\", function() gtmux.select_pane_vim("last") end)
 -- you; focusing the pane clears it), "idle" otherwise. The state shows up
 -- three ways: gtmux.on("agent-state") below, the #{pane_agent_state} status
 -- format var, and pane:set_border from the hook.
+-- busy is a pane-title substring, busy_screen a substring of the pane's bottom
+-- rows — for agents that show they are working on screen and never in the
+-- title. Neither set means the pane only ever reads idle/done.
 gtmux.agents{
 	{ match = "claude", busy = "✳" }, -- Claude Code spins ✳ in the title while working
-	{ match = "codex" },
-	{ match = "opencode" },
+	{ match = "codex" },              -- no busy marker known yet; title is the cwd
+	{ match = "opencode", busy_screen = "esc interrupt" }, -- bottom hint line while working
 	{ match = "aider" },
 	{ match = "gemini" },
 	{ match = "amp" },

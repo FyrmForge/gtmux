@@ -1056,8 +1056,13 @@ func (c *compositor) detectAgentStates(snap *proto.StateSnapshot) {
 				if state == "" {
 					state = "idle"
 				}
+				// Busy shows up two ways: a title marker (Claude Code's spinner)
+				// or text on the pane's bottom rows (opencode's "esc interrupt"
+				// hint, which never reaches the title).
+				busy := def.Busy != "" && strings.Contains(p.Title, def.Busy)
+				busy = busy || (def.BusyScreen != "" && strings.Contains(p.ScreenTail, def.BusyScreen))
 				switch {
-				case def.Busy != "" && strings.Contains(p.Title, def.Busy):
+				case busy:
 					state = "busy"
 				case bellEdge:
 					state = "done"

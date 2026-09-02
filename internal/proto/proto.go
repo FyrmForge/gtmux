@@ -212,6 +212,12 @@ type PaneInfo struct {
 	Active        bool
 	Marked        bool
 	Width, Height int
+	// ScreenTail is the plain text of the pane's last few non-blank rows.
+	// Agent busy-detection needs it for agents that put no marker in the
+	// title: opencode shows "esc interrupt" on its bottom line and never
+	// touches the title while working. Clients get PaneContent only for the
+	// window they display, so the snapshot carries this for every pane.
+	ScreenTail string
 }
 
 // SnapClient is one attached client exposed to gtmux.clients().

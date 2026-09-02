@@ -274,7 +274,35 @@ func (p *pane) currentCommand() string {
 	if err != nil {
 		return ""
 	}
-	return procComm(pgid)
+	return procCommand(pgid)
+}
+
+// screenTailRows is how many of a pane's bottom rows feed
+// proto.PaneInfo.ScreenTail — enough for a TUI's status/hint line.
+const screenTailRows = 3
+
+// screenTail renders the pane's last few non-blank rows as plain text, for
+// agent busy-detection with no title marker to match on. Trailing blank rows
+// are dropped first: opencode's "esc interrupt" line sits one blank row above
+// the bottom, and where a TUI parks its blanks is not something to tune a
+// constant against.
+func (p *pane) screenTail() string {
+	if p.term == nil {
+		return ""
+	}
+	rows := p.term.Screen()
+	for len(rows) > 0 && strings.TrimSpace(rows[len(rows)-1].String()) == "" {
+		rows = rows[:len(rows)-1]
+	}
+	if len(rows) > screenTailRows {
+		rows = rows[len(rows)-screenTailRows:]
+	}
+	var b strings.Builder
+	for _, l := range rows {
+		b.WriteString(strings.TrimRight(l.String(), " "))
+		b.WriteByte('\n')
+	}
+	return b.String()
 }
 
 func (p *pane) resize(r rect) {

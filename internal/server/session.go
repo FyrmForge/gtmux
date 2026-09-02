@@ -903,7 +903,8 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string, re
 				sw.Panes = append(sw.Panes, proto.PaneInfo{
 					Number: j + paneBaseIndex, ID: p.id,
 					Command: p.currentCommand(), Path: p.cwd(), Title: p.term.Title(),
-					PID: pid, Active: p == w.active, Marked: p.marked,
+					ScreenTail: p.screenTail(),
+					PID:        pid, Active: p == w.active, Marked: p.marked,
 					Width: p.rect.Cols, Height: p.rect.Rows,
 				})
 			}
