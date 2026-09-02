@@ -414,7 +414,10 @@ gtmux.agents{
 	-- works (2.1.228+; braille ⠋⠙⠹… before that). The static ✳ it shows the
 	-- rest of the time is NOT a busy marker — matching it inverts the state.
 	{ match = "claude", busy = { "◐", "◑", "◒", "◓" } },
-	{ match = "codex" },              -- no busy marker known yet; title is the cwd
+	-- codex animates a braille spinner in the title. These four are the UTF-8
+	-- lead-byte pairs of the whole braille block (U+2800-U+28FF), so the
+	-- substring test matches any frame without listing every glyph.
+	{ match = "codex", busy = { "\226\160", "\226\161", "\226\162", "\226\163" } },
 	{ match = "opencode", busy_screen = "esc interrupt" }, -- bottom hint line while working
 	{ match = "aider" },
 	{ match = "gemini" },
