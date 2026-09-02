@@ -20,7 +20,7 @@ func snap(cmd, title string, bell, focused bool) *proto.StateSnapshot {
 
 func TestDetectAgentStates(t *testing.T) {
 	c := newCompositor()
-	c.agentDefs = []config.AgentDef{{Match: "claude", Busy: "✳"}}
+	c.agentDefs = []config.AgentDef{{Match: "claude", Busy: []string{"✳"}}}
 
 	c.detectAgentStates(snap("claude", "✳ thinking", false, false)) // seed tick
 	if got := c.drainAgentChanges(); len(got) != 0 {
@@ -78,5 +78,26 @@ func TestDetectAgentStatesBusyFromScreenTail(t *testing.T) {
 	ch = c.drainAgentChanges()
 	if len(ch) != 1 || ch[0].state != "idle" {
 		t.Fatalf("marker cleared changes = %+v, want one idle", ch)
+	}
+}
+
+// An animated spinner cycles frames, so busy is a list: any frame in the title
+// means working. Matching one frame only (the old Busy string) read the other
+// frames as idle — with Claude Code's static ✳ matched instead, inverted.
+func TestDetectAgentStatesBusyFrames(t *testing.T) {
+	c := newCompositor()
+	c.agentDefs = []config.AgentDef{{Match: "claude", Busy: []string{"◐", "◑", "◒", "◓"}}}
+
+	c.detectAgentStates(snap("claude", "✳ idle summary", false, false)) // seed
+	if c.agentState[7] != "idle" {
+		t.Fatalf("state with no frame = %q, want idle", c.agentState[7])
+	}
+	for _, title := range []string{"◐ working", "◑ working", "◒ working", "◓ working"} {
+		c.agentState[7] = "idle"
+		c.detectAgentStates(snap("claude", title, false, false))
+		if c.agentState[7] != "busy" {
+			t.Fatalf("state for title %q = %q, want busy", title, c.agentState[7])
+		}
+		c.drainAgentChanges()
 	}
 }

@@ -629,13 +629,16 @@ type ClientBinds struct {
 }
 
 // AgentDef declares one coding agent (gtmux.agents{}): Match is a substring of
-// the pane's foreground command; Busy (optional) is a substring of the pane
-// title that means the agent is working (e.g. Claude Code's "✳" spinner).
-// BusyScreen (optional) is the same test against the pane's bottom rows, for
-// agents that show their working state on screen and never in the title
-// (opencode's "esc interrupt" hint). Either match means busy.
+// the pane's foreground command; Busy (optional) holds the pane-title
+// substrings that mean the agent is working — a list because an animated
+// spinner cycles frames (Claude Code's ◐◓◑◒), and matching only one frame
+// reads the other four as idle. BusyScreen (optional) is the same test against
+// the pane's bottom rows, for agents that show their working state on screen
+// and never in the title (opencode's "esc interrupt" hint). Any match is busy.
 type AgentDef struct {
-	Match, Busy, BusyScreen string
+	Match      string
+	Busy       []string
+	BusyScreen string
 }
 
 // RunAgentState fires "agent-state" with a pane object carrying the agent's
@@ -1960,7 +1963,7 @@ func LoadClientWith(path string, overrides [][2]string) (ClientConfig, *ClientBi
 	}))
 	// agents{ {match="claude", busy="✳"}, ... } declares which foreground
 	// commands are coding agents. The client derives a per-pane state from them
-	// (busy: title contains the busy marker, or the pane's bottom rows contain
+	// (busy: title contains any busy marker, or the pane's bottom rows contain
 	// busy_screen; done: bell rang; idle otherwise),
 	// fires gtmux.on("agent-state") on changes and exposes the active pane's
 	// state as #{pane_agent_state}.
@@ -1973,8 +1976,20 @@ func LoadClientWith(path string, overrides [][2]string) (ClientConfig, *ClientBi
 			}
 			d := AgentDef{
 				Match:      lua.LVAsString(t.RawGetString("match")),
-				Busy:       lua.LVAsString(t.RawGetString("busy")),
 				BusyScreen: lua.LVAsString(t.RawGetString("busy_screen")),
+			}
+			// busy is one substring or a list of them (spinner frames).
+			switch b := t.RawGetString("busy").(type) {
+			case *lua.LTable:
+				b.ForEach(func(_, v lua.LValue) {
+					if m := lua.LVAsString(v); m != "" {
+						d.Busy = append(d.Busy, m)
+					}
+				})
+			default:
+				if m := lua.LVAsString(b); m != "" {
+					d.Busy = []string{m}
+				}
 			}
 			if d.Match != "" {
 				binds.Agents = append(binds.Agents, d)
