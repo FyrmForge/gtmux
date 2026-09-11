@@ -11,10 +11,13 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"runtime/pprof"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/FyrmForge/gtmux/internal/config"
@@ -560,6 +563,18 @@ func Run(resumePath string) error {
 		log.Printf("gtmux server listening on %s", sockPath)
 	}
 	defer ln.Close()
+
+	// SIGUSR1 → dump every goroutine's stack to the log. The only way to see
+	// what a sluggish session/window actor is blocked on in a live daemon
+	// (ptrace is usually locked down; SIGQUIT would kill it).
+	go func() {
+		ch := make(chan os.Signal, 1)
+		signal.Notify(ch, syscall.SIGUSR1)
+		for range ch {
+			log.Printf("SIGUSR1: goroutine dump")
+			pprof.Lookup("goroutine").WriteTo(log.Writer(), 2)
+		}
+	}()
 
 	// Read the server options once at startup.
 	cfg := config.LoadServer(config.ServerConfigPath())

@@ -2,10 +2,19 @@ package client
 
 import "fmt"
 
-// kittyNegotiate returns the bytes to send the outer terminal to move our pushed
-// kitty-keyboard flags from old to want, and the new pushed state. We keep at
-// most one entry on the terminal's stack: pop ours if we had one, push the new
-// flags if wanted. want==0 (or !enabled) means "no kitty" → just pop.
+// kittyNegotiate returns the bytes to send the outer terminal to set our pushed
+// kitty-keyboard flags to want, and the new pushed state. We keep at most one
+// entry on the terminal's stack: always pop, then push the new flags if wanted.
+// want==0 (or !enabled) means "no kitty" → just pop.
+//
+// Deliberately NOT a diff against old: the terminal's real stack can drift from
+// what we remember (a client killed without its detach pop, a terminal that
+// reset its own stack), and a diff would then skip the very re-push that fixes
+// it — leaving a kitty pane receiving legacy keys (Esc/Ctrl/Enter dead, letters
+// fine). Popping an empty stack is a no-op per the kitty spec, so re-asserting
+// on every layout is safe and idempotent; the cost is a few bytes per focus
+// change. ponytail: a stack entry pushed by something outside gtmux (client
+// nested in another multiplexer) would get popped too — not a supported setup.
 //
 // This is what makes extended-keys work: while a pane's app speaks the kitty
 // protocol, the outer terminal is told to speak it too, so its CSI-u keystrokes
@@ -15,13 +24,7 @@ func kittyNegotiate(old, want int, enabled bool) (out []byte, state int) {
 	if !enabled {
 		want = 0
 	}
-	if want == old {
-		return nil, old
-	}
-	var b []byte
-	if old > 0 {
-		b = append(b, "\x1b[<1u"...) // pop our entry
-	}
+	b := []byte("\x1b[<1u") // pop our entry (no-op if the stack is empty)
 	if want > 0 {
 		b = append(b, []byte(fmt.Sprintf("\x1b[>%du", want))...) // push new flags
 	}
@@ -50,12 +53,10 @@ func (c *compositor) negotiateKitty() []byte {
 	return append(out, c.negotiateMOK(c.cfg.ExtendedKeys && state == 0)...)
 }
 
-// negotiateMOK toggles the outer terminal's xterm modifyOtherKeys=1 mode to
-// `want`, emitting the set/reset sequence only on a change.
+// negotiateMOK sets the outer terminal's xterm modifyOtherKeys=1 mode to `want`.
+// Always emitted (the sequence is idempotent), for the same drift reason as
+// kittyNegotiate.
 func (c *compositor) negotiateMOK(want bool) []byte {
-	if want == c.mokActive {
-		return nil
-	}
 	c.mokActive = want
 	if want {
 		return []byte("\x1b[>4;1m")

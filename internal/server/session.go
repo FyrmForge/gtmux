@@ -2383,6 +2383,10 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string, re
 			"pane_width":  strconv.Itoa(p.rect.Cols), "pane_height": strconv.Itoa(p.rect.Rows),
 			"pane_left": strconv.Itoa(p.rect.Col), "pane_top": strconv.Itoa(p.rect.Row),
 			"pane_right": strconv.Itoa(p.rect.Col + p.rect.Cols - 1), "pane_bottom": strconv.Itoa(p.rect.Row + p.rect.Rows - 1),
+			// Server-side view of the pane app's input modes (what the client
+			// mirrors to the outer terminal): kitty keyboard flags (0 = legacy) and
+			// mouse tracking. Debug aid for "keys/mouse don't reach the app".
+			"pane_key_flags": strconv.Itoa(p.keyFlags()), "pane_mouse_flag": bitStr(p.wantsMouse()),
 		})
 	}
 	// bufferVars builds the #{...} map for one paste buffer (list-buffers). The
