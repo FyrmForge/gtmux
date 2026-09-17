@@ -294,6 +294,17 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 				}
 				return m
 			},
+			DockVisible: func(name string) bool {
+				if comp == nil {
+					return false
+				}
+				for _, d := range comp.docks { // visible set only; allDocks includes hidden
+					if d.name == name {
+						return true
+					}
+				}
+				return false
+			},
 			Expand: func(s string) string {
 				if comp != nil && comp.expander != nil && comp.status != nil {
 					return comp.expander.expand(s, comp.status.Vars, comp.status.ServerShell)
@@ -609,6 +620,24 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 						os.Stdout.Write(comp.redraw())
 					}
 					compMu.Unlock()
+				} else if op.Preview != nil {
+					// Record the target first, then ask: the reply only paints if
+					// it still matches (a stale capture for a row the cursor has
+					// left is dropped). "" just clears, no round-trip.
+					ask := false
+					compMu.Lock()
+					// Preview is dock-scoped: a request from a chunk whose last key
+					// already handed focus back (Enter/Escape) must not re-paint over
+					// the panes you just returned to. Clearing is always allowed.
+					if comp != nil && (*op.Preview == "" || comp.focusedDock != nil) {
+						comp.wantPreview(*op.Preview)
+						os.Stdout.Write(comp.redraw())
+						ask = *op.Preview != ""
+					}
+					compMu.Unlock()
+					if ask {
+						send(&proto.ClientMsg{Preview: &proto.PreviewRequest{Target: *op.Preview}})
+					}
 				} else if op.ToggleDock != "" {
 					// Visibility toggle changes the window's usable size, so the
 					// server must re-layout: re-report from the visible set. Send

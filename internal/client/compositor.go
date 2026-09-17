@@ -111,6 +111,14 @@ type compositor struct {
 	// focusedDock is the dock currently owning the keyboard (focus="nav"/"bind"/
 	// "both" widgets): keys route to its on_key until it calls ui:close().
 	focusedDock *textBox
+
+	// preview paints another pane's screen in place of the window content while
+	// a focused dock browses sessions (gtmux.preview) — you see where you'd land
+	// without switching. previewTarget is what we last ASKED for; a reply whose
+	// target no longer matches is dropped, so a capture that arrives after the
+	// cursor moved on (or after the dock lost focus) can't paint stale content.
+	previewTarget string
+	preview       []emu.Line
 	// prose toggles prose highlighting in agent panes (gtmux.prose_highlight):
 	// buildRow recolors default-styled text by word category — a dyslexia aid.
 	prose bool
@@ -138,9 +146,9 @@ type compositor struct {
 	// prevCommand tracks each pane's last-seen foreground command (from the
 	// snapshot) so apply() can fire gtmux.on("program-changed") on a change.
 	// progSeeded gates the first snapshot (prime without firing), like alerts.
-	prevCommand     map[int]string
-	progSeeded      bool
-	pendingProgram  []programChange
+	prevCommand    map[int]string
+	progSeeded     bool
+	pendingProgram []programChange
 	// Agent awareness (gtmux.agents{}): agentDefs comes from the binds VM at
 	// rebuildWidgets; agentState is the derived per-pane state ("busy"/"done"/
 	// "idle", absent = not an agent pane); agentBell tracks per-window bell flags
@@ -675,9 +683,36 @@ func (c *compositor) setDockFocus(b *textBox, on bool) {
 		c.focusedDock = b
 	} else if c.focusedDock == b {
 		c.focusedDock = nil
+		// Losing focus ends the browse: a preview left up would read as a hung
+		// session with no way back to your own panes.
+		c.wantPreview("")
 	}
 	b.state = b.binds.MarkFocused(b.state, on)
 	b.rerender()
+}
+
+// wantPreview records the target the client is requesting a snapshot for. The
+// paint only appears when the reply lands; an empty target clears both the
+// request and anything already painted.
+func (c *compositor) wantPreview(target string) {
+	c.previewTarget = target
+	if target == "" {
+		c.preview = nil
+	}
+}
+
+// setPreview installs a snapshot the server sent back, ignoring one for a
+// target we've since moved off. Empty Lines (the target is gone) clears.
+func (c *compositor) setPreview(target string, lines []emu.Line) bool {
+	if target != c.previewTarget {
+		return false
+	}
+	if len(lines) == 0 {
+		c.preview = nil
+	} else {
+		c.preview = lines
+	}
+	return true
 }
 
 // focusDockNav steps keyboard focus into a nav-focusable dock when pane
@@ -887,6 +922,11 @@ func (c *compositor) activeCursor() (row, col int, visible bool) {
 			r, col := sr+c.popup.cursor.R, sc+c.popup.cursor.C+coff
 			return r + off, col, c.popup.cursorVisible && inContent(r) && col >= 0 && col < c.cols()
 		}
+	}
+	// A preview is someone else's screen: a live cursor blinking over it points
+	// at nothing. Checked after the popup, which owns the cursor when it's up.
+	if c.preview != nil {
+		return 0, 0, false
 	}
 	if c.copy != nil {
 		if pr, ok := c.rectFor(c.copy.paneID); ok {
@@ -1338,6 +1378,10 @@ func (c *compositor) apply(msg *proto.ServerMsg) []byte {
 		}
 	}
 
+	if msg.Preview != nil && c.setPreview(msg.Preview.Target, msg.Preview.Lines) {
+		c.markAll(dirty)
+	}
+
 	if msg.OpenPicker != nil {
 		c.picker = newPicker(msg.OpenPicker)
 		c.markAll(dirty)
@@ -1548,6 +1592,21 @@ func (c *compositor) buildRow(row int) emu.Line {
 		return c.composeContentRow(line, row)
 	}
 
+	// A dock preview replaces the whole window content: the target pane's own
+	// grid, clipped and padded to our content area (never scaled or reflowed).
+	// It replaces only the CONTENT — overlays, popups, modals and the lock
+	// screen still paint over it below, or a lock would leave another session's
+	// pane on screen with no banner.
+	if c.preview != nil {
+		if inWindowRow && row < len(c.preview) {
+			src := c.preview[row]
+			for col := 0; col < len(src) && col < c.layout.Cols && col < len(line); col++ {
+				line[col] = clipWide(src[col], roomIn(len(src)-col, c.layout.Cols-col))
+			}
+		}
+		return c.composeOverlays(line, row)
+	}
+
 	// Border color is decided per cell, not per divider: a cell lights active
 	// (or marked) only where it lies on that pane's outline ring, so a long
 	// divider shared by several stacked panes highlights just the active pane's
@@ -1658,6 +1717,14 @@ func (c *compositor) buildRow(row int) emu.Line {
 		}
 	}
 
+	return c.composeOverlays(line, row)
+}
+
+// composeOverlays paints every layer that sits ON TOP of the window content —
+// widget overlays, the picker, popups, modals, the clock/lock screen — and then
+// wraps the row for the docks. Split out of buildRow so the dock-preview path
+// (which replaces the content wholesale) still gets all of them.
+func (c *compositor) composeOverlays(line emu.Line, row int) emu.Line {
 	for _, w := range c.overlays {
 		w.paintRow(row, c.contentCols(), line)
 	}
@@ -2223,9 +2290,9 @@ func (c *compositor) overlayRowSplit(row int, line emu.Line) {
 		put(0, row, false)
 	default:
 		i := boxRow - 1
-		put(0, []rune{'│'}, false)         // left frame
-		put(3+leftW, []rune{'│'}, false)   // middle divider
-		put(width-1, []rune{'│'}, false)   // right frame
+		put(0, []rune{'│'}, false)       // left frame
+		put(3+leftW, []rune{'│'}, false) // middle divider
+		put(width-1, []rune{'│'}, false) // right frame
 		// Left column: the item text, active-colored if it's the selection.
 		lc := pad("", leftW)
 		if i < len(left) {
@@ -2452,6 +2519,7 @@ func (c *compositor) reload(cfg config.ClientConfig, binds *config.ClientBinds) 
 // dropping the previous set. Shared by attach-time setup and reload.
 func (c *compositor) rebuildWidgets(binds *config.ClientBinds) {
 	c.statusWidget, c.docks, c.allDocks, c.overlays, c.focusedDock = nil, nil, nil, nil, nil
+	c.wantPreview("") // the dock that was browsing is gone; don't leave its preview up
 	c.agentDefs = binds.Agents
 	for _, w := range c.cfg.Widgets {
 		b := &textBox{

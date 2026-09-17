@@ -271,7 +271,19 @@ local function simple_picker(title, rows_fn, label_fn, select_fn)
   }
 end
 
+-- prefix+s: the overlay picker by default. Set session_switcher = "dock" to
+-- drive the sidebar dock instead — same list you already have on screen, with a
+-- cursor and a preview of the row you're on. The dock can be hidden (min_cols /
+-- toggle_dock), so fall back to the overlay rather than let the key go dead.
+gtmux.session_switcher = "overlay" -- or "dock"
 gtmux.bind("s", function()
+  -- gtmux.session_dock is set by require("gtmux.sidebar") to whatever name it
+  -- was given; read at key time, so load order doesn't matter.
+  local dock = gtmux.session_dock or "sidebar"
+  if gtmux.session_switcher == "dock" and gtmux.dock_visible(dock) then
+    gtmux.focus_dock(dock)
+    return
+  end
   simple_picker("choose session", gtmux.sessions,
     function(s) return s.name .. (s.attached and " (attached)" or "") end,
     function(s) gtmux.switch_session(s.name) end)
@@ -450,7 +462,10 @@ end)
 
 -- Bundled widgets are Lua modules: require("gtmux.<name>") returns a setup
 -- function taking an options table (see the module's header for the fields).
--- gtmux.sidebar: left dock with a SESSIONS list and a Clanker (agent panes)
--- section; click a row to switch there. Pair it with a toggle bind:
+-- gtmux.sidebar: left dock listing every session with its agent panes nested
+-- beneath; click a row to go there, or focus it and it's the session switcher
+-- (j/k, the pane area previews the row, Enter commits). Pair it with a toggle
+-- bind, and point prefix+s at it:
 -- require("gtmux.sidebar"){ size = 25, min_cols = 110 }
 -- gtmux.bind("B", function() gtmux.toggle_dock("sidebar") end)
+-- gtmux.session_switcher = "dock"

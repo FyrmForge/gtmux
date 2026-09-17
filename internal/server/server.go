@@ -833,6 +833,8 @@ func acceptConn(reg *registry, conn net.Conn) {
 			s.events <- resizeBorderEvent{epoch: epoch, index: m.ResizeBorder.Index, pos: m.ResizeBorder.Pos}
 		case m.CopyDrag != nil:
 			s.events <- copyDragEvent{epoch: epoch, paneID: m.CopyDrag.PaneID, row: m.CopyDrag.Row, col: m.CopyDrag.Col}
+		case m.Preview != nil:
+			s.events <- previewRequestEvent{epoch: epoch, target: m.Preview.Target}
 		case m.Resize != nil:
 			s.events <- clientResize{epoch: epoch, cols: m.Resize.Cols, rows: m.Resize.Rows}
 		case m.SetPaste != nil:

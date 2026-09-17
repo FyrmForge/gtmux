@@ -325,7 +325,29 @@ type clientInfo struct {
 	cols, rows int
 }
 type clientsEvent struct{ replyCh chan []clientInfo }
-type previewEvent struct{ replyCh chan []emu.Line }
+
+// previewEvent asks for a styled snapshot of one of this session's panes.
+// paneID 0 means the active pane. full returns the whole screen untrimmed (the
+// dock's in-place preview, painted at the content area's own row 0); otherwise
+// it's previewSnap's trimmed version, for the picker's preview box.
+type previewEvent struct {
+	paneID  int
+	full    bool
+	replyCh chan []emu.Line
+}
+
+// previewRequestEvent is a client asking for a pane snapshot to paint in place
+// of its window content (proto.PreviewRequest); previewReadyEvent carries a
+// cross-session capture back from the goroutine that fetched it.
+type previewRequestEvent struct {
+	epoch  int
+	target string
+}
+type previewReadyEvent struct {
+	epoch  int
+	target string
+	lines  []emu.Line
+}
 type killEvent struct{ replyCh chan struct{} }
 type renameEvent struct {
 	name    string
@@ -395,6 +417,52 @@ func (s *session) previewLines() []emu.Line {
 	ch := make(chan []emu.Line, 1)
 	s.events <- previewEvent{replyCh: ch}
 	return <-ch
+}
+
+// previewScreen is previewLines' untrimmed sibling for the in-place dock
+// preview: the full screen of paneID (0 = the session's active pane). Unlike
+// previewLines it gives up if the session dies mid-request — it's called from
+// a detached goroutine, not from a picker the user is waiting on.
+func (s *session) previewScreen(paneID int) []emu.Line {
+	ch := make(chan []emu.Line, 1)
+	select {
+	case s.events <- previewEvent{paneID: paneID, full: true, replyCh: ch}:
+	case <-s.gone:
+		return nil
+	}
+	select {
+	case l := <-ch:
+		return l
+	case <-s.gone:
+		return nil
+	}
+}
+
+// snapLines deep-copies a screen as-is — no blank trimming, no cap — so row i
+// of the copy is row i of the pane. previewSnap's trimming is right for a
+// preview box beside a list and wrong for a preview painted where the screen is.
+func snapLines(scr []emu.Line) []emu.Line {
+	out := make([]emu.Line, len(scr))
+	for i, l := range scr {
+		out[i] = make(emu.Line, len(l))
+		copy(out[i], l)
+	}
+	return out
+}
+
+// splitPreviewTarget splits a preview target into session name and pane id:
+// "sess" -> ("sess", 0) = that session's active pane, "sess:%12" -> ("sess", 12).
+func splitPreviewTarget(t string) (string, int) {
+	name, pane, ok := strings.Cut(t, ":")
+	if !ok {
+		return t, 0
+	}
+	// Only the %id form selects a pane; any other suffix (a window/pane index)
+	// still names the session, and previews its active pane.
+	if id, err := strconv.Atoi(strings.TrimPrefix(pane, "%")); err == nil && strings.HasPrefix(pane, "%") {
+		return name, id
+	}
+	return name, 0
 }
 
 // previewSnap deep-copies a pane's screen for a static picker preview: trailing
@@ -1692,13 +1760,49 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string, re
 		}})
 	}
 
+	// paneSnap copies one of this session's pane screens: paneID 0 = the active
+	// pane, otherwise the pane with that %id in any of our windows. nil if
+	// there's no such pane. full = the untrimmed grid (in-place dock preview);
+	// otherwise previewSnap's trimmed version for the picker's preview box.
+	// The copy happens INSIDE actorDo — handing the live grid out and copying
+	// after would read it while its window actor mutates it.
+	paneSnap := func(paneID int, full bool) []emu.Line {
+		copyOf := func(scr []emu.Line) []emu.Line {
+			if full {
+				return snapLines(scr)
+			}
+			return previewSnap(scr)
+		}
+		var out []emu.Line
+		if paneID == 0 {
+			wa := activeWindow()
+			actorDo(wa, func() { out = copyOf(wa.active.term.Screen()) })
+			return out
+		}
+		for _, wl := range windows {
+			wa := wl.actor
+			found := false
+			actorDo(wa, func() {
+				for _, p := range wa.panes {
+					if p.id == paneID {
+						out, found = copyOf(p.term.Screen()), true
+					}
+				}
+			})
+			if found {
+				return out
+			}
+		}
+		return nil
+	}
+
 	// sessionPreview returns a static styled snapshot of session n's active pane
 	// (last ~12 non-blank rows, real colors), for the picker preview. Self reads
 	// local state; a peer replies via its own goroutine (like chooseTree's
 	// list-windows) — a wedged peer stalls the picker open (interactive, acceptable).
 	sessionPreview := func(n string) []emu.Line {
 		if n == s.name {
-			return previewSnap(activeWindow().active.term.Screen())
+			return paneSnap(0, false)
 		}
 		if other, ok := reg.get(n); ok {
 			return other.previewLines()
@@ -3913,7 +4017,35 @@ loop:
 				}
 				e.replyCh <- infos
 			case previewEvent:
-				e.replyCh <- previewSnap(activeWindow().active.term.Screen())
+				e.replyCh <- paneSnap(e.paneID, e.full)
+			case previewRequestEvent:
+				// The dock re-requests on every cursor move, so a cross-session
+				// capture must not block this goroutine on the peer's (the deadlock
+				// the picker path accepts at open-frequency): fetch it detached and
+				// come back through previewReadyEvent.
+				name, paneID := splitPreviewTarget(e.target)
+				if name == "" || name == s.name {
+					// Our own pane: read it here, never through s.events (that's
+					// this goroutine — it would deadlock on itself).
+					sendTo(e.epoch, &proto.ServerMsg{Preview: &proto.Preview{
+						Target: e.target, Lines: paneSnap(paneID, true),
+					}})
+					break
+				}
+				peer, ok := reg.get(name)
+				if !ok {
+					sendTo(e.epoch, &proto.ServerMsg{Preview: &proto.Preview{Target: e.target}})
+					break
+				}
+				go func(ep int, t string, id int) {
+					lines := peer.previewScreen(id)
+					select {
+					case s.events <- previewReadyEvent{epoch: ep, target: t, lines: lines}:
+					case <-s.gone:
+					}
+				}(e.epoch, e.target, paneID)
+			case previewReadyEvent:
+				sendTo(e.epoch, &proto.ServerMsg{Preview: &proto.Preview{Target: e.target, Lines: e.lines}})
 			case killEvent:
 				killReplyCh = e.replyCh
 				killed = true

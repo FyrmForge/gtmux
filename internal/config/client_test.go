@@ -826,10 +826,10 @@ func TestBundledSidebarModule(t *testing.T) {
 	cfg, binds := LoadClient(path)
 	defer binds.Close()
 	w := lastWidget(cfg)
-	if w.Dock != "left" || w.Size != 30 || w.Name != "sb" || w.Draw == nil || w.OnClick == nil {
-		t.Fatalf("sidebar widget = %+v, want left dock, size 30, name sb, draw+on_click", w)
+	if w.Dock != "left" || w.Size != 30 || w.Name != "sb" || w.Component == nil || w.OnClick == nil || w.OnKey == nil {
+		t.Fatalf("sidebar widget = %+v, want left dock, size 30, name sb, component+on_click+on_key", w)
 	}
-	cv, _, _ := binds.RunDraw(w.Draw, 30, 5, emu.White, emu.Black, 0)
+	cv, _, _, _ := binds.RunComponent(w.Component, nil, 30, 5, emu.White, emu.Black, 0)
 	if g, _ := cv.At(2, 1); g.Char != 'S' { // "SESSIONS" header inside the box
 		t.Errorf("cell (2,1) = %q, want S of SESSIONS", g.Char)
 	}

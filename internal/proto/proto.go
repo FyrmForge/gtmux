@@ -380,6 +380,23 @@ type ClientMsg struct {
 	Action        *Action
 	ResizeBorder  *ResizeBorder
 	CopyDrag      *CopyDrag
+	Preview       *PreviewRequest
+}
+
+// PreviewRequest asks the server for a styled snapshot of a pane, to paint in
+// place of the window content while a focused dock browses sessions
+// (gtmux.preview) — a look at where you'd land without actually switching.
+// Target is "sess" (that session's active pane) or "sess:%12" (that pane).
+// Empty Target is never sent; the client clears a preview locally.
+type PreviewRequest struct{ Target string }
+
+// Preview is the reply to a PreviewRequest: the target pane's screen, top row
+// first and untrimmed, so it paints at the content area's own row 0. Lines nil
+// = the target is gone (the client clears). Target echoes the request so a
+// reply that arrives after the dock moved on can be dropped.
+type Preview struct {
+	Target string
+	Lines  []emu.Line
 }
 
 // ResizeBorder drags a pane divider to an absolute position. The client
@@ -434,6 +451,8 @@ type ServerMsg struct {
 	// visible pane; the client re-emits them as OSC 52 to its outer terminal
 	// unless its set-clipboard option is off.
 	Clipboards []string
+	// Preview is a pane snapshot the client asked for (PreviewRequest).
+	Preview *Preview
 	// CommandExits reports OSC 133 command-finished events (a command run in a
 	// pane exited) so the client can fire gtmux.on("command-exited", …).
 	CommandExits []CommandExit

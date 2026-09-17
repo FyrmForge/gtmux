@@ -573,6 +573,7 @@ type BindOp struct {
 	Border     *PaneBorder // set a pane's border override color (pane:set_border)
 	Dock       string      // toggle focus on the named dock (gtmux.focus_dock)
 	ToggleDock string      // toggle visibility of the named dock (gtmux.toggle_dock)
+	Preview    *string     // gtmux.preview(target): paint that pane in place of the window content; "" clears
 }
 
 // PaneBorder is a per-pane border color override (pane:set_border("red")): the
@@ -672,6 +673,10 @@ type WidgetHooks struct {
 	// ("busy"/"done"/"idle" per gtmux.agents{}, "" = not an agent pane / no
 	// classifier). Surfaced as the `state` field on find_panes rows.
 	AgentState func(paneID int) string
+	// DockVisible reports whether a named dock is currently on screen (it can be
+	// dropped by its min_cols breakpoint or a toggle_dock override), so a keybind
+	// that drives a dock can fall back instead of going dead.
+	DockVisible func(name string) bool
 }
 
 func (c *ClientBinds) Close() { c.l.Close() }
@@ -1526,6 +1531,27 @@ func LoadClientWith(path string, overrides [][2]string) (ClientConfig, *ClientBi
 		}
 		return 0
 	}))
+	// dock_visible(name) reports whether that dock is on screen right now —
+	// min_cols and toggle_dock can have hidden it. Lets a bind aimed at a dock
+	// (prefix+s -> the sidebar switcher) fall back to an overlay when it's gone.
+	L.SetField(tbl, "dock_visible", L.NewFunction(func(l *lua.LState) int {
+		name := l.CheckString(1)
+		vis := binds.Hooks.DockVisible != nil && binds.Hooks.DockVisible(name)
+		l.Push(lua.LBool(vis))
+		return 1
+	}))
+
+	// preview(target) paints target's screen in place of the window content
+	// until cleared — a focused dock calls it as its cursor moves, so you see
+	// the session you'd land on without switching to it. target is "sess" (that
+	// session's active pane) or "sess:%12". preview() with no argument clears;
+	// so does the dock losing focus, so a preview can't outlive the browse.
+	L.SetField(tbl, "preview", L.NewFunction(func(l *lua.LState) int {
+		t := l.OptString(1, "")
+		binds.ops = append(binds.ops, BindOp{Preview: &t})
+		return 0
+	}))
+
 	// toggle_dock(name) toggles the named dock's visibility. Overrides a
 	// min_cols auto-hide: once toggled the dock stays forced shown/hidden
 	// until toggled again (reload returns it to auto).
