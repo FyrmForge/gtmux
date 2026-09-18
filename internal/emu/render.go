@@ -28,6 +28,9 @@ func WriteLine(b *strings.Builder, line Line) {
 			haveAttrs = true
 		}
 		b.WriteRune(g.Char)
+		if g.Mode&AttrEmoji != 0 {
+			b.WriteRune(0xFE0F)
+		}
 		i += g.Width() - 1
 	}
 	b.WriteString("\x1b[0m")

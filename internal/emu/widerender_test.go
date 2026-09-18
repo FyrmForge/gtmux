@@ -3,6 +3,8 @@ package emu
 import (
 	"strings"
 	"testing"
+
+	"github.com/FyrmForge/gtmux/internal/geom"
 )
 
 // A double-width rune occupies two grid cells: the rune plus a ' ' placeholder
@@ -100,4 +102,34 @@ func lineCols(s string) int {
 		n += Glyph{Char: r}.Width()
 	}
 	return n
+}
+
+// "⚠️" is U+26A0 plus a U+FE0F variation selector. go-runewidth calls the
+// selector one column wide, so the grid used to spend two cells on a pair the
+// terminal advances one column for — the pane border then landed one column
+// early. The selector must take no cell and must not be emitted.
+func TestVariationSelectorTakesNoCell(t *testing.T) {
+	term := New(WithSize(geom.Vec2{R: 2, C: 20}))
+	term.Write([]byte("⚠️X"))
+	line := term.Screen()[0]
+
+	if line[1].Char != 'X' {
+		t.Errorf("cell 1 = %q, want 'X' (the variation selector must not take a cell)", line[1].Char)
+	}
+	// The selector still goes out, attached to the base rune, so the terminal
+	// draws the colour emoji rather than the monochrome text form.
+	if got := stripSGR(RenderLine(line[:2])); got != "⚠\ufe0fX" {
+		t.Errorf("RenderLine = %q, want %q (selector re-emitted on its base rune)", got, "⚠\ufe0fX")
+	}
+}
+
+// LineFromString is the other string→Line path; it must agree with Print.
+func TestLineFromStringVariationSelector(t *testing.T) {
+	line := LineFromString("⚠️X")
+	if len(line) != 2 {
+		t.Fatalf("len = %d, want 2 cells", len(line))
+	}
+	if got := stripSGR(RenderLine(line)); got != "⚠️X" {
+		t.Errorf("RenderLine = %q, want %q", got, "⚠️X")
+	}
 }

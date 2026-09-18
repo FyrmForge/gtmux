@@ -6,17 +6,34 @@ import (
 	"strconv"
 
 	"github.com/FyrmForge/gtmux/internal/geom"
-
-	"github.com/mattn/go-runewidth"
 )
 
 func (t *State) Print(c rune) {
+	w := runeWidth(c)
+	// A variation selector modifies the rune already on screen and takes no
+	// cell of its own — giving it one puts the grid's column count out of step
+	// with the terminal's. Mark the base rune instead; WriteLine re-emits the
+	// selector so the emoji still renders in colour.
+	if w == 0 {
+		// dirty.Print is the last cell setChar wrote, and it outlives the
+		// write it came from — only honour it when the cursor is still sitting
+		// right after it, so a selector arriving after a cursor move or an
+		// erase doesn't tag some unrelated cell.
+		p := t.dirty.Print
+		if c == 0xFE0F && p.R == t.cur.R && p.C >= 0 && p.R >= 0 && p.R < len(t.screen) && p.C < len(t.screen[p.R]) &&
+			t.cursorFollows(p.C, t.screen[p.R][p.C].Width()) {
+			t.screen[p.R][p.C].Mode |= attrEmoji
+			t.dirty.Print.Glyph = t.screen[p.R][p.C]
+			t.markDirtyLine(p.R)
+		}
+		return
+	}
+
 	if t.mode&ModeWrap != 0 && t.cur.State&cursorWrapNext != 0 {
 		t.screen[t.cur.R][t.cur.C].Mode |= attrWrap
 		t.newline(true)
 	}
 
-	w := runewidth.RuneWidth(c)
 	destCol := t.cur.C + w
 
 	// TODO(cfoust): 04/03/24 this is a nasty problem, what is the expected
@@ -527,4 +544,14 @@ func (t *State) handleOSC133(s strEscape) {
 	}
 
 	t.dirty.AddSemanticPrompt(event)
+}
+
+// cursorFollows reports whether the cursor sits immediately after a rune of
+// width w printed at column col — including the pending-wrap case, where the
+// cursor stays on the last column instead of moving past it.
+func (t *State) cursorFollows(col, w int) bool {
+	if t.cur.State&cursorWrapNext != 0 {
+		return t.cur.C == col+w-1
+	}
+	return t.cur.C == col+w
 }

@@ -41,3 +41,25 @@ func TestLayTextWideRuneSpacerAndClip(t *testing.T) {
 		t.Error("wide rune spilled past maxCols instead of being dropped")
 	}
 }
+
+// Dock/widget text goes through layText, not the emulator's Print, so it needs
+// the same column model: a U+FE0F variation selector takes no cell, it only
+// marks the rune before it. Laying it into its own cell made widget text one
+// column wider than the emulator thought — the divergence that pushes a border.
+func TestLayTextVariationSelectorTakesNoCell(t *testing.T) {
+	line := make(emu.Line, 6)
+	for i := range line {
+		line[i] = emu.Glyph{Char: ' '}
+	}
+
+	used := layText(line, "⚠️X", 0, 6, emu.DefaultFG, emu.DefaultBG, 0)
+	if used != 2 {
+		t.Fatalf("used = %d columns, want 2 (selector takes none)", used)
+	}
+	if line[1].Char != 'X' {
+		t.Errorf("cell 1 = %q, want 'X'", line[1].Char)
+	}
+	if line[0].Mode&emu.AttrEmoji == 0 {
+		t.Error("base rune not marked AttrEmoji — the selector would be lost")
+	}
+}

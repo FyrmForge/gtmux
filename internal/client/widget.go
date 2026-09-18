@@ -192,14 +192,24 @@ func (b *textBox) regionAt(x, y int) *lua.LFunction {
 // left/right-dock strip and the float-widget row so both stay width-correct.
 func layText(line emu.Line, s string, col0, maxCols int, fg, bg emu.Color, attr int16) int {
 	used := 0
+	last := -1 // cell holding the most recent rune, not its spacers
 	for _, r := range s {
 		g := emu.Glyph{Char: r, FG: fg, BG: bg, Mode: attr}
 		w := g.Width()
+		if w == 0 {
+			// A variation selector takes no column: it rides on the rune
+			// before it, as it does in the emulator's own Print path.
+			if r == 0xFE0F {
+				line.MarkEmoji(last)
+			}
+			continue
+		}
 		if used+w > maxCols {
 			break
 		}
 		if col := col0 + used; col >= 0 && col < len(line) {
 			line[col] = g
+			last = col
 		}
 		for k := 1; k < w; k++ { // spacer cells under a wide glyph
 			if c := col0 + used + k; c >= 0 && c < len(line) {

@@ -22,6 +22,11 @@ const (
 	AttrTransparent
 	AttrOpaque // unused here, but keeps the bit values aligned with state.go
 	AttrDim
+	// AttrEmoji marks a rune that arrived with a U+FE0F variation selector:
+	// the selector takes no cell of its own, so the bit rides on the base rune
+	// and WriteLine re-emits it. Keeps emoji presentation without a second rune
+	// per glyph (Glyph goes over the wire as gob; Mode already does).
+	AttrEmoji
 )
 
 type UnderlineMode uint8
@@ -110,9 +115,23 @@ func (g Glyph) Transparent() bool {
 }
 
 func (g Glyph) Width() int {
-	// runewidth can be 0, but we strictly want visible glyphs to be at
-	// least one cell wide.
-	return geom.Max(runewidth.RuneWidth(g.Char), 1)
+	// A variation selector genuinely takes no cell — it modifies the rune
+	// before it (see runeWidth). Every other rune, including ones runewidth
+	// calls zero-width, gets at least one cell.
+	if isVariationSelector(g.Char) {
+		return 0
+	}
+	return geom.Max(runeWidth(g.Char), 1)
+}
+
+// MarkEmoji records that the rune at col arrived with a U+FE0F variation
+// selector, so WriteLine re-emits the selector after it. Used by every path
+// that lays runes into cells: the emulator's Print, LineFromString, and the
+// client's widget text layout.
+func (l Line) MarkEmoji(col int) {
+	if col >= 0 && col < len(l) {
+		l[col].Mode |= AttrEmoji
+	}
 }
 
 func (g Glyph) Equal(other Glyph) bool {
@@ -224,14 +243,25 @@ func (l Line) Whitespace() (first, last int) {
 
 func LineFromString(text string) Line {
 	line := make(Line, 0)
+	last := -1 // cell holding the most recent rune, not its padding
 
 	for _, r := range text {
+		w := runeWidth(r)
+		if w == 0 {
+			// Same deal as Print: the selector rides on the rune before it
+			// rather than taking a cell the terminal doesn't advance over.
+			if r == 0xFE0F {
+				line.MarkEmoji(last)
+			}
+			continue
+		}
+
 		glyph := EmptyGlyph()
 		glyph.Char = r
+		last = len(line)
 		line = append(line, glyph)
 
 		// Handle wider characters
-		w := runewidth.RuneWidth(r)
 		if w > 1 {
 			for i := 0; i < w-1; i++ {
 				line = append(line, EmptyGlyph())
@@ -415,3 +445,19 @@ func New(opts ...TerminalOption) Terminal {
 	}
 	return newTerminal(info)
 }
+
+// runeWidth is runewidth.RuneWidth with variation selectors (U+FE00-U+FE0F)
+// forced to zero. go-runewidth calls VS16 one column wide, so a "⚠️" would
+// take two grid cells while the terminal advances one for the pair — every
+// cell right of it, pane border included, drawn one column early.
+//
+// ponytail: variation selectors only. ZWJ sequences (👨‍👩‍👧) still mismodel their
+// width; that needs multi-rune glyphs, which the gob wire format doesn't carry.
+func runeWidth(r rune) int {
+	if isVariationSelector(r) {
+		return 0
+	}
+	return runewidth.RuneWidth(r)
+}
+
+func isVariationSelector(r rune) bool { return r >= 0xFE00 && r <= 0xFE0F }

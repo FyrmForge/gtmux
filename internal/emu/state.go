@@ -7,7 +7,6 @@ import (
 	"github.com/FyrmForge/gtmux/internal/geom"
 
 	"github.com/danielgatis/go-vte/vtparser"
-	"github.com/mattn/go-runewidth"
 	"sync"
 )
 
@@ -27,6 +26,7 @@ const (
 	attrTransparent
 	attrOpaque
 	attrDim
+	attrEmoji
 )
 
 // State represents the terminal emulation state. Use Lock/Unlock
@@ -55,9 +55,9 @@ type State struct {
 	// charsets: whether G0/G1 are designated to DEC line-drawing (ESC ( 0 /
 	// ESC ) 0); charset is the active one, selected by SI/SO. attrGfx on the
 	// cursor mirrors charsets[charset].
-	charsets    [2]bool
-	charset     int
-	top, bottom int // scroll limits
+	charsets      [2]bool
+	charset       int
+	top, bottom   int // scroll limits
 	mode          ModeFlag
 	tabs          []bool
 	title         string
@@ -233,7 +233,7 @@ var gfxCharTable = [62]rune{
 }
 
 func (t *State) setChar(c rune, attr *Glyph, x, y int) {
-	w := runewidth.RuneWidth(c)
+	w := runeWidth(c)
 
 	if attr.Mode&attrGfx != 0 {
 		if c >= 0x41 && c <= 0x7e && gfxCharTable[c-0x41] != 0 {
