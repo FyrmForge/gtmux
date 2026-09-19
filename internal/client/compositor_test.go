@@ -267,6 +267,115 @@ func TestCompositorCopyModeCursorHighlight(t *testing.T) {
 	}
 }
 
+// TestCompositorCopyModeRelativeNumbers verifies the copy_line_numbers gutter:
+// distances from the cursor line (which shows 0), right-aligned, with the pane
+// text shifted right past it and the cursor block moving with it.
+func TestCompositorCopyModeRelativeNumbers(t *testing.T) {
+	c := newCompositor()
+	c.cfg.CopyLineNumbers = "relative"
+	c.apply(&proto.ServerMsg{
+		Layout: &proto.Layout{Cols: 8, Rows: 3, Panes: []proto.PaneRect{
+			{ID: 1, Row: 0, Col: 0, Rows: 3, Cols: 8, Active: true},
+		}},
+		Status: &proto.StatusInfo{},
+	})
+	c.apply(&proto.ServerMsg{CopyModeEnter: &proto.CopyModeEnter{
+		PaneID: 1, Lines: []emu.Line{lineOf("aaa"), lineOf("bbb"), lineOf("ccc")},
+		CursorY: 1, CursorX: 0,
+	}})
+
+	// 3 rows => max distance 2 => one digit + a trailing space.
+	const gut = 2
+	for row, want := range []string{"1 aaa", "0 bbb", "1 ccc"} {
+		var got []rune
+		for _, g := range c.buildRow(row)[:len(want)] {
+			got = append(got, g.Char)
+		}
+		if string(got) != want {
+			t.Errorf("row %d = %q, want %q", row, string(got), want)
+		}
+	}
+	// Cursor block sits on the first text cell, not in the gutter.
+	if g := c.buildRow(1)[gut]; g.FG != c.cfg.CopyCursorFG || g.BG != c.cfg.CopyCursorBG {
+		t.Errorf("cursor cell at col %d: FG=%v BG=%v, want copy-cursor colors", gut, g.FG, g.BG)
+	}
+
+	// The real terminal cursor tracks the painted block, or the outer terminal
+	// draws a second cursor gut cells to its left.
+	if _, col, _ := c.activeCursor(); col != gut {
+		t.Errorf("activeCursor col = %d, want %d (past the gutter)", col, gut)
+	}
+
+	// Absolute numbers the snapshot from 1, oldest scrollback line first.
+	c.cfg.CopyLineNumbers = "absolute"
+	for row, want := range []string{"1 aaa", "2 bbb", "3 ccc"} {
+		var got []rune
+		for _, g := range c.buildRow(row)[:len(want)] {
+			got = append(got, g.Char)
+		}
+		if string(got) != want {
+			t.Errorf("absolute row %d = %q, want %q", row, string(got), want)
+		}
+	}
+}
+
+// TestCompositorCopyModeUnfocused verifies copy-mode is a frozen overlay
+// pinned to its pane, not a global input grab: once another pane is active the
+// overlay still renders, but keys/mouse and the real cursor belong to the newly
+// active pane (client.go gates both on copyFocused).
+func TestCompositorCopyModeUnfocused(t *testing.T) {
+	c := newCompositor()
+	layout := func(activeID int) *proto.Layout {
+		return &proto.Layout{Cols: 7, Rows: 1, Panes: []proto.PaneRect{
+			{ID: 1, Row: 0, Col: 0, Rows: 1, Cols: 3, Active: activeID == 1},
+			{ID: 2, Row: 0, Col: 4, Rows: 1, Cols: 3, Active: activeID == 2},
+		}}
+	}
+	c.apply(&proto.ServerMsg{
+		Layout: layout(1),
+		PaneContent: []proto.PaneContent{
+			{PaneID: 1, Lines: map[int]emu.Line{0: lineOf("abc")}},
+			{PaneID: 2, Lines: map[int]emu.Line{0: lineOf("xyz")}},
+		},
+		Status: &proto.StatusInfo{},
+	})
+	c.apply(&proto.ServerMsg{CopyModeEnter: &proto.CopyModeEnter{
+		PaneID: 1, Lines: []emu.Line{lineOf("abc")}, CursorY: 0, CursorX: 1,
+	}})
+	if !c.copyFocused() {
+		t.Fatal("copy-mode pane is active: want focused")
+	}
+
+	// Pane 2 becomes active (a root-bound C-l, say). Copy-mode is not cleared.
+	c.apply(&proto.ServerMsg{Layout: layout(2), Status: &proto.StatusInfo{}})
+	if c.copy == nil {
+		t.Fatal("switching panes must not clear copy-mode")
+	}
+	if c.copyFocused() {
+		t.Error("copy-mode pane is no longer active: want unfocused")
+	}
+	// Overlay still drawn on pane 1 (its own cursor block).
+	if g := c.buildRow(0)[1]; g.BG != c.cfg.CopyCursorBG {
+		t.Errorf("copy overlay should still render on pane 1, cell BG=%v", g.BG)
+	}
+	// Real terminal cursor follows the active pane, not the frozen overlay.
+	if _, col, _ := c.activeCursor(); col < 4 {
+		t.Errorf("activeCursor col = %d, want inside pane 2 (>=4)", col)
+	}
+
+	// Pane 1 is killed while the overlay is unfocused. It must be dropped: an
+	// overlay on a pane that can never be focused again can never be exited.
+	c.apply(&proto.ServerMsg{
+		Layout: &proto.Layout{Cols: 7, Rows: 1, Panes: []proto.PaneRect{
+			{ID: 2, Row: 0, Col: 0, Rows: 1, Cols: 7, Active: true},
+		}},
+		Status: &proto.StatusInfo{},
+	})
+	if c.copy != nil {
+		t.Error("copy-mode pane was killed: overlay must be dropped, not wedged")
+	}
+}
+
 // TestCompositorMarkedBorder verifies a marked pane's divider is drawn in the
 // marked-border color rather than the default divider color.
 func TestCompositorMarkedBorder(t *testing.T) {
@@ -510,7 +619,7 @@ func TestCopyDragFinishOption(t *testing.T) {
 			Status: &proto.StatusInfo{},
 		})
 		c.apply(&proto.ServerMsg{CopyModeEnter: &proto.CopyModeEnter{PaneID: 1, Lines: mkLines()}})
-		c.copyMouse(proto.MouseEvent{Cb: 0, X: 3, Y: 3, Press: true})  // anchor
+		c.copyMouse(proto.MouseEvent{Cb: 0, X: 3, Y: 3, Press: true})    // anchor
 		c.copyMouse(proto.MouseEvent{Cb: 0x20, X: 8, Y: 3, Press: true}) // drag
 		_, res := c.copyMouse(proto.MouseEvent{Cb: 0, X: 8, Y: 3})       // release
 		return res

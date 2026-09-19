@@ -42,6 +42,49 @@ func byteKey(b byte) string {
 	return ""
 }
 
+// firstKeyToken peeks the bind token of the first key in an input chunk,
+// without consuming it — the escape-sequence forms the main loop's collector
+// handles (CSI, SS3, Meta), plus a plain byte via byteKey. "" means the chunk
+// doesn't start with a complete, nameable key.
+//
+// Only overlays that want to let root binds through need this (copy-mode);
+// everything else decodes as it consumes. Keep the cases in step with the
+// collector in processInput.
+func firstKeyToken(pass []byte) string {
+	if len(pass) == 0 {
+		return ""
+	}
+	if pass[0] != 0x1b {
+		return byteKey(pass[0])
+	}
+	if len(pass) < 2 {
+		return ""
+	}
+	switch pass[1] {
+	case '[':
+		for i := 2; i < len(pass); i++ {
+			if pass[i] >= 0x40 && pass[i] <= 0x7e {
+				seq := string(pass[2 : i+1])
+				if tok, _, _, _, ok := decodeExtKey(seq); ok {
+					return tok // kitty CSI-u / modifyOtherKeys: C-1, S-Enter, …
+				}
+				return csiKeyName[seq]
+			}
+		}
+		return "" // sequence split across reads
+	case 'O':
+		if len(pass) < 3 {
+			return ""
+		}
+		return ss3KeyName[string(pass[2])]
+	default:
+		if pass[1] >= 0x20 && pass[1] <= 0x7e {
+			return "M-" + string(pass[1])
+		}
+		return ""
+	}
+}
+
 // advancePaste steps a bracketed-paste marker matcher: m is how many bytes of
 // pat matched so far, b is the next byte. Returns the new progress and whether
 // pat just completed. On a mismatch it restarts at 1 if b is pat's first byte
@@ -930,7 +973,7 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 				for _, me := range mouseEvents {
 					compMu.Lock()
 					switch {
-					case comp != nil && comp.copy != nil:
+					case comp != nil && comp.copyFocused():
 						out, res := comp.copyMouse(me)
 						if res.exit {
 							// A drag-select yank exits copy-mode, same as the keyboard
@@ -1064,15 +1107,23 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 						os.Stdout.Write(comp.redraw())
 						compMu.Unlock()
 						runOps(dops)
-					case comp != nil && comp.copy != nil:
+					case comp != nil && comp.copyFocused():
 						// tmux behavior: the prefix key wins over copy-mode. A chunk
 						// that starts with the prefix (or continues a pending prefix /
 						// prefixed escape) runs through the normal bind machine, so
 						// detach / select-pane / kill-session etc. still work while
 						// browsing scrollback. Shadows copy-mode's own binding of the
 						// prefix byte (e.g. C-b page-up in vi mode), same as tmux.
+						//
+						// A root bind (bind -n, e.g. C-h/C-j/C-k/C-l pane navigation,
+						// C-1..C-9 window select) wins too, so you can step out of a
+						// copy-mode pane the same way you move between live ones. The
+						// token is decoded without consuming it, so keys with no root
+						// bind — copy-mode's own arrows and PgUp among them — still
+						// reach copyFeed rather than the forward-raw path.
 						if bd := curBinds(); prefixPending || (escStage != 0 && escPrefixed) ||
-							pass[0] == bd.Prefix || (bd.Prefix2 != 0 && pass[0] == bd.Prefix2) {
+							pass[0] == bd.Prefix || (bd.Prefix2 != 0 && pass[0] == bd.Prefix2) ||
+							bd.ResolveRoot(firstKeyToken(pass)) != nil {
 							compMu.Unlock()
 							processInput(pass)
 							break

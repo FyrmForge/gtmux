@@ -903,6 +903,18 @@ func (c *compositor) rectFor(paneID int) (proto.PaneRect, bool) {
 	return proto.PaneRect{}, false
 }
 
+// copyFocused reports whether this client's copy-mode pane is still the active
+// one. Copy-mode is a frozen overlay pinned to its pane, not a global input
+// grab: once focus moves elsewhere the overlay keeps rendering but keys and
+// mouse belong to the newly active pane, and switching back resumes it.
+func (c *compositor) copyFocused() bool {
+	if c.copy == nil || c.layout == nil {
+		return false
+	}
+	pr, ok := c.rectFor(c.copy.paneID)
+	return ok && pr.Active
+}
+
 // activeCursor reports where the real terminal cursor should sit: the
 // active pane's rect plus its last-known local cursor position — or the
 // copy-mode block position while this client is browsing scrollback.
@@ -928,10 +940,10 @@ func (c *compositor) activeCursor() (row, col int, visible bool) {
 	if c.preview != nil {
 		return 0, 0, false
 	}
-	if c.copy != nil {
+	if c.copyFocused() {
 		if pr, ok := c.rectFor(c.copy.paneID); ok {
 			r := pr.Row + (c.copy.cy - c.copy.top)
-			col := pr.Col + c.copy.cx + coff
+			col := pr.Col + c.copyGutterWidth(pr) + c.copy.cx + coff
 			return r + off, col, inContent(r) && col >= 0 && col < c.cols()
 		}
 	}
@@ -1207,6 +1219,14 @@ func (c *compositor) apply(msg *proto.ServerMsg) []byte {
 		for _, pr := range msg.Layout.Panes {
 			if pr.Active && c.paneBorderColor != nil {
 				delete(c.paneBorderColor, pr.ID)
+			}
+		}
+		// The copy-mode pane is gone (killed, or this window swapped out): drop
+		// the overlay. Copy-mode only takes input while its pane is focused, so
+		// a snapshot pinned to a pane that no longer exists can never be exited.
+		if c.copy != nil {
+			if _, ok := c.rectFor(c.copy.paneID); !ok {
+				c.copy = nil
 			}
 		}
 		c.rebuildBorders() // recompute joined-mode junctions for the new arrangement
@@ -1517,7 +1537,7 @@ func (c *compositor) buildRow(row int) emu.Line {
 	// status off: no reserved row, but the command prompt / copy-mode help still
 	// needs somewhere to show — overlay it on the bottom physical row (like tmux).
 	if c.statusLines() == 0 && c.layout != nil && row == c.totalRows()-1 {
-		if c.copy != nil {
+		if c.copyFocused() {
 			return renderPromptLine(c.cols(), "copy-mode", c.copy.helpText(), c.cfg)
 		}
 		if c.prompt != nil {
@@ -1531,7 +1551,9 @@ func (c *compositor) buildRow(row int) emu.Line {
 		// Main bar row: client-owned input modes draw their own line, taking
 		// precedence over status content (component or bespoke bar alike).
 		if extra < 0 {
-			if c.copy != nil {
+			// Focus moved off the copy-mode pane: the overlay stays frozen on it,
+			// but the bar belongs to the pane the keys are going to now.
+			if c.copyFocused() {
 				return renderPromptLine(c.cols(), "copy-mode", c.copy.helpText(), c.cfg)
 			}
 			if c.prompt != nil {
@@ -2006,6 +2028,10 @@ func (c *compositor) drawCentered(text string, line emu.Line) {
 func (c *compositor) buildCopyRow(pr proto.PaneRect, localRow int, line emu.Line) {
 	cm := c.copy
 	bufY := cm.top + localRow
+	gut := c.copyGutterWidth(pr)
+	if gut > 0 {
+		c.drawCopyGutter(pr, bufY, gut, line)
+	}
 	var src emu.Line
 	if bufY >= 0 && bufY < len(cm.lines) {
 		src = cm.lines[bufY]
@@ -2018,8 +2044,10 @@ func (c *compositor) buildCopyRow(pr proto.PaneRect, localRow int, line emu.Line
 	if cursorX > 0 && cursorX < len(src) && src[cursorX-1].Width() > 1 {
 		cursorX--
 	}
-	for x := 0; x < pr.Cols; x++ {
-		col := pr.Col + x
+	// x is the buffer column (what the cursor/selection are indexed by); col is
+	// the screen cell, shifted right past the number gutter.
+	for x := 0; x < pr.Cols-gut; x++ {
+		col := pr.Col + gut + x
 		if col < 0 || col >= c.contentCols() {
 			continue
 		}
@@ -2035,7 +2063,60 @@ func (c *compositor) buildCopyRow(pr proto.PaneRect, localRow int, line emu.Line
 			g.FG, g.BG = c.cfg.CopySelectionFG, c.cfg.CopySelectionBG
 			g.Mode &^= emu.AttrReverse
 		}
-		line[col] = clipWide(g, roomIn(pr.Cols-x, c.contentCols()-col))
+		line[col] = clipWide(g, roomIn(pr.Cols-gut-x, c.contentCols()-col))
+	}
+}
+
+// copyGutterWidth is the number-gutter width for a copy-mode pane, fixed for
+// the whole redraw (copy_line_numbers). Deriving it from the pane height, not
+// from the numbers actually on screen, keeps the content from sliding sideways
+// every time the cursor moves. 0 = no gutter.
+func (c *compositor) copyGutterWidth(pr proto.PaneRect) int {
+	n := 0
+	switch c.cfg.CopyLineNumbers {
+	case "relative":
+		n = pr.Rows - 1 // largest distance from the cursor that can be on screen
+	case "absolute":
+		n = len(c.copy.lines)
+	default:
+		return 0
+	}
+	w := 1
+	for n >= 10 {
+		n /= 10
+		w++
+	}
+	w++ // trailing space between the numbers and the text
+	if w >= pr.Cols {
+		return 0 // pane too narrow to spare the cells
+	}
+	return w
+}
+
+// drawCopyGutter paints one row's line number, right-aligned in the gutter.
+// Relative mode counts from the cursor line, which shows 0.
+func (c *compositor) drawCopyGutter(pr proto.PaneRect, bufY, gut int, line emu.Line) {
+	cm := c.copy
+	num := bufY + 1
+	if c.cfg.CopyLineNumbers == "relative" {
+		num = cm.cy - bufY
+		if num < 0 {
+			num = -num
+		}
+	}
+	// Past the end of the snapshot the gutter is blank, not left as whatever the
+	// base row had (the dot fill) — these cells belong to nobody else now that
+	// the content loop starts past them.
+	text := strings.Repeat(" ", gut)
+	if bufY >= 0 && bufY < len(cm.lines) {
+		text = fmt.Sprintf("%*d ", gut-1, num)
+	}
+	for i, r := range []rune(text) {
+		col := pr.Col + i
+		if col < 0 || col >= c.contentCols() || i >= gut {
+			continue
+		}
+		line[col] = emu.Glyph{Char: r, FG: c.cfg.FillFG, BG: emu.DefaultBG, Mode: emu.AttrDim}
 	}
 }
 
@@ -2470,11 +2551,14 @@ func (c *compositor) copyMouse(me proto.MouseEvent) ([]byte, copyResult) {
 			cm.cy += n
 		}
 	case isLeft && me.Press && !isMotion:
-		cm.cy, cm.cx = cm.top+(row-pr.Row), col-pr.Col
+		cm.cy, cm.cx = cm.top+(row-pr.Row), col-pr.Col-c.copyGutterWidth(pr)
 		cm.clamp()
 		cm.selY, cm.selX, cm.selecting, cm.lineSel = cm.cy, cm.cx, true, false
 	case isLeft && isMotion && cm.selecting:
-		cm.cy, cm.cx = cm.top+(row-pr.Row), col-pr.Col
+		cm.cy, cm.cx = cm.top+(row-pr.Row), col-pr.Col-c.copyGutterWidth(pr)
+		if cm.cx < 0 {
+			cm.cx = 0 // dragged into the gutter; release clamps the rest
+		}
 	case !me.Press && cm.selecting:
 		cm.clamp()
 		cm.scroll()

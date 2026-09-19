@@ -4,6 +4,10 @@
 
 gtmux.options.mouse = true
 gtmux.options.mode_keys = "vi" -- copy-mode keytable: "vi" or "emacs"
+-- Line-number gutter in copy-mode: "off", "absolute" (index into the frozen
+-- snapshot, oldest scrollback line = 1) or "relative" (distance from the
+-- cursor line, which shows 0).
+-- gtmux.options.copy_line_numbers = "relative"
 -- extended-keys (tmux's option, default off): while a pane app speaks the kitty
 -- keyboard protocol, negotiate it with the outer terminal too, so disambiguated
 -- keys (Ctrl+I vs Tab, Shift+Enter) reach the app. gtmux does kitty passthrough,

@@ -27,8 +27,8 @@ func TestDecodeKeys(t *testing.T) {
 		{"a", []string{"a"}},
 		{"\x03", []string{"C-c"}},
 		{"jk\r", []string{"j", "k", "Enter"}},    // multi-key chunk
-		{"\x1b[Aj", []string{"Up", "j"}},          // arrow + char in one read
-		{"ab\x1b[B", []string{"a", "b", "Down"}},  // printables then arrow
+		{"\x1b[Aj", []string{"Up", "j"}},         // arrow + char in one read
+		{"ab\x1b[B", []string{"a", "b", "Down"}}, // printables then arrow
 	}
 	for _, tc := range cases {
 		if got := decodeKeys([]byte(tc.in)); !reflect.DeepEqual(got, tc.want) {
@@ -110,5 +110,33 @@ func TestReaderParserAgree(t *testing.T) {
 	// Meta is formed the same way on both sides.
 	if got, ok := config.ParseKey("M-h"); !ok || got != "M-"+string(byte('h')) {
 		t.Errorf("Meta token mismatch: config=%q, reader forms %q", got, "M-h")
+	}
+}
+
+// TestFirstKeyToken covers the peek the copy-mode branch uses to let root
+// binds (bind -n) through: C-hjkl arrive as plain control bytes, C-1..C-9 as
+// kitty CSI-u or modifyOtherKeys, and copy-mode's own keys must stay nameable
+// so an unbound one still falls through to copyFeed rather than raw forward.
+func TestFirstKeyToken(t *testing.T) {
+	for _, tc := range []struct {
+		in, want string
+	}{
+		{"\x0c", "C-l"},          // C-l: plain control byte
+		{"\x08", "C-h"},          //
+		{"\x1b[49;5u", "C-1"},    // kitty CSI-u
+		{"\x1b[27;5;49~", "C-1"}, // xterm modifyOtherKeys
+		{"\x1b[A", "Up"},         // copy-mode motion, unbound at root
+		{"\x1b[5~", "PgUp"},      //
+		{"\x1bOP", "F1"},         // SS3
+		{"\x1bb", "M-b"},         // Meta
+		{"q", "q"},               // copy-mode quit
+		{"", ""},                 // empty chunk
+		{"\x1b", ""},             // lone ESC
+		{"\x1b[1;5", ""},         // CSI split across reads
+		{"\x00", ""},             // no bind token
+	} {
+		if got := firstKeyToken([]byte(tc.in)); got != tc.want {
+			t.Errorf("firstKeyToken(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }

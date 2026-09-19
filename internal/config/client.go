@@ -72,6 +72,10 @@ type ClientConfig struct {
 	StatusRight        string
 	StatusInterval     int    // #client()/#server() cache cadence, seconds
 	ModeKeys           string // copy-mode keytable: "vi" (default) or "emacs"
+	// CopyLineNumbers draws a line-number gutter in copy-mode: "off" (default),
+	// "absolute" (index into the frozen snapshot, oldest scrollback line = 1) or
+	// "relative" (distance from the cursor line, which shows 0).
+	CopyLineNumbers string
 	// gtmux.responsive{}: below RespBelow physical cols the client keeps the
 	// active pane zoomed (RespMode "maximize" — the only mode yet), so a small
 	// client (phone attach) sees one pane at a time; cycle with next_pane/
@@ -229,16 +233,17 @@ func DefaultClientConfig() ClientConfig {
 		// status-left/right-length: 0 = unlimited. Diverges from tmux (10/40) on
 		// purpose — gtmux's default status-left is longer than 10, so tmux's cap
 		// would truncate the default bar. The knob is still exposed.
-		StatusLeft:     "[#{host}][#{session}]",
-		StatusRight:    "#{?git_branch,[git:#{git_branch}] ,}#{clock}",
-		StatusInterval: 15,
-		StatusLines:    1,
-		ModeKeys:       "vi",
-		StatusKeys:     "emacs",                                // tmux default
-		SetClipboard:   "external",                             // tmux default
-		CopyWheelLines: 3,                                      // tmux copy-mode default
-		CopyDragFinish: true,                                   // tmux default: drag-release yanks + cancels
-		WordSeparators: "!\"#$%&'()*+,-./:;<=>?@[\\]^\x60{|}~", // tmux default: all ASCII punctuation
+		StatusLeft:      "[#{host}][#{session}]",
+		StatusRight:     "#{?git_branch,[git:#{git_branch}] ,}#{clock}",
+		StatusInterval:  15,
+		StatusLines:     1,
+		ModeKeys:        "vi",
+		CopyLineNumbers: "off",
+		StatusKeys:      "emacs",                                // tmux default
+		SetClipboard:    "external",                             // tmux default
+		CopyWheelLines:  3,                                      // tmux copy-mode default
+		CopyDragFinish:  true,                                   // tmux default: drag-release yanks + cancels
+		WordSeparators:  "!\"#$%&'()*+,-./:;<=>?@[\\]^\x60{|}~", // tmux default: all ASCII punctuation
 
 		RepeatTime:      500,
 		SetTitlesString: "#{session}:#{window_index}:#{window_name}",
@@ -367,6 +372,11 @@ func applyOption(cfg *ClientConfig, binds *ClientBinds, name, value string) bool
 	case "mode_keys":
 		if value == "vi" || value == "emacs" {
 			cfg.ModeKeys = value
+		}
+	case "copy_line_numbers":
+		switch value {
+		case "off", "absolute", "relative":
+			cfg.CopyLineNumbers = value
 		}
 	case "status_keys":
 		if value == "vi" || value == "emacs" {
