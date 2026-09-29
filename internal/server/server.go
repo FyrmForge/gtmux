@@ -405,6 +405,7 @@ func (r *registry) relabel(oldName, newName string) error {
 		return fmt.Errorf("no such session: %s", oldName)
 	}
 	delete(r.sessions, oldName)
+	delete(r.snapshots, oldName) // the owner re-reports under the new name next tick
 	r.sessions[newName] = s
 	return nil
 }
