@@ -393,8 +393,8 @@ func TestChooseTree(t *testing.T) {
 	c.WaitFor(func(s *harness.Screen) bool { return s.ActiveWindow() == 1 })
 }
 
-// TestChooseSessionSwitch covers the choose-session picker actually switching
-// the client to another session.
+// TestChooseSessionSwitch covers prefix+s (the default fuzzy session finder)
+// actually switching the client to another session.
 func TestChooseSessionSwitch(t *testing.T) {
 	c := harness.Start(t)
 	c.WaitForStatus("default")
@@ -402,13 +402,11 @@ func TestChooseSessionSwitch(t *testing.T) {
 	peer.WaitForStatus("work")
 
 	c.Prefix("s")
-	c.WaitForText("choose session")
-	c.WaitForText("work") // the picker is a component over the client snapshot;
-	//                       wait for the cross-session list to populate (it now
-	//                       re-renders live on the status tick).
-	c.Type("j") // sorted [default, work]; move to work
+	c.WaitForText("find session")
+	c.Type("wrk") // fuzzy: narrows the list to work
+	c.WaitForText("1/2")
 	c.Key('\r')
-	c.WaitForStatus("work") // c re-attached to the work session
+	c.WaitForStatus("● work") // c re-attached to the work session
 }
 
 // TestResizePane covers prefix+Ctrl-arrow resize by verifying the divider

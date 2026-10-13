@@ -70,7 +70,7 @@ func TestDefaultBindsResolve(t *testing.T) {
 		"!": {Action: []string{"break-pane"}},
 		"m": {Action: []string{"mark-pane"}},
 		"J": {Action: []string{"join-marked"}},
-		// "s" is now a modal picker component (gtmux.open), asserted separately below.
+		"s": {Action: []string{"find-session"}}, // the fuzzy session finder
 		"[": {Action: []string{"copy-mode"}},
 		"]": {Action: []string{"paste"}},
 		// "$" / "," are now modal prompt components (gtmux.open), asserted below.
@@ -91,7 +91,7 @@ func TestDefaultBindsResolve(t *testing.T) {
 	}
 	// prefix+s / prefix+W open modal picker components (gtmux.open), not server
 	// actions.
-	for _, key := range []string{"s", "W", "$", ",", "w"} {
+	for _, key := range []string{"W", "$", ",", "w"} {
 		if ops := binds.Resolve(key); len(ops) != 1 || ops[0].Modal == nil {
 			t.Errorf("key %s: got %+v, want a Modal open", key, ops)
 		}

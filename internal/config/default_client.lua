@@ -298,11 +298,12 @@ local function simple_picker(title, rows_fn, label_fn, select_fn)
   }
 end
 
--- prefix+s: the overlay picker by default. Set session_switcher = "dock" to
--- drive the sidebar dock instead — same list you already have on screen, with a
--- cursor and a preview of the row you're on. The dock can be hidden (min_cols /
--- toggle_dock), so fall back to the overlay rather than let the key go dead.
-gtmux.session_switcher = "overlay" -- or "dock"
+-- prefix+s: the fuzzy session finder (gtmux.find_session: type to filter,
+-- live pane preview, Enter switches). Set session_switcher = "dock" to drive the
+-- sidebar dock instead — same list you already have on screen, with a cursor and
+-- a preview of the row you're on. The dock can be hidden (min_cols /
+-- toggle_dock), so fall back to the finder rather than let the key go dead.
+gtmux.session_switcher = "finder" -- or "dock"
 gtmux.bind("s", function()
   -- gtmux.session_dock is set by require("gtmux.sidebar") to whatever name it
   -- was given; read at key time, so load order doesn't matter.
@@ -311,9 +312,7 @@ gtmux.bind("s", function()
     gtmux.focus_dock(dock)
     return
   end
-  simple_picker("choose session", gtmux.sessions,
-    function(s) return s.name .. (s.attached and " (attached)" or "") end,
-    function(s) gtmux.switch_session(s.name) end)
+  gtmux.find_session()
 end)
 gtmux.bind("W", function()
   simple_picker("choose window", gtmux.windows,
