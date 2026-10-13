@@ -325,7 +325,11 @@ func (t *State) CsiDispatch(
 			}
 			t.clear(0, t.cur.R, t.cur.C, t.cur.R)
 		case 2: // all
+			t.pushScreenToHistory()
 			t.clear(0, 0, t.cols-1, t.rows-1)
+			t.sealHistory()
+		case 3: // scrollback (`clear` sends it) — the active buffer's only, like tmux
+			t.history, t.historyOffset, t.pullFloor = nil, 0, 0
 		default:
 			goto unknown
 		}

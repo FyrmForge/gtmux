@@ -119,6 +119,31 @@ func appendWrapped(lines []Line, line Line) []Line {
 	return lines
 }
 
+// historyRows lays a logical history line out as cols-wide screen rows, the
+// way reflow builds a screen; starts[i] is the index in line of row i's first
+// glyph. An empty line is one blank row.
+func historyRows(line Line, cols int) (rows []Line, starts []int) {
+	line = copyLine(line)
+	for i := range line {
+		line[i].Mode &^= attrWrap // appendWrapped leaves stale mid-line flags
+	}
+	physical := wrapLine(line, cols)
+	for i, sl := range physical {
+		row := make(Line, cols)
+		copy(row, line[sl.C0:sl.C1])
+		for j := sl.C1 - sl.C0; j < cols; j++ {
+			row[j] = EmptyGlyph()
+			row[j].Mode |= attrBlank
+		}
+		if i != len(physical)-1 {
+			row[cols-1].Mode |= attrWrap
+		}
+		rows = append(rows, row)
+		starts = append(starts, sl.C0)
+	}
+	return
+}
+
 func emptyLine(cols int) Line {
 	line := make(Line, cols)
 	for i := range line {

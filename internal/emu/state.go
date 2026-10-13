@@ -45,6 +45,10 @@ type State struct {
 	// to keep a bounded scrollback buffer without breaking the coordinate
 	// system used by Flow and Root.
 	historyOffset, altHistoryOffset int
+	// Absolute history index (historyOffset-based) below which lines may not
+	// be pulled back onto a growing screen — tmux's hscrolled: only lines
+	// that scrolled off are pullable, not ones a clear left behind.
+	pullFloor, altPullFloor int
 	// Whether the last cell of history _continues to wrap onto the screen_.
 	// This is only used when `disableHistory` is true, since we still need
 	// the wrapping behavior to be correct.
@@ -309,6 +313,7 @@ func (t *State) reset() {
 	t.bottom = t.rows - 1
 	t.mode = ModeWrap
 	t.clear(0, 0, t.cols-1, t.rows-1)
+	t.sealHistory()
 	t.moveTo(0, 0)
 	t.keyState.Reset()
 	t.altKeyState.Reset()
@@ -316,7 +321,7 @@ func (t *State) reset() {
 
 // TODO: definitely can improve allocs
 func (t *State) resize(size geom.Vec2) {
-	oldCols := t.cols
+	oldCols, oldRows := t.cols, t.rows
 	cols := size.C
 	rows := size.R
 	if cols == t.cols && rows == t.rows {
@@ -345,6 +350,7 @@ func (t *State) resize(size geom.Vec2) {
 		rows--
 	}
 
+	unwound := size.R - rows // screen rows just pushed into history above
 	rows = size.R
 
 	tabs := t.tabs
@@ -385,6 +391,48 @@ func (t *State) resize(size geom.Vec2) {
 		}
 
 		newLines, newCursor, cursorValid := reflow(oldScreen, oldCursor, cols)
+
+		// Growing: pull rows back from the end of history, like tmux — at
+		// most the rows gained, never past the clear boundary. A line taller
+		// than what's left is split: its tail comes back, its head stays.
+		if rows > oldRows && !t.disableHistory {
+			offset, floor := t.historyOffset, &t.pullFloor
+			if IsAltMode(t.mode) {
+				offset, floor = t.altHistoryOffset, &t.altPullFloor
+			}
+			curR := oldCursor.R
+			if cursorValid {
+				curR = newCursor.R
+			}
+			budget := min(rows-oldRows+unwound, rows-max(len(newLines), curR+1))
+			var pulled []Line
+			// A wrapped tail continues onto the saved screen (only possible
+			// in alt mode, where the pre-loop above doesn't run): leave it.
+			for len(pulled) < budget && len(newHistory) > 0 && !isWrappedLines(newHistory) &&
+				offset+len(newHistory) > *floor {
+				last := newHistory[len(newHistory)-1]
+				lineRows, starts := historyRows(last, cols)
+				if len(lineRows) == 0 {
+					break // unwrappable (wide glyph in a 1-col pane)
+				}
+				take := min(len(lineRows), budget-len(pulled))
+				pulled = append(lineRows[len(lineRows)-take:], pulled...)
+				if take == len(lineRows) {
+					newHistory = newHistory[:len(newHistory)-1]
+					continue
+				}
+				head := copyLine(last[:starts[len(lineRows)-take]])
+				head[len(head)-1].Mode |= attrWrap
+				newHistory[len(newHistory)-1] = head
+			}
+			if len(pulled) > 0 {
+				newLines = append(pulled, newLines...)
+				if !cursorValid {
+					newCursor, cursorValid = oldCursor, true
+				}
+				newCursor.R += len(pulled)
+			}
+		}
 
 		numExtra := max(len(newLines)-rows, 0)
 		if numExtra > 0 {
@@ -512,6 +560,7 @@ func (t *State) swapScreen() {
 	t.screen, t.altScreen = t.altScreen, t.screen
 	t.history, t.altHistory = t.altHistory, t.history
 	t.historyOffset, t.altHistoryOffset = t.altHistoryOffset, t.historyOffset
+	t.pullFloor, t.altPullFloor = t.altPullFloor, t.pullFloor
 	t.wrapped, t.altWrapped = t.altWrapped, t.wrapped
 	t.keyState, t.altKeyState = t.altKeyState, t.keyState
 	t.mode ^= ModeAltScreen
@@ -570,6 +619,38 @@ func (t *State) clearHistory() {
 	t.altHistory = nil
 	t.historyOffset = 0
 	t.altHistoryOffset = 0
+	t.pullFloor = 0
+	t.altPullFloor = 0
+}
+
+// pushScreenToHistory saves the screen's used rows (down to the last
+// non-blank one) into history before an ED 2 wipes them — tmux's
+// scroll-on-clear. The primary screen only; the alt screen has no history.
+func (t *State) pushScreenToHistory() {
+	if IsAltMode(t.mode) || t.disableHistory {
+		return
+	}
+	last := -1
+	for i, line := range t.screen {
+		if line.Length() > 0 {
+			last = i
+		}
+	}
+	for i := 0; i <= last; i++ {
+		t.history = appendWrapped(t.history, t.screen[i])
+	}
+	// The pushed text ends here; a wrap flag would glue the next line on.
+	if isWrappedLines(t.history) {
+		tail := t.history[len(t.history)-1]
+		tail[len(tail)-1].Mode &^= attrWrap
+	}
+	t.pruneHistory()
+}
+
+// sealHistory makes the active buffer's current history unpullable (ED 2,
+// RIS): growing the screen afterwards must not drag cleared output back.
+func (t *State) sealHistory() {
+	t.pullFloor = t.historyOffset + len(t.history)
 }
 
 func (t *State) pruneHistory() {
