@@ -44,7 +44,7 @@ func TestExtendedKeysRuntimeEnable(t *testing.T) {
 	// Toggle the option on at runtime; the client reconciles (reload hook and/or
 	// the ensuing Layout). Without either, the outer terminal would stay legacy.
 	c.Prefix(":")
-	c.WaitForStatus("(:")
+	c.WaitForText("─ commands ─") // the command palette is open
 	c.TypeLine("set-option extended-keys on")
 	c.WaitForRaw(kittyEnableSeq)
 }

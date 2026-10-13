@@ -37,9 +37,9 @@ func TestKillSessionUnderFlood(t *testing.T) {
 // there kills the session; a clean run leaves the session alive on window 2.
 func TestKillWindowUnderFlood(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Prefix("c") // second window so the session survives killing the first
-	c.WaitForStatus("2:")
+	c.WaitForStatus(" 2 ")
 	c.Prefix("p") // back to window 1
 	c.WaitFor(func(s *harness.Screen) bool { return s.ActiveWindow() == 1 })
 

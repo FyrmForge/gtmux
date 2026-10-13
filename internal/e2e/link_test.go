@@ -56,7 +56,7 @@ func TestLinkWindowKillPropagates(t *testing.T) {
 	c.WaitForStatus("default")
 	c.WaitFor(func(s *harness.Screen) bool { return s.Row(0).String() != "" })
 	c.Prefix("c") // a second window in default so killing the shared one leaves it alive
-	c.WaitForStatus("2:")
+	c.WaitForStatus(" 2 ")
 	c.Prefix("p")
 	c.WaitFor(func(s *harness.Screen) bool { return s.ActiveWindow() == 1 })
 	c.TypeLine("echo LINKME; while true; do sleep 1; done")

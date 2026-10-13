@@ -302,12 +302,13 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 	// locally (client-owned copy-mode) instead of forwarding them to the server.
 	var compMu sync.Mutex
 	var comp *compositor
-	// On exit, restore the outer terminal's title if set-titles pushed one, and
-	// pop any extended-keys kitty entry we pushed.
+	// On exit, restore the outer terminal's title if set-titles pushed one, pop
+	// any extended-keys kitty entry we pushed, and undo the finder's bar cursor.
 	defer func() {
 		if comp != nil {
 			os.Stdout.Write(comp.restoreTitle())
 			os.Stdout.Write(comp.restoreKitty())
+			os.Stdout.Write(comp.restoreCursor())
 		}
 	}()
 
@@ -503,6 +504,14 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 			compMu.Lock()
 			if comp != nil {
 				os.Stdout.Write(comp.openFlowPrompt(action))
+			}
+			compMu.Unlock()
+		case len(action) == 1 && action[0] == "choose-window":
+			// Client-owned picker (built from the mirrored window list), not a
+			// server command — reachable by name from the command palette.
+			compMu.Lock()
+			if comp != nil {
+				os.Stdout.Write(comp.openLocal("choose-window"))
 			}
 			compMu.Unlock()
 		case len(action) > 0 && action[0] == "display-menu":
@@ -1236,6 +1245,7 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 		compMu.Lock()
 		if comp != nil {
 			os.Stdout.Write(comp.restoreKitty())
+			os.Stdout.Write(comp.restoreCursor())
 		}
 		comp = newCompositor()
 		comp.cfg = cliCfg

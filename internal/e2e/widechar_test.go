@@ -20,7 +20,7 @@ import (
 // this asserts on where the border really lands, not on the compositor's intent.
 func TestWideRuneDoesNotShiftBorder(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.WaitFor(func(s *harness.Screen) bool { return s.Row(0).String() != "" })
 
 	// Two side-by-side panes; the divider's column is the thing under test.

@@ -31,7 +31,7 @@ func TestBreakPaneUnderFlood(t *testing.T) {
 	c.Prefix("!")
 
 	// The flooding pane is now window 2 and must render there live.
-	c.WaitForStatus("2:")
+	c.WaitForStatus(" 2 ")
 	c.WaitForText("FLOOD")
 }
 
@@ -52,7 +52,7 @@ func TestBreakThenKillOrigin(t *testing.T) {
 	c.TypeLine("i=0; while true; do echo FLOOD$i; i=$((i+1)); done")
 	c.WaitForText("FLOOD1")
 	c.Prefix("!") // break the flooding pane into window 2 (origin = window 1)
-	c.WaitForStatus("2:")
+	c.WaitForStatus(" 2 ")
 
 	// Back to window 1 (still has the other pane, and relays the moved one).
 	c.Prefix("p")

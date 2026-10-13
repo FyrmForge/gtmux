@@ -54,6 +54,10 @@ type compositor struct {
 	locked  bool          // lock overlay (unlocks on any key, or on the configured password)
 	lockBuf []byte        // typed password so far while locked (never rendered)
 
+	// barCursor: emit last switched the terminal cursor to a blinking bar
+	// (finder input), so the next emit without a finder restores the default.
+	barCursor bool
+
 	// expander expands #{...} formats for status components that call
 	// gtmux.expand() (via the client's Expand hook); it also serves #client/
 	// #server shell caching.
@@ -935,6 +939,12 @@ func (c *compositor) activeCursor() (row, col int, visible bool) {
 			return r + off, col, c.popup.cursorVisible && inContent(r) && col >= 0 && col < c.cols()
 		}
 	}
+	// The finder's input owns the cursor: after the query, in the top box.
+	if c.picker != nil && c.picker.finder() {
+		g := c.findGeometry()
+		col := g.inLeft + 4 + min(len([]rune(c.picker.filter)), g.inW-12) // already physical
+		return g.top + 1 + off, col, col < c.cols()
+	}
 	// A preview is someone else's screen: a live cursor blinking over it points
 	// at nothing. Checked after the popup, which owns the cursor when it's up.
 	if c.preview != nil {
@@ -1526,9 +1536,31 @@ func (c *compositor) emit(dirty map[int]bool) []byte {
 	if row, col, visible := c.activeCursor(); visible {
 		fmt.Fprintf(&b, "\x1b[%d;%dH\x1b[?25h", row+1, col+1)
 	}
+	// Blinking bar while the finder's input has the cursor; back to the
+	// terminal's default shape (DECSCUSR 0) when it closes. Pane apps' own
+	// cursor shapes aren't forwarded, so default is what was there before.
+	if bar := c.picker != nil && c.picker.finder(); bar != c.barCursor {
+		c.barCursor = bar
+		if bar {
+			b.WriteString("\x1b[5 q")
+		} else {
+			b.WriteString("\x1b[0 q")
+		}
+	}
 
 	b.WriteString("\x1b[?2026l")
 	return []byte(b.String())
+}
+
+// restoreCursor puts the terminal cursor back to its default shape if the
+// finder left it a blinking bar — on exit and on a session-switch reconnect
+// (the fresh compositor doesn't know the old one set it).
+func (c *compositor) restoreCursor() []byte {
+	if !c.barCursor {
+		return nil
+	}
+	c.barCursor = false
+	return []byte("\x1b[0 q")
 }
 
 // buildRow composites one physical row: the status bar, or borders + pane
@@ -1750,7 +1782,7 @@ func (c *compositor) composeOverlays(line emu.Line, row int) emu.Line {
 	for _, w := range c.overlays {
 		w.paintRow(row, c.contentCols(), line)
 	}
-	if c.picker != nil {
+	if c.picker != nil && !c.picker.finder() { // the finder paints over the docks, below
 		c.overlayRow(row, line)
 	}
 	if c.popup != nil {
@@ -1790,7 +1822,11 @@ func (c *compositor) composeOverlays(line emu.Line, row int) emu.Line {
 		}
 	}
 
-	return c.composeContentRow(line, row)
+	phys := c.composeContentRow(line, row)
+	if c.picker != nil && c.picker.finder() {
+		c.overlayRowFind(row, phys)
+	}
+	return phys
 }
 
 // composeContentRow wraps a content-width row (window content drawn in
@@ -2409,6 +2445,245 @@ func (c *compositor) overlayRowSplit(row int, line emu.Line) {
 	}
 }
 
+// finder reports whether the picker gets the finder layout (find-session,
+// choose-tree): a centered input box on top, list and preview boxes below.
+func (p *picker) finder() bool { return p.filterable && (len(p.previews) > 0 || p.palette != nil) }
+
+// findGeom is the finder panel's geometry: rows in window coordinates, columns
+// PHYSICAL (it spans the whole terminal width, over any left/right docks) — the
+// panel rect, the centered input box's left edge and width, the list box's
+// left edge (panel-relative) and width, and whether there's a preview box.
+type findGeom struct {
+	top, left, w, h, inLeft, inW, listL, listW int
+	preview                                    bool
+}
+
+// Finder sizing: full height, but a centered width that grows with the
+// terminal up to a cap instead of stretching edge to edge; the preview drops
+// out when narrow.
+const (
+	findMaxW       = 120 // panel width cap
+	findPreviewMin = 64  // narrower panel: list only, full width
+	paletteRows    = 14  // command palette: list rows under the input (telescope)
+)
+
+func (c *compositor) findGeometry() findGeom {
+	W, H := c.cols(), c.layout.Rows
+	g := findGeom{w: min(W-4, findMaxW), h: H - 2}
+	if g.w < 30 {
+		g.w = W
+	}
+	if g.h < 8 {
+		g.h = H
+	}
+	g.left, g.top = (W-g.w)/2, (H-g.h)/2
+	g.inW = min(g.w, max(40, min(64, g.w/2)))
+	g.inLeft = g.left + (g.w-g.inW)/2
+	if c.picker.palette != nil {
+		// Telescope: the list hangs under the input, same width, fixed height
+		// (doesn't jump while filtering); the input sits where the finder's does.
+		g.listL, g.listW = g.inLeft-g.left, g.inW
+		g.h = min(g.h, 3+paletteRows+2)
+		return g
+	}
+	g.preview = g.w >= findPreviewMin
+	if !g.preview {
+		g.listW = g.w
+		return g
+	}
+	lw := 0
+	for _, it := range c.picker.items {
+		lw = max(lw, len([]rune(it)))
+	}
+	g.listW = max(16, min(lw+5, 36, g.w*2/5)) // 2 border + pad + marker + text + pad
+	return g
+}
+
+// overlayRowFind paints one row of the finder panel (find-session /
+// choose-tree; the command palette is the same input box with its list hung
+// underneath at input width, no preview — see findGeometry):
+//
+//	        ╭──── find session ────╮
+//	        │ ❯ query▏        3/10 │
+//	        ╰──────────────────────╯
+//	╭─ session ───╮╭─ preview ──────────╮
+//	│ ▌match      ││ pane content       │
+//	╰─────────────╯╰────────────────────╯
+//
+// Borders are dim, the input box takes the accent (active border colour),
+// matched letters are accent+bold, and the selection gets a ▌ and a lifted bg.
+// The real terminal cursor blinks in the input (activeCursor / emit).
+func (c *compositor) overlayRowFind(row int, line emu.Line) {
+	pk := c.picker
+	g := c.findGeometry()
+	r := row - g.top
+	if r < 0 || r >= g.h {
+		return
+	}
+	accent, dim := c.cfg.ActiveBorderFG, emu.DarkGrey
+	selBG := emu.XTermColor(236)
+	cells := make([]emu.Glyph, g.w)
+	for i := range cells {
+		cells[i] = emu.Glyph{Char: ' ', FG: emu.DefaultFG, BG: emu.DefaultBG}
+	}
+	put := func(x int, rs []rune, fg emu.Color, mode int16) int {
+		for _, ch := range rs {
+			if x >= 0 && x < g.w {
+				cells[x] = emu.Glyph{Char: ch, FG: fg, BG: emu.DefaultBG, Mode: mode}
+			}
+			x++
+		}
+		return x
+	}
+	// edge draws a box's top/bottom border over [x0, x1] with an optional
+	// title riding it ("╭─ title ───╮").
+	edge := func(x0, x1 int, l, rr rune, title string, fg, tfg emu.Color, center bool) {
+		put(x0, []rune{l}, fg, 0)
+		for x := x0 + 1; x < x1; x++ {
+			put(x, []rune{'─'}, fg, 0)
+		}
+		put(x1, []rune{rr}, fg, 0)
+		if title == "" {
+			return
+		}
+		t := []rune(" " + title + " ")
+		if room := x1 - x0 - 3; len(t) > room {
+			t = t[:max(0, room)]
+		}
+		tx := x0 + 2
+		if center {
+			tx = x0 + (x1-x0+1-len(t))/2
+		}
+		put(tx, t, tfg, emu.AttrBold)
+	}
+
+	view := pk.view()
+	inL, inR := g.inLeft-g.left, g.inLeft-g.left+g.inW-1
+	switch {
+	case r == 0:
+		edge(inL, inR, '╭', '╮', pk.title, accent, accent, true)
+	case r == 1:
+		put(inL, []rune{'│'}, accent, 0)
+		put(inR, []rune{'│'}, accent, 0)
+		x := put(inL+2, []rune("❯ "), accent, emu.AttrBold)
+		count := []rune(fmt.Sprintf("%d/%d", len(view), len(pk.items)))
+		q := []rune(pk.filter)
+		if room := inR - 2 - len(count) - 1 - x; len(q) > room {
+			q = q[len(q)-max(0, room):] // keep the tail you're typing visible
+		}
+		put(x, q, emu.DefaultFG, emu.AttrBold)
+		put(inR-1-len(count), count, dim, 0)
+	case r == 2:
+		edge(inL, inR, '╰', '╯', "", accent, accent, false)
+	default:
+		lr, lh := r-3, g.h-3 // row within the list/preview boxes
+		lx0, lx1, rx0, rx1 := g.listL, g.listL+g.listW-1, g.listW, g.w-1
+		previewTitle := "preview"
+		var preview []emu.Line
+		if g.preview && pk.sel >= 0 && pk.sel < len(view) {
+			preview = pk.previews[view[pk.sel]]
+			previewTitle = strings.TrimSpace(pk.items[view[pk.sel]])
+		}
+		switch {
+		case lr == 0:
+			lt := pk.title
+			if f := strings.Fields(lt); len(f) > 0 {
+				lt = f[len(f)-1]
+			}
+			if pk.palette != nil {
+				lt = pk.palette.listTitle()
+			}
+			edge(lx0, lx1, '╭', '╮', lt, dim, emu.White, false)
+			if g.preview {
+				edge(rx0, rx1, '╭', '╮', previewTitle, dim, emu.White, false)
+			}
+		case lr == lh-1:
+			edge(lx0, lx1, '╰', '╯', "", dim, dim, false)
+			if g.preview {
+				edge(rx0, rx1, '╰', '╯', "", dim, dim, false)
+			}
+		default:
+			put(lx0, []rune{'│'}, dim, 0)
+			put(lx1, []rune{'│'}, dim, 0)
+			if g.preview {
+				put(rx0, []rune{'│'}, dim, 0)
+				put(rx1, []rune{'│'}, dim, 0)
+			}
+			i, inner := lr-1, lh-2
+			scroll := max(0, pk.sel-(inner-1)) // keep the selection on screen
+			if i == 0 && len(view) == 0 && pk.palette != nil && strings.TrimSpace(pk.query()) != "" {
+				// Nothing to pick: Enter runs the line as typed — say so.
+				put(lx0+3, []rune("↵ run: "+pk.filter), dim, 0)
+			}
+			// Description column (palette): starts past the longest item name.
+			descX := lx1
+			if pk.descs != nil {
+				nw := 0
+				for _, it := range pk.items {
+					nw = max(nw, len([]rune(it)))
+				}
+				descX = lx0 + 3 + nw + 3
+			}
+			if vi := i + scroll; vi < len(view) {
+				oi := view[vi]
+				sel := vi == pk.sel
+				bg := emu.DefaultBG
+				if sel {
+					bg = selBG
+					put(lx0+1, []rune{'▌'}, accent, 0)
+				}
+				hit := map[int]bool{}
+				pos, _ := matchPos(pk.query(), pk.items[oi])
+				for _, p := range pos {
+					hit[p] = true
+				}
+				text := []rune(pk.items[oi])
+				var desc []rune
+				if pk.descs != nil {
+					desc = []rune(pk.descs[oi])
+				}
+				for x := lx0 + 2; x < lx1; x++ {
+					gl := emu.Glyph{Char: ' ', FG: emu.DefaultFG, BG: bg}
+					if sel {
+						gl.FG, gl.Mode = emu.White, emu.AttrBold
+					}
+					if j := x - lx0 - 3; j >= 0 && j < len(text) && x < lx1-1 {
+						gl.Char = text[j]
+						if hit[j] {
+							gl.FG, gl.Mode = accent, emu.AttrBold
+						}
+					} else if j := x - descX; j >= 0 && j < len(desc) && x < lx1-1 {
+						gl.Char, gl.FG, gl.Mode = desc[j], dim, 0
+					}
+					cells[x] = gl
+				}
+			}
+			// Preview: the pane's own glyphs (real colours), one cell of padding.
+			if g.preview && i < len(preview) {
+				ln, pw := preview[i], rx1-rx0-3
+				for x := 0; x < pw && x < len(ln); x++ {
+					gl := ln[x]
+					if gl.Char == 0 {
+						gl.Char = ' '
+					}
+					cells[rx0+2+x] = clipWide(gl, pw-x)
+				}
+			}
+		}
+	}
+	// Only the boxes are opaque: beside the narrower input box (rows 0-2) the
+	// window and docks behind stay visible.
+	x0, x1 := 0, g.w-1
+	if r < 3 || pk.palette != nil {
+		x0, x1 = inL, inR // the palette's list is input-width too
+	}
+	for x := x0; x <= x1; x++ {
+		if col := g.left + x; col >= 0 && col < len(line) {
+			line[col] = cells[x]
+		}
+	}
+}
+
 // mouseResult is what the client should do with a mouse event after the
 // compositor recognizes the gesture from its own Layout: dispatch string
 // actions (0-2), send a ResizeBorder / CopyDrag request, and/or forward the
@@ -2640,7 +2915,9 @@ func (c *compositor) editKeys() bool { return c.cfg.StatusKeys != "vi" }
 func (c *compositor) openLocal(kind string) []byte {
 	switch kind {
 	case "command-prompt":
-		c.prompt = newPrompt(&proto.OpenPrompt{Kind: "command"}, c.editKeys())
+		// The plain ":" line is the fuzzy command palette; parameterized
+		// command-prompt (-p/-I/template) still opens the classic prompt.
+		c.picker = newPalettePicker(c.paletteCands)
 	case "rename-window":
 		c.prompt = newPrompt(&proto.OpenPrompt{Kind: "window", Prefill: c.activeWindowName()}, c.editKeys())
 	case "rename-session":
@@ -2689,6 +2966,11 @@ func (c *compositor) openFlowPrompt(action []string) []byte {
 	}
 	if action[0] == "confirm-before" {
 		c.prompt = &prompt{kind: "confirm", labels: labels, cmd: tail}
+	} else if labels == nil && !hasTail {
+		// Plain command line (prefix+:): the fuzzy command palette, -I text
+		// prefilled. Labelled / templated prompts keep the classic prompt.
+		c.picker = newPalettePicker(c.paletteCands)
+		c.picker.palette.setFilter(c.picker, initial)
 	} else {
 		p := &prompt{kind: "command", labels: labels, buf: []byte(initial), editKeys: c.editKeys()}
 		if hasTail {
@@ -2857,6 +3139,47 @@ func (c *compositor) buildWindowPicker() *picker {
 		}
 	}
 	return newPicker(&proto.OpenPicker{Title: "choose window", Verb: "select-window", Items: items, Targets: targets})
+}
+
+// paletteCands supplies the command palette's stage-two candidates from state
+// the client already mirrors: sessions and panes from the snapshot, windows
+// from the status. items are what's shown, targets what's passed to the command.
+func (c *compositor) paletteCands(kind string) (items, targets []string) {
+	switch kind {
+	case "session":
+		if c.snapshot != nil {
+			for _, s := range c.snapshot.Sessions {
+				items, targets = append(items, s.Name), append(targets, s.Name)
+			}
+		}
+	case "window":
+		if c.status != nil {
+			for _, w := range c.status.Windows {
+				items = append(items, fmt.Sprintf("%d %s", w.Index, w.Name))
+				targets = append(targets, strconv.Itoa(w.Index))
+			}
+		}
+	case "pane":
+		if c.snapshot != nil && c.status != nil {
+			cur := c.status.Vars["session"]
+			for _, s := range c.snapshot.Sessions {
+				if s.Name != cur {
+					continue
+				}
+				for _, w := range s.Windows {
+					for _, p := range w.Panes {
+						items = append(items, fmt.Sprintf("%%%d %s (%d.%d %s)", p.ID, p.Command, w.Index, p.Number, w.Name))
+						targets = append(targets, fmt.Sprintf("%%%d", p.ID))
+					}
+				}
+			}
+		}
+	case "layout":
+		items, targets = paletteLayouts, paletteLayouts
+	case "option":
+		items, targets = paletteOptions, paletteOptions
+	}
+	return items, targets
 }
 
 // promptFeed drives a text-entry prompt from a chunk of local input, returning

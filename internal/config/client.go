@@ -1378,6 +1378,7 @@ func LoadClientWith(path string, overrides [][2]string) (ClientConfig, *ClientBi
 	reg("mark_pane", BindOp{Action: []string{"mark-pane"}})
 	reg("join_marked", BindOp{Action: []string{"join-marked"}})
 	reg("choose_session", BindOp{Action: []string{"choose-session"}})
+	reg("find_session", BindOp{Action: []string{"find-session"}})
 	reg("rename_session_prompt", BindOp{Local: "rename-session"})
 	reg("rename_window_prompt", BindOp{Local: "rename-window"})
 	reg("choose_window", BindOp{Local: "choose-window"})

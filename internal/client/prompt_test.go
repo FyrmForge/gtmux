@@ -129,3 +129,19 @@ func TestPromptEmacsEditing(t *testing.T) {
 		t.Fatalf("editKeys off: buf = %q, want unchanged", q.buf)
 	}
 }
+
+// TestPickerFuzzyFilter: substring hits come first, subsequence-only hits after,
+// non-matches drop; C-n moves within the filtered view and Enter commits it.
+func TestPickerFuzzyFilter(t *testing.T) {
+	p := &picker{verb: "switch-session", filterable: true,
+		items:   []string{"gtmux", "notes", "gt-x", "ffgx"},
+		targets: []string{"gtmux", "notes", "gt-x", "ffgx"}}
+	p.feed([]byte("gx"))
+	if got := p.view(); !reflect.DeepEqual(got, []int{3, 0, 2}) {
+		t.Fatalf("view = %v, want [3 0 2]", got)
+	}
+	r := p.feed([]byte("\x0e\r"))
+	if !reflect.DeepEqual(r.action, []string{"switch-session", "gtmux"}) {
+		t.Fatalf("action = %v", r.action)
+	}
+}

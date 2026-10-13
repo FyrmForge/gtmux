@@ -29,9 +29,9 @@ func TestSmokeEcho(t *testing.T) {
 // window, reflected in the status bar.
 func TestWindowCreate(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Prefix("c")
-	c.WaitForStatus("2:")
+	c.WaitForStatus(" 2 ")
 }
 
 // TestMultiClientDotFill covers window-size "latest" plus the dot-fill: a

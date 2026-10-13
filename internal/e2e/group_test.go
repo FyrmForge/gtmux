@@ -20,7 +20,7 @@ func TestSessionGroup(t *testing.T) {
 
 	// A second window in default so the snapshot carries more than one.
 	c.Prefix("c")
-	c.WaitForStatus("2:")
+	c.WaitForStatus(" 2 ")
 	c.Prefix("p")
 	c.WaitFor(func(s *harness.Screen) bool { return s.ActiveWindow() == 1 })
 
@@ -31,7 +31,7 @@ func TestSessionGroup(t *testing.T) {
 	// New session joined to default's group: it borrows default's windows.
 	grp := c.AttachGroup("grp", "default")
 	grp.WaitForStatus("grp")
-	grp.WaitForStatus("2:") // the snapshot carried default's second window too
+	grp.WaitForStatus(" 2 ") // the snapshot carried default's second window too
 
 	// grp shows the shared counter advancing — same live window, not a copy.
 	grp.WaitForText("GRP")

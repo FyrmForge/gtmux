@@ -1814,7 +1814,7 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string, re
 	// list and the client owns navigation, sending back {switch-session, name}
 	// as an Action on Enter. (choose-window is built client-side from the
 	// window list the client already mirrors — no server round-trip.)
-	chooseSession := func() {
+	chooseSession := func(filter bool) {
 		names := reg.names()
 		items := make([]string, len(names))
 		previews := make([][]emu.Line, len(names))
@@ -1827,7 +1827,11 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string, re
 			}
 			previews[i] = sessionPreview(n)
 		}
-		openPicker("choose session", "switch-session", false, items, names, previews, sel)
+		title := "choose session"
+		if filter {
+			title = "find session"
+		}
+		openPicker(title, "switch-session", filter, items, names, previews, sel)
 	}
 
 	// chooseTree opens a filterable session→window tree picker: each session is
@@ -3132,15 +3136,25 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string, re
 			refocus(prevFocus)
 			fireHook("after-select-pane")
 		case "display-message":
-			// display-message [-p] [-t target] <format> -> expand and return.
+			// display-message [-p] [-t target] <format>: expand it; -p returns it
+			// to the caller (scripting), otherwise it shows on the status line
+			// like tmux. The words after the flags are one message, not just the last.
 			tw, tp, twi, rest, _ := resolveTarget(args)
-			var fmtStr string
+			var words []string
+			toStdout := false
 			for _, a := range rest {
-				if a != "-p" {
-					fmtStr = a
+				if a == "-p" {
+					toStdout = true
+				} else {
+					words = append(words, a)
 				}
 			}
-			cmdOut = format.ExpandLoop(fmtStr, paneVars(tw, tp, twi), loopVars)
+			out := format.ExpandLoop(strings.Join(words, " "), paneVars(tw, tp, twi), loopVars)
+			if toStdout {
+				cmdOut = out
+			} else {
+				showMessage(out)
+			}
 		case "show-messages", "showmsgs", "server-messages":
 			// Dump the message log, newest first like tmux. -J/-T (job/terminal
 			// listings) not modeled — this session's status messages only.
@@ -3532,7 +3546,10 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string, re
 		case "join-pane", "move-pane":
 			joinPaneCmd(args)
 		case "choose-session":
-			chooseSession()
+			chooseSession(false)
+		case "find-session":
+			// choose-session with type-to-filter (fuzzy) instead of j/k nav.
+			chooseSession(true)
 		case "choose-tree":
 			filter := ""
 			for i := 0; i < len(args); i++ {
@@ -3680,9 +3697,10 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string, re
 			}
 		case "send-keys":
 			// -l sends args as literal text (no key-name lookup); -H treats each
-			// arg as a hex byte value; -t <target> is accepted and ignored (acts on
-			// the active pane). ponytail: -N count / -R reset deferred.
+			// arg as a hex byte value; -t <target> picks the pane (default the
+			// active one). ponytail: -N count / -R reset deferred.
 			literal, hexMode := false, false
+			dst := activeWindow().active
 			payload := args
 			for len(payload) > 0 && strings.HasPrefix(payload[0], "-") && payload[0] != "-" {
 				switch {
@@ -3691,7 +3709,11 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string, re
 				case payload[0] == "-H":
 					hexMode, payload = true, payload[1:]
 				case payload[0] == "-t" && len(payload) > 1:
-					payload = payload[2:]
+					_, _, p, ok := resolvePaneStr(payload[1])
+					if !ok { // never fall back to the active pane: keys would land somewhere unintended
+						return "send-keys: can't find pane: " + payload[1]
+					}
+					dst, payload = p, payload[2:]
 				default:
 					payload = payload[1:]
 				}
@@ -3710,7 +3732,7 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string, re
 				}
 			}
 			if len(out) > 0 {
-				activeWindow().active.pty.Write(out)
+				dst.pty.Write(out)
 			}
 		case "if-shell":
 			// if-shell shell-cmd then-cmd [else-cmd]: run shell-cmd, then run
@@ -4419,6 +4441,8 @@ func keyBytes(arg string) []byte {
 		return []byte{0x1b}
 	case "Space":
 		return []byte{' '}
+	case "BSpace":
+		return []byte{0x7f}
 	}
 	if len(arg) == 3 && arg[0] == 'C' && arg[1] == '-' {
 		return []byte{arg[2] & 0x1f}

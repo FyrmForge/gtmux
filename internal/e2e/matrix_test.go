@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 	"time"
 
 	"github.com/FyrmForge/gtmux/internal/emu"
@@ -69,7 +70,7 @@ func TestCopyModePrefixBinds(t *testing.T) {
 	c.WaitFor(func(s *harness.Screen) bool { return !strings.Contains(s.String(), "marker") })
 	c.Type("q") // quit copy-mode: its help line overlays the status row
 	// "2:zsh", not "2:" — the status clock (e.g. "22:34") contains "2:".
-	c.WaitForStatus("2:zsh")
+	c.WaitForStatus("2 zsh")
 }
 
 // TestCopyModeMouseFramed: mouse drag-select in copy-mode under framed borders.
@@ -310,7 +311,7 @@ func TestActivityActionNone(t *testing.T) {
 // typing a name and committing shows it in the status window list.
 func TestRenameWindow(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Prefix(",")
 	c.WaitForStatus("(rename-window") // prompt open before typing
 	// Prefilled with the current name; clear it, then type a new one.
@@ -318,7 +319,7 @@ func TestRenameWindow(t *testing.T) {
 		c.Key(0x7f) // backspace
 	}
 	c.TypeLine("mywin")
-	c.WaitForStatus("1:mywin")
+	c.WaitForStatus("1 mywin")
 }
 
 // TestCommandPromptMultiPrompt covers command-prompt -p "a,b": the overlay asks
@@ -327,13 +328,13 @@ func TestRenameWindow(t *testing.T) {
 func TestCommandPromptMultiPrompt(t *testing.T) {
 	lua := `gtmux.bind("m", function() gtmux.command_prompt("first,second", "", "rename-window %1%2") end)`
 	c := harness.StartWithConfig(t, lua, "")
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Prefix("m")
 	c.WaitForStatus("(first") // first stage label
 	c.TypeLine("alpha")
 	c.WaitForStatus("(second") // advanced to the second prompt
 	c.TypeLine("beta")
-	c.WaitForStatus("1:alphabeta") // template ran with both answers substituted
+	c.WaitForStatus("1 alphabeta") // template ran with both answers substituted
 }
 
 // TestRenameSession covers the client-owned rename-session prompt (prefix+$).
@@ -353,11 +354,11 @@ func TestRenameSession(t *testing.T) {
 // default fix: it selects the top window (1), not the current one (3).
 func TestChooseWindowDefault(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Prefix("c")
-	c.WaitForStatus("2:")
+	c.WaitForStatus(" 2 ")
 	c.Prefix("c")
-	c.WaitForStatus("3:")
+	c.WaitForStatus(" 3 ")
 	c.WaitFor(func(s *harness.Screen) bool { return s.ActiveWindow() == 3 })
 
 	c.Prefix("W") // choose-window moved to W (prefix+w is now choose-tree)
@@ -432,7 +433,7 @@ func TestRunShellClears(t *testing.T) {
 	c := harness.Start(t)
 	c.WaitForStatus("default")
 	c.Prefix(":")
-	c.WaitForStatus("(:") // command prompt open (client-owned) before typing
+	c.WaitForText("─ commands ─") // command palette open (client-owned) before typing
 	c.TypeLine("run-shell echo HELLO")
 	c.WaitForStatus("HELLO") // message shown
 	c.WaitForUntil(5*time.Second, func(s *harness.Screen) bool {
@@ -443,9 +444,9 @@ func TestRunShellClears(t *testing.T) {
 // TestCLIRunAndList covers the scripting subcommands against the daemon.
 func TestCLIRunAndList(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Run("run", "default", "new-window")
-	c.WaitForStatus("2:")
+	c.WaitForStatus(" 2 ")
 
 	if list := c.Run("list"); !strings.Contains(list, "default: 2 windows") {
 		t.Fatalf("list = %q, want to contain 'default: 2 windows'", list)
@@ -483,15 +484,15 @@ func TestMouseFocus(t *testing.T) {
 // from its own status mirror, no server-side hit-testing).
 func TestMouseSelectWindow(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Prefix("c") // create window 2, now active
-	c.WaitForStatus("2:")
+	c.WaitForStatus(" 2 ")
 	c.WaitFor(func(s *harness.Screen) bool { return s.ActiveWindow() == 2 })
 
 	status := string(c.Screen().Status())
-	col := strings.Index(status, "1:")
-	if col < 0 {
-		t.Fatalf("no '1:' label in status: %q", status)
+	col := runeIndex(status, " 1 ") + 1
+	if col < 1 {
+		t.Fatalf("no window 1 label in status: %q", status)
 	}
 	c.Click(col+1, 24) // status is the bottom row of the 80x24 client
 	c.WaitFor(func(s *harness.Screen) bool { return s.ActiveWindow() == 1 })
@@ -506,9 +507,9 @@ func TestMouseSelectWindow(t *testing.T) {
 // digit jumps straight to that window.
 func TestSelectWindowByIndex(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Prefix("c")
-	c.WaitForStatus("2:")
+	c.WaitForStatus(" 2 ")
 	c.WaitFor(func(s *harness.Screen) bool { return s.ActiveWindow() == 2 })
 	c.Prefix("1") // jump to window 1 by number
 	c.WaitFor(func(s *harness.Screen) bool { return s.ActiveWindow() == 1 })
@@ -571,7 +572,7 @@ func TestDisplayMessage(t *testing.T) {
 // frozen in the layout (window not destroyed) and respawn-pane revives it.
 func TestRemainOnExit(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Run("run", "default", "set-option", "remain-on-exit", "on")
 
 	c.TypeLine("exit")         // exit the only pane's shell
@@ -587,7 +588,7 @@ func TestRemainOnExit(t *testing.T) {
 // keeps the pane. Split first so the death doesn't end the session.
 func TestRemainOnExitFailed(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Prefix("%") // split; the new pane is active
 	c.Run("run", "default", "set-option", "remain-on-exit", "failed")
 	c.TypeLine("exit 5") // non-zero -> kept, with the code shown
@@ -598,7 +599,7 @@ func TestRemainOnExitFailed(t *testing.T) {
 // process closes the pane normally — the reap-then-close fall-through path.
 func TestRemainOnExitFailedClean(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Prefix("%") // split; the new pane is active, 2 panes total
 	c.WaitFor(func(*harness.Screen) bool {
 		return strings.Count(strings.TrimSpace(c.Run("run", "default", "list-panes")), "\n") == 1
@@ -645,7 +646,7 @@ func TestSynchronizePanes(t *testing.T) {
 // unbind-key removes it.
 func TestRuntimeBindKey(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 
 	c.Run("run", "default", "bind-key", "x", "new-window")
 	if out := c.Run("run", "default", "list-keys"); !strings.Contains(out, "bind-key -T prefix x new-window") {
@@ -657,7 +658,7 @@ func TestRuntimeBindKey(t *testing.T) {
 	c.Run("run", "default", "rename-window", "BINDMARK")
 	c.WaitForStatus("BINDMARK")
 	c.Prefix("x")
-	c.WaitForStatus("2:")
+	c.WaitForStatus(" 2 ")
 
 	// unbind-key removes the runtime bind (server record gone).
 	c.Run("run", "default", "unbind-key", "x")
@@ -745,7 +746,7 @@ func TestJoinPane(t *testing.T) {
 	c := harness.Start(t)
 	promptReady(c)
 	c.Prefix("c") // window 2 with its own pane; now the current window
-	c.WaitForStatus("2:")
+	c.WaitForStatus(" 2 ")
 	promptReady(c)
 
 	c.Run("run", "default", "join-pane", "-h", "-s", ":2", "-t", ":1")
@@ -826,9 +827,9 @@ func TestSelectPaneTargetByID(t *testing.T) {
 
 func TestSelectPaneTarget(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Prefix("c")
-	c.WaitForStatus("2:")
+	c.WaitForStatus(" 2 ")
 	c.WaitFor(func(s *harness.Screen) bool { return s.ActiveWindow() == 2 })
 
 	c.Run("run", "default", "select-pane", "-t", ":1")
@@ -839,11 +840,11 @@ func TestSelectPaneTarget(t *testing.T) {
 // its own window.
 func TestBreakPane(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Prefix("%") // 2 panes, still 1 window
 	c.WaitFor(func(s *harness.Screen) bool { return s.Col(3, '│') >= 0 })
 	c.Prefix("!") // break active pane out -> 2 windows
-	c.WaitForStatus("2:")
+	c.WaitForStatus(" 2 ")
 }
 
 // TestCapturePane covers capture-pane: the visible screen by default, and
@@ -870,7 +871,7 @@ func TestCapturePane(t *testing.T) {
 // returns to 2, and again to 3 (the pair swaps).
 func TestLastWindow(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Prefix("c")
 	c.WaitFor(func(s *harness.Screen) bool { return s.ActiveWindow() == 2 })
 	c.Prefix("c")
@@ -957,7 +958,7 @@ func mainVerticalWidth(c *harness.Client) int {
 // main_pane_width shrinks the main pane on the next main-vertical layout.
 func TestSetOptionMainPaneWidth(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Prefix("%")
 	c.WaitFor(func(s *harness.Screen) bool { return len(paneDimsWS(c)) == 2 })
 	c.Prefix("%")
@@ -979,11 +980,11 @@ func TestSetOptionMainPaneWidth(t *testing.T) {
 // index/name/relative and pane by index within a window.pane target.
 func TestTargetSyntaxWithinSession(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Prefix("c")
-	c.WaitForStatus("2:")
+	c.WaitForStatus(" 2 ")
 	c.Prefix("c")
-	c.WaitForStatus("3:") // active window is now 3
+	c.WaitForStatus(" 3 ") // active window is now 3
 
 	dm := func(tgt, f string) string {
 		return strings.TrimSpace(c.Run("run", "default", "display-message", "-t", tgt, "-p", f))
@@ -1008,7 +1009,7 @@ func TestTargetSyntaxWithinSession(t *testing.T) {
 		c.Key(0x7f)
 	}
 	c.TypeLine("named")
-	c.WaitForStatus("3:named")
+	c.WaitForStatus("3 named")
 	if got := dm("named", "#{window_index}"); got != "3" {
 		t.Errorf("-t named window_index = %q, want 3", got)
 	}
@@ -1041,7 +1042,7 @@ func TestTargetCrossSession(t *testing.T) {
 	// Mutation: give work a 2nd window (active), then switch it back to window 1
 	// from default's client via a cross-session select-pane, and confirm it took.
 	peer.Run("run", "work", "new-window")
-	peer.WaitForStatus("2:")
+	peer.WaitForStatus(" 2 ")
 	c.Run("run", "default", "select-pane", "-t", "work:1")
 	peer.WaitFor(func(s *harness.Screen) bool { return s.ActiveWindow() == 1 })
 }
@@ -1051,21 +1052,21 @@ func TestTargetCrossSession(t *testing.T) {
 // reader from before the respawn is dropped, not applied as a teardown).
 func TestRespawnPane(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Run("run", "default", "respawn-pane", "echo RESPAWNEDOK; sleep 3")
 	c.WaitForText("RESPAWNEDOK")
 	// Session still alive: status bar still shows the window.
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 }
 
 // TestSetEnvironment: a var set via set-environment is present in panes spawned
 // afterward.
 func TestSetEnvironment(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Run("run", "default", "set-environment", "GTMUXTEST", "envok123")
 	c.Prefix("c") // new window inherits the session env
-	c.WaitForStatus("2:")
+	c.WaitForStatus(" 2 ")
 	c.TypeLine("echo E=$GTMUXTEST")
 	c.WaitForText("E=envok123")
 }
@@ -1074,13 +1075,13 @@ func TestSetEnvironment(t *testing.T) {
 // shows under show-environment -g.
 func TestSetEnvironmentGlobal(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Run("run", "default", "set-environment", "-g", "GTMUXGLOBAL", "globalok")
 	if s := c.Run("run", "default", "show-environment", "-g"); !strings.Contains(s, "GTMUXGLOBAL=globalok") {
 		t.Errorf("show-environment -g = %q, want GTMUXGLOBAL=globalok", s)
 	}
 	c.Prefix("c") // new window's pane inherits the global env
-	c.WaitForStatus("2:")
+	c.WaitForStatus(" 2 ")
 	c.TypeLine("echo G=$GTMUXGLOBAL")
 	c.WaitForText("G=globalok")
 }
@@ -1089,7 +1090,7 @@ func TestSetEnvironmentGlobal(t *testing.T) {
 // retrievable via show-buffer (the inverse of save-buffer).
 func TestLoadBuffer(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	path := filepath.Join(t.TempDir(), "buf.txt")
 	if err := os.WriteFile(path, []byte("LOADEDCONTENT"), 0644); err != nil {
 		t.Fatal(err)
@@ -1104,9 +1105,9 @@ func TestLoadBuffer(t *testing.T) {
 // reach the pane; a normal peer's input still does.
 func TestAttachReadOnly(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	ro := c.NewPeerReadOnly(80, 24)
-	ro.WaitForStatus("1:") // read-only client still receives renders
+	ro.WaitForStatus(" 1 ") // read-only client still receives renders
 
 	ro.TypeLine("echo FROMRO") // must be dropped server-side
 	c.TypeLine("echo FROMRW")  // read-write input reaches the shell
@@ -1121,7 +1122,7 @@ func TestAttachReadOnly(t *testing.T) {
 // recorded in the per-session log that show-messages prints.
 func TestShowMessages(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Run("run", "default", "run-shell", "echo LOGGEDMSG")
 	c.WaitForStatus("LOGGEDMSG") // shown => logged
 	if out := c.Run("run", "default", "show-messages"); !strings.Contains(out, "LOGGEDMSG") {
@@ -1132,7 +1133,7 @@ func TestShowMessages(t *testing.T) {
 // TestSetBufferAppend: set-buffer -a concatenates onto the existing buffer.
 func TestSetBufferAppend(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Run("run", "default", "set-buffer", "-b", "ab", "foo")
 	c.Run("run", "default", "set-buffer", "-a", "-b", "ab", "bar")
 	if s := strings.TrimSpace(c.Run("run", "default", "show-buffer", "-b", "ab")); s != "foobar" {
@@ -1144,7 +1145,7 @@ func TestSetBufferAppend(t *testing.T) {
 // accepting tmux's hyphenated names.
 func TestShowOptions(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Run("run", "default", "set-option", "main-pane-width", "123")
 	if s := strings.TrimSpace(c.Run("run", "default", "show-options", "-v", "main-pane-width")); s != "123" {
 		t.Errorf("show-options -v main-pane-width = %q, want 123", s)
@@ -1164,7 +1165,7 @@ func TestShowOptions(t *testing.T) {
 // visible via #{window_width} in list-windows.
 func TestResizeWindow(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Run("run", "default", "set-option", "window-size", "manual")
 	c.Run("run", "default", "resize-window", "-x", "50")
 	if s := strings.TrimSpace(c.Run("run", "default", "list-windows", "-F", "#{window_width}")); s != "50" {
@@ -1178,7 +1179,7 @@ func TestResizeWindow(t *testing.T) {
 func TestBaseIndex(t *testing.T) {
 	serverLua := "gtmux.set_option(\"base_index\", 5)\ngtmux.set_option(\"pane_base_index\", 3)"
 	c := harness.StartWithConfig(t, "", serverLua)
-	c.WaitForStatus("5:") // first window numbered from base-index 5
+	c.WaitForStatus(" 5 ") // first window numbered from base-index 5
 	if s := strings.TrimSpace(c.Run("run", "default", "list-windows", "-F", "#{window_index}")); s != "5" {
 		t.Errorf("window_index = %q, want 5", s)
 	}
@@ -1186,7 +1187,7 @@ func TestBaseIndex(t *testing.T) {
 		t.Errorf("pane_index = %q, want 3", s)
 	}
 	c.Prefix("c")
-	c.WaitForStatus("6:") // second window is 6
+	c.WaitForStatus(" 6 ") // second window is 6
 	// Target the first window by its offset display index.
 	c.Run("run", "default", "select-window", "-t", ":5")
 	c.WaitFor(func(s *harness.Screen) bool { return s.ActiveWindow() == 5 })
@@ -1218,7 +1219,7 @@ func TestBaseIndex(t *testing.T) {
 func TestWindowNaming(t *testing.T) {
 	c := harness.Start(t)
 	promptReady(c)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 
 	// automatic-rename-format: the live auto name gains the "-auto" suffix.
 	c.Run("run", "default", "set-option", "automatic-rename-format", "#{pane_command}-auto")
@@ -1242,29 +1243,39 @@ func TestWindowNaming(t *testing.T) {
 // component (default: "index:name" + flags), so those content options are gone;
 // reshape by editing the component.
 
+// runeIndex is strings.Index in cells (runes), not bytes: the bar's ● and ·
+// are multi-byte, so a byte offset would click the wrong column.
+func runeIndex(s, sub string) int {
+	i := strings.Index(s, sub)
+	if i < 0 {
+		return -1
+	}
+	return utf8.RuneCountInString(s[:i])
+}
+
 // TestStatusPosition covers status-position top: the bar moves to the top row,
 // and a click on a window label there still selects it (the client offsets the
 // mouse Y it forwards, and resolveMouse uses the recorded click spans).
 func TestStatusPosition(t *testing.T) {
 	lua := `gtmux.options.status_position = "top"`
 	c := harness.StartWithConfig(t, lua, "")
-	c.WaitFor(func(s *harness.Screen) bool { return strings.Contains(s.Row(0).String(), "1:") })
-	if strings.Contains(c.Screen().Status().String(), "1:") {
+	c.WaitFor(func(s *harness.Screen) bool { return strings.Contains(s.Row(0).String(), " 1 ") })
+	if strings.Contains(c.Screen().Status().String(), " 1 ") {
 		t.Error("window list must not be on the bottom row when status-position=top")
 	}
 	c.Prefix("c")
-	c.WaitFor(func(s *harness.Screen) bool { return strings.Contains(s.Row(0).String(), "2:") })
+	c.WaitFor(func(s *harness.Screen) bool { return strings.Contains(s.Row(0).String(), " 2 ") })
 
 	// Click window 1's label on the top row; the active green marker moves to it.
 	row0 := c.Screen().Row(0).String()
-	col := strings.Index(row0, "1:")
-	if col < 0 {
-		t.Fatalf("no '1:' label on the top row: %q", row0)
+	col := runeIndex(row0, " 1 ") + 1
+	if col < 1 {
+		t.Fatalf("no window 1 label on the top row: %q", row0)
 	}
 	c.Click(col+1, 1)
 	c.WaitFor(func(s *harness.Screen) bool {
 		for x := 0; x < 80; x++ {
-			if g := s.Cell(0, x); g.BG == emu.Green && g.Char == '1' {
+			if g := s.Cell(0, x); g.FG == emu.Green && g.Mode&emu.AttrBold != 0 && g.Char == '1' {
 				return true
 			}
 		}
@@ -1276,9 +1287,9 @@ func TestStatusPosition(t *testing.T) {
 // one window doesn't touch the other windows or the session default.
 func TestWindowOptionScope(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Prefix("c")
-	c.WaitForStatus("2:")
+	c.WaitForStatus(" 2 ")
 
 	c.Run("run", "default", "setw", "-t", ":1", "automatic-rename", "off")
 	if s := strings.TrimSpace(c.Run("run", "default", "show-window-options", "-t", ":1", "-v", "automatic-rename")); s != "off" {
@@ -1296,7 +1307,7 @@ func TestWindowOptionScope(t *testing.T) {
 // and a comparison used inside a conditional, via display-message.
 func TestFormatOperators(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	if s := strings.TrimSpace(c.Run("run", "default", "display-message", "-p", "#{e:6*7}")); s != "42" {
 		t.Errorf("#{e:6*7} = %q, want 42", s)
 	}
@@ -1317,7 +1328,7 @@ func TestFormatOperators(t *testing.T) {
 // command-alias (a command name resolved to its expansion at dispatch).
 func TestUserOptionsAndAlias(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Run("run", "default", "set-option", "-g", "@greeting", "howdy")
 	if s := strings.TrimSpace(c.Run("run", "default", "display-message", "-p", "#{@greeting}")); s != "howdy" {
 		t.Errorf("#{@greeting} = %q, want howdy", s)
@@ -1346,10 +1357,10 @@ gtmux.bind("g", function() gtmux.key_table("demo") end)
 gtmux.bind_table("demo", "n", function() gtmux.new_window() end)
 `
 	c := harness.StartWithConfig(t, lua, "")
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Prefix("g") // enter the custom "demo" table
 	c.Key('n')    // resolved from "demo" -> new-window
-	c.WaitForStatus("2:")
+	c.WaitForStatus(" 2 ")
 	// The table is one-shot: a bare 'n' now types into the shell, not a bind
 	// (if it re-fired the table we'd get window 3).
 	promptReady(c)
@@ -1366,7 +1377,7 @@ gtmux.bind_table("demo", "n", function() gtmux.new_window() end)
 // last client detaches.
 func TestDestroyUnattached(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Run("run", "default", "set-option", "-g", "destroy-unattached", "on")
 	c.Run("run", "default", "detach")
 	deadline := time.Now().Add(10 * time.Second)
@@ -1437,13 +1448,13 @@ func TestMonitorActivity(t *testing.T) {
 		t.Fatal("monitor-activity: window 1 activity flag not set after background output")
 	}
 	// visual-activity flashes a message (which transiently replaces the window
-	// list), then once it clears the flag shows as # on the non-current window.
+	// list), then once it clears the flag shows as a red • on the non-current window.
 	c.WaitForStatus("activity in window 1")
-	c.WaitForUntil(6*time.Second, func(s *harness.Screen) bool { return strings.Contains(s.Status().String(), "#") })
+	c.WaitForUntil(6*time.Second, func(s *harness.Screen) bool { return strings.Contains(s.Status().String(), "•") })
 }
 
 // TestMonitorSilence: a window with no output for the monitor-silence interval,
-// while non-current, raises the silence flag (~) and a visual message.
+// while non-current, raises the silence flag (~, a red • in the bar) and a visual message.
 func TestMonitorSilence(t *testing.T) {
 	c := harness.Start(t)
 	promptReady(c)
@@ -1461,7 +1472,7 @@ func TestMonitorSilence(t *testing.T) {
 	// (its post-trigger prompt redraw), so the default 2s WaitFor can't win the
 	// race — give the alert real headroom past the interval.
 	c.WaitForUntil(6*time.Second, func(s *harness.Screen) bool { return s.Status().Has("silence in window 1") })
-	c.WaitFor(func(s *harness.Screen) bool { return strings.Contains(s.Status().String(), "~") })
+	c.WaitFor(func(s *harness.Screen) bool { return strings.Contains(s.Status().String(), "•") })
 }
 
 // TestCapturePaneDepth covers capture-pane -e (keep SGR escapes) and -J (join a
@@ -1502,9 +1513,9 @@ func TestPaneBorderStatus(t *testing.T) {
 // (server-side expansion, where the windows/panes/sessions live).
 func TestFormatLoops(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Run("run", "default", "new-window")
-	c.WaitForStatus("2:")
+	c.WaitForStatus(" 2 ")
 	if s := strings.TrimSpace(c.Run("run", "default", "display-message", "-p", "#{W:#{window_index}:#{window_name} }")); s != "1:zsh 2:zsh" {
 		t.Errorf("#{W:} = %q, want '1:zsh 2:zsh'", s)
 	}
@@ -1521,7 +1532,7 @@ func TestFormatLoops(t *testing.T) {
 // waiter) and lock/unlock (-L blocks while held, -U releases it).
 func TestWaitFor(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 
 	// signal/wait: the waiter blocks until -S.
 	woke := make(chan struct{})
@@ -1568,9 +1579,9 @@ func TestHookSessionCreated(t *testing.T) {
 // killed (the surviving window gets renamed by the hook).
 func TestHookAfterKillWindow(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Prefix("c")
-	c.WaitForStatus("2:")
+	c.WaitForStatus(" 2 ")
 	c.Run("run", "default", "set-hook", "after-kill-window", "rename-window", "KILLED")
 	c.Run("run", "default", "kill-window") // kills window 2, back to window 1
 	c.WaitForStatus("KILLED")
@@ -1580,16 +1591,16 @@ func TestHookAfterKillWindow(t *testing.T) {
 // opens the overlay on the client, instead of no-opping server-side.
 func TestHookClientCommand(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Run("run", "default", "set-hook", "after-new-window", "command-prompt")
 	c.Prefix("c")         // new-window fires after-new-window -> command-prompt
-	c.WaitForStatus("(:") // the command-prompt overlay opened locally
+	c.WaitForText("─ commands ─") // the command palette opened locally
 }
 
 // TestPipePane tees a pane's output to a command; the data must reach it.
 func TestPipePane(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	out := filepath.Join(t.TempDir(), "pipe.out")
 	c.Run("run", "default", "pipe-pane", "cat >> "+out)
 	c.TypeLine("echo PIPEDATA")
@@ -1608,7 +1619,7 @@ func TestPipePane(t *testing.T) {
 func TestLock(t *testing.T) {
 	lua := `gtmux.bind_root("L", function() gtmux.lock() end)`
 	c := harness.StartWithConfig(t, lua, "")
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Key('L')
 	c.WaitForText("locked")
 	c.Key(' ') // any key unlocks
@@ -1620,7 +1631,7 @@ func TestLock(t *testing.T) {
 func TestClockMode(t *testing.T) {
 	lua := `gtmux.bind_root("K", function() gtmux.clock_mode() end)`
 	c := harness.StartWithConfig(t, lua, "")
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Key('K')
 	// The clock draws big block digits across the window's middle rows (mid row
 	// 11 for 80x24, where digit columns show '█'). Wait for it before dismissing,
@@ -1630,14 +1641,14 @@ func TestClockMode(t *testing.T) {
 	c.Key(' ') // dismiss
 	c.WaitFor(func(s *harness.Screen) bool { return s.Col(11, '█') < 0 })
 	c.Prefix("c")
-	c.WaitForStatus("2:") // still functional after the overlay
+	c.WaitForStatus(" 2 ") // still functional after the overlay
 }
 
 // TestBufferStack covers the paste-buffer stack: set/show/list/named/delete and
 // paste round-tripping into the pane.
 func TestBufferStack(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Run("run", "default", "set-buffer", "alpha")
 	c.Run("run", "default", "set-buffer", "beta") // beta is now the newest
 	if s := strings.TrimSpace(c.Run("run", "default", "show-buffer")); s != "beta" {
@@ -1664,7 +1675,7 @@ func TestBufferStack(t *testing.T) {
 // TestHasSession: has-session exits 0 for a live session, non-zero otherwise.
 func TestHasSession(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	if err := c.RunErr("has-session", "default"); err != nil {
 		t.Errorf("has-session default should succeed, got %v", err)
 	}
@@ -1676,13 +1687,13 @@ func TestHasSession(t *testing.T) {
 // TestFindWindow: find-window selects the first window matching a name pattern.
 func TestFindWindow(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Prefix("c")
-	c.WaitForStatus("2:")
+	c.WaitForStatus(" 2 ")
 	c.Run("run", "default", "rename-window", "targetwin") // names window 2
 	c.WaitForStatus("targetwin")
 	c.Prefix("c")
-	c.WaitForStatus("3:") // window 3 active now
+	c.WaitForStatus(" 3 ") // window 3 active now
 	c.Run("run", "default", "find-window", "targetwin")
 	c.WaitFor(func(s *harness.Screen) bool { return s.ActiveWindow() == 2 })
 }
@@ -1690,9 +1701,9 @@ func TestFindWindow(t *testing.T) {
 // TestListClients lists the clients attached to a session (one line each).
 func TestListClients(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	peer := c.NewPeer(80, 24)
-	peer.WaitForStatus("1:")
+	peer.WaitForStatus(" 1 ")
 	out := c.Run("run", "default", "list-clients")
 	if n := strings.Count(out, "client-"); n != 2 {
 		t.Fatalf("list-clients = %q, want 2 client lines", out)
@@ -1705,12 +1716,12 @@ func TestListClients(t *testing.T) {
 func TestWindowSizeSmallest(t *testing.T) {
 	srv := `gtmux.set_option("window_size", "smallest")`
 	c := harness.StartWithConfig(t, "", srv) // this client is 80x24
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	peer := c.NewPeer(40, 24) // narrower peer -> grid shrinks to 40
 	// At 40 columns the right-side git widget can crowd the automatic window
 	// name out of the status line, so use the always-visible session label as
 	// the peer-ready marker. The assertion below is what this test exercises.
-	peer.WaitForStatus("[default]")
+	peer.WaitForStatus("● default")
 	// On the 80-wide client, columns past 40 are now dot-fill.
 	c.WaitFor(func(s *harness.Screen) bool { return s.Cell(0, 60).Char == '·' })
 }
@@ -1720,7 +1731,7 @@ func TestWindowSizeSmallest(t *testing.T) {
 func TestDisplayPopup(t *testing.T) {
 	lua := `gtmux.bind_root("P", function() gtmux.display_popup("echo POPUPOK; sleep 3") end)`
 	c := harness.StartWithConfig(t, lua, "")
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Key('P') // bind_root: bare key, no prefix
 	c.WaitForText("POPUPOK")
 }
@@ -1730,18 +1741,18 @@ func TestDisplayPopup(t *testing.T) {
 func TestDisplayMenu(t *testing.T) {
 	lua := `gtmux.bind_root("M", function() gtmux.display_menu("go", "new", "new-window") end)`
 	c := harness.StartWithConfig(t, lua, "")
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Key('M')
 	c.WaitForText("go") // menu title visible
 	c.Key('\r')         // select the only item -> new-window
-	c.WaitForStatus("2:")
+	c.WaitForStatus(" 2 ")
 }
 
 // TestHookFires registers an after-new-window hook, then triggers the event and
 // asserts the hook's command actually ran (renames the new window).
 func TestHookFires(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Run("run", "default", "set-hook", "after-new-window", "rename-window", "hooked")
 	c.Run("run", "default", "new-window")
 	c.WaitForStatus("hooked") // the hook renamed the freshly-created window
@@ -1752,7 +1763,7 @@ func TestHookFires(t *testing.T) {
 // but the guard stops the loop and the second rename still lands).
 func TestHookAfterRenameWindow(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Run("run", "default", "set-hook", "after-rename-window", "rename-window", "guarded")
 	c.Run("run", "default", "rename-window", "first")
 	c.WaitForStatus("guarded") // the hook renamed once; the guard stopped it looping
@@ -1763,13 +1774,13 @@ func TestHookAfterRenameWindow(t *testing.T) {
 // later — WaitForStatus polls until it does.
 func TestIfShell(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	// exit 0 -> then branch: new-window.
 	c.Run("run", "default", "if-shell", "true", "new-window", "next-window")
-	c.WaitForStatus("2:")
+	c.WaitForStatus(" 2 ")
 	// exit non-zero -> else branch: new-window (then branch is a harmless no-op).
 	c.Run("run", "default", "if-shell", "false", "next-window", "new-window")
-	c.WaitForStatus("3:")
+	c.WaitForStatus(" 3 ")
 }
 
 // TestMouseWheelEntersCopyMode: a wheel-up over a non-mouse-tracking pane
@@ -1778,7 +1789,7 @@ func TestIfShell(t *testing.T) {
 // copy-mode actions.
 func TestMouseWheelEntersCopyMode(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.WheelUp(5, 5) // wheel up inside the pane grid
 	c.WaitForText("hjkl")
 }
@@ -1823,7 +1834,7 @@ func TestMouseDragCopy(t *testing.T) {
 func TestMultiLineStatus(t *testing.T) {
 	lua := `gtmux.options.status = "2"`
 	c := harness.StartWithConfig(t, lua, "")
-	c.WaitForStatus("1:") // main bar (window list) still on the bottom row
+	c.WaitForStatus(" 1 ") // main bar (window list) still on the bottom row
 	// The server must reserve BOTH status rows, or the pane is one row too tall.
 	// On an 80x24 client the pane gets 24 - 2 = 22 rows.
 	h := strings.TrimSpace(c.Run("run", "default", "display-message", "-p", "#{pane_height}"))
@@ -1836,9 +1847,9 @@ func TestMultiLineStatus(t *testing.T) {
 // window_active flag.
 func TestListWindows(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Prefix("c")
-	c.WaitForStatus("2:") // window 2 active now
+	c.WaitForStatus(" 2 ") // window 2 active now
 
 	out := strings.TrimSpace(c.Run("run", "default", "list-windows",
 		"-F", "#{window_index}:#{window_active}:#{window_panes}"))
@@ -1883,7 +1894,7 @@ func TestListSessions(t *testing.T) {
 // active one (the -t-ignored bug killed whichever window was current).
 func TestKillWindowTarget(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Run("run", "default", "new-window", "-n", "keepme") // now active; base-index 1 → zsh is :1
 	c.WaitForStatus("keepme")
 	c.Run("run", "default", "kill-window", "-t", ":1") // kill the OTHER (non-active) window
@@ -1900,7 +1911,7 @@ func TestKillWindowTarget(t *testing.T) {
 // visible in the registry.
 func TestNewSession(t *testing.T) {
 	c := harness.Start(t)
-	c.WaitForStatus("1:")
+	c.WaitForStatus(" 1 ")
 	c.Run("run", "default", "new-session", "-s", "spawned")
 	out := c.Run("run", "default", "list-sessions", "-F", "#{session_name}")
 	if !strings.Contains(out, "spawned") {

@@ -3,6 +3,7 @@ package client
 import (
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/FyrmForge/gtmux/internal/emu"
 	"github.com/FyrmForge/gtmux/internal/proto"
@@ -234,6 +235,8 @@ type picker struct {
 	filterable bool
 	filter     string
 	previews   [][]emu.Line // per-item static styled preview (selected item's pane), or nil
+	descs      []string     // per-item dim description column (command palette), or nil
+	palette    *palette     // command-palette mode (prefix+:), or nil — see palette.go
 }
 
 func newPicker(m *proto.OpenPicker) *picker {
@@ -241,16 +244,64 @@ func newPicker(m *proto.OpenPicker) *picker {
 }
 
 // view returns the original indices of the items matching the current filter
-// (all of them when not filtering). sel indexes into this slice.
+// (all of them when not filtering). sel indexes into this slice. The match is
+// fuzzy: substring hits first, then subsequence-only hits ("gtx" ~ "gtmux"),
+// each group in list order.
 func (p *picker) view() []int {
 	idx := make([]int, 0, len(p.items))
-	f := strings.ToLower(p.filter)
+	var fuzzy []int
+	q := p.query()
 	for i, it := range p.items {
-		if f == "" || strings.Contains(strings.ToLower(it), f) {
+		if pos, sub := matchPos(q, it); sub {
 			idx = append(idx, i)
+		} else if pos != nil {
+			fuzzy = append(fuzzy, i)
 		}
 	}
-	return idx
+	return append(idx, fuzzy...)
+}
+
+// query is the part of the filter the items are matched against: all of it,
+// except in palette stage two, where it's the argument after the command.
+func (p *picker) query() string {
+	if p.palette != nil {
+		return p.filter[min(p.palette.off, len(p.filter)):]
+	}
+	return p.filter
+}
+
+// matchPos returns the rune indexes of s that q matches, case-insensitively:
+// the first contiguous run when q is a substring (sub=true), else the leftmost
+// subsequence; nil when neither. An empty q is a substring of everything.
+func matchPos(q, s string) (pos []int, sub bool) {
+	lower := func(x string) []rune {
+		r := []rune(x)
+		for i := range r {
+			r[i] = unicode.ToLower(r[i]) // per rune, so indexes stay aligned with s
+		}
+		return r
+	}
+	qr, sr := lower(q), lower(s)
+	if len(qr) == 0 {
+		return nil, true
+	}
+	for i := 0; i+len(qr) <= len(sr); i++ {
+		if string(sr[i:i+len(qr)]) == string(qr) {
+			for j := range qr {
+				pos = append(pos, i+j)
+			}
+			return pos, true
+		}
+	}
+	for i := 0; i < len(sr) && len(pos) < len(qr); i++ {
+		if sr[i] == qr[len(pos)] {
+			pos = append(pos, i)
+		}
+	}
+	if len(pos) < len(qr) {
+		return nil, false
+	}
+	return pos, false
 }
 
 func (p *picker) move(d int) {
@@ -309,11 +360,27 @@ func (p *picker) feed(data []byte) pickerResult {
 			}
 		}
 		if p.filterable {
+			if p.palette != nil {
+				switch b {
+				case '\r', '\n':
+					if res := p.palette.commit(p); res.done {
+						return res
+					}
+					continue
+				case '\t':
+					p.palette.complete(p)
+					continue
+				}
+			}
 			switch {
 			case b == '\r' || b == '\n':
 				return p.commit()
 			case b == 0x1b: // bare ESC cancels
 				return pickerResult{done: true}
+			case b == 0x0e: // C-n / C-p navigate (fzf); letters go to the filter
+				p.move(1)
+			case b == 0x10:
+				p.move(-1)
 			case b == 0x7f || b == 0x08: // backspace edits the filter
 				if p.filter != "" {
 					p.filter = p.filter[:len(p.filter)-1]
@@ -322,6 +389,9 @@ func (p *picker) feed(data []byte) pickerResult {
 			case b >= 0x20 && b < 0x7f:
 				p.filter += string(b)
 				p.sel = 0
+			}
+			if p.palette != nil {
+				p.palette.refresh(p) // the stage can change with every keystroke
 			}
 			continue
 		}

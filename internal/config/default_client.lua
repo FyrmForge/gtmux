@@ -17,8 +17,10 @@ gtmux.options.mode_keys = "vi" -- copy-mode keytable: "vi" or "emacs"
 -- word-separators). Default is all ASCII punctuation, so foo.bar is three words.
 -- gtmux.options.word_separators = "!\"#$%&'()*+,-./:;<=>?@[\\]^`{|}~"
 
--- status-style: the bar's default fg/bg/attrs as one tmux-style string
--- (comma-separated fg=/bg=/bold/reverse/italics). Partial — only what's listed.
+-- status-style: fg/bg/attrs as one tmux-style string (comma-separated
+-- fg=/bg=/bold/reverse/italics). Partial — only what's listed. The default
+-- status bar below is a transparent component and doesn't use it; it colours
+-- the plain pickers (choose-window/session), modals and centered notices.
 gtmux.options.status_style = "fg=white,bg=dark_grey"
 
 -- Multi-line status (tmux `status` 1..5): reserve N status rows. Line 1 is the
@@ -58,28 +60,49 @@ gtmux.options.status_interval = 15
 
 -- Status bar: a component (dock="status"). gtmux composes the bar in Lua rather
 -- than from format-string options — reshape it by editing this. It reads
--- gtmux.windows()/expand()/context() and paints:
---   left = [host][session], a clickable window list (click selects; w.flags is
---   tmux's * # ! ~ Z), right = git branch + clock. #{...} still expands via
---   gtmux.expand; the window list is a child per window (its own on_click).
+-- gtmux.windows()/expand()/context() and paints, transparent (no bar strip —
+-- the terminal's own background shows through):
+--   left = ● session in the accent colour, then a clickable window list (click
+--   selects): the active window bold, the rest dim, a zoomed one marked ⤢ and
+--   bell/activity/silence alerts as a red •; right = branch · host · clock, dim.
+-- The accent is active_border_fg (green unless your config sets it), so the
+-- bar follows the pane-border theme. #{...} still expands via gtmux.expand.
 gtmux.widget{ dock = "status", component = function(props, ui)
-  local BAR = "fg=white,bg=dark_grey" -- inactive / bar background (status-style)
-  local CUR = "fg=black,bg=green"      -- active window (active-window colors)
-  ui:fill(BAR)
-  local left = "[" .. gtmux.expand("#{host}") .. "][" .. gtmux.expand("#{session}") .. "]"
-  ui:text(0, 0, left, BAR)
-  local x = #left + 1
-  for i, w in ipairs(gtmux.windows()) do
-    if i > 1 then x = x + 1 end -- separator
-    local label = w.index .. ":" .. w.name .. w.flags
-    ui:child(x, 0, #label, 1, function(p, cell)
-      cell:text(0, 0, p.label, p.style)
+  local accent = "fg=" .. (gtmux.options.active_border_fg or "green")
+  local DIM = "fg=dark_grey"
+  -- display width in cells: count UTF-8 lead bytes (# counts bytes, and ●/⤢/·
+  -- are 3 bytes each)
+  local function len(s) return (select(2, s:gsub("[^\128-\191]", ""))) end
+  local x = 1
+  local function put(s, style) ui:text(x, 0, s, style); x = x + len(s) end
+
+  put("●", accent)
+  x = x + 1
+  put(gtmux.expand("#{session}"), accent .. ",bold")
+  x = x + 3
+  for _, w in ipairs(gtmux.windows()) do
+    local mark = ""
+    if w.flags:find("Z", 1, true) then mark = " ⤢" end
+    local alert = w.flags:find("[!#~]") ~= nil
+    local label = w.index .. " " .. w.name .. mark
+    local width = len(label) + (alert and 2 or 0)
+    ui:child(x, 0, width, 1, function(p, cell)
+      cell:text(0, 0, p.idx .. "", p.active and (p.accent .. ",bold") or p.dim)
+      cell:text(len(p.idx .. "") + 1, 0, p.rest, p.active and "fg=default,bold" or p.dim)
+      if p.alert then cell:text(p.width - 1, 0, "•", "fg=red,bold") end
       cell:on_click(function() gtmux.select_window(p.idx) end)
-    end, { label = label, style = (w.active and CUR or BAR), idx = w.index })
-    x = x + #label
+    end, { idx = w.index, rest = w.name .. mark, active = w.active, alert = alert,
+           width = width, accent = accent, dim = DIM })
+    x = x + width + 3
   end
-  local right = gtmux.expand("#{?git_branch,[git:#{git_branch}] ,}") .. gtmux.expand("#{clock}")
-  ui:text(ui.w - #right, 0, right, BAR)
+
+  local parts = {}
+  local branch = gtmux.expand("#{git_branch}")
+  if branch ~= "" then parts[#parts + 1] = "⎇ " .. branch end
+  parts[#parts + 1] = gtmux.expand("#{host}")
+  parts[#parts + 1] = gtmux.expand("#{clock}")
+  local right = table.concat(parts, " · ")
+  ui:text(ui.w - len(right) - 1, 0, right, DIM)
 end }
 
 -- Cap status-left / status-right to N cells (tmux status-left-length /
@@ -359,12 +382,11 @@ function gtmux.lock()
     end,
   }
 end
--- command-prompt: type a tmux command, Enter runs it (reuses the prompt widget +
--- gtmux.run_command). The richer gtmux.command_prompt() (templates, multi-stage
--- -p prompts) still exists for binds that need %1 substitution.
-gtmux.bind(":", function()
-  prompt(":", "", function(t) gtmux.run_command(t) end)
-end)
+-- command palette: fuzzy-find a command (Enter runs it, Tab completes it into
+-- the input); a command that takes a session/window/pane/layout/option then
+-- lists those to fuzzy-pick. Text matching nothing runs as typed. With -p
+-- labels or a template, gtmux.command_prompt() opens the classic prompt.
+gtmux.bind(":", gtmux.command_prompt)
 gtmux.bind("[", gtmux.enter_copy_mode)
 gtmux.bind("]", gtmux.paste)
 

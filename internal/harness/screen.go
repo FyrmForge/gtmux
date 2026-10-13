@@ -73,8 +73,9 @@ func (s *Screen) Col(row int, r rune) int {
 }
 
 // ActiveWindow returns the index of the highlighted window in the status bar,
-// found by its active-window background color, or -1. Robust to the shell name
-// (which varies by environment), unlike matching label text.
+// found by its accent-coloured bold index digit (the default bar is
+// transparent: the active window is the bold green one), or -1. Robust to the
+// shell name (which varies by environment), unlike matching label text.
 func (s *Screen) ActiveWindow() int {
 	row := s.rows - 1
 	if row < 0 {
@@ -82,7 +83,7 @@ func (s *Screen) ActiveWindow() int {
 	}
 	for x := 0; x < s.cols; x++ {
 		g := s.cells[row][x]
-		if g.BG == emu.Green && g.Char >= '1' && g.Char <= '9' {
+		if g.FG == emu.Green && g.Mode&emu.AttrBold != 0 && g.Char >= '1' && g.Char <= '9' {
 			return int(g.Char - '0')
 		}
 	}

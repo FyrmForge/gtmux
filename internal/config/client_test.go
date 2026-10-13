@@ -74,7 +74,7 @@ func TestDefaultBindsResolve(t *testing.T) {
 		"[": {Action: []string{"copy-mode"}},
 		"]": {Action: []string{"paste"}},
 		// "$" / "," are now modal prompt components (gtmux.open), asserted below.
-		// ":" is now a modal command-prompt component (gtmux.open), asserted below.
+		":": {Action: []string{"command-prompt"}}, // the fuzzy command palette
 		// "w" is now a modal choose-tree component (gtmux.open), asserted below.
 		// "W" is now a modal picker component (gtmux.open), asserted below.
 	}
@@ -91,7 +91,7 @@ func TestDefaultBindsResolve(t *testing.T) {
 	}
 	// prefix+s / prefix+W open modal picker components (gtmux.open), not server
 	// actions.
-	for _, key := range []string{"s", "W", "$", ",", ":", "w"} {
+	for _, key := range []string{"s", "W", "$", ",", "w"} {
 		if ops := binds.Resolve(key); len(ops) != 1 || ops[0].Modal == nil {
 			t.Errorf("key %s: got %+v, want a Modal open", key, ops)
 		}
