@@ -217,3 +217,15 @@ func TestCopyModeDollarStopsAtLastNonBlank(t *testing.T) {
 		t.Fatalf("$ on a blank line cx = %d, want 0", blank.cx)
 	}
 }
+
+// Yanking across a soft-wrapped row joins it with the next (no newline), and a
+// wrap that falls on a space keeps that space.
+func TestCopyModeYankJoinsSoftWrap(t *testing.T) {
+	cm := mkCopyMode(10, "echo foo ", "bar", "next")
+	cm.lines[0][len(cm.lines[0])-1].Mode |= emu.AttrWrap
+	cm.selecting, cm.selY, cm.selX = true, 0, 0
+	cm.cy, cm.cx = 2, 3
+	if got, want := cm.selectedText(), "echo foo bar\nnext"; got != want {
+		t.Fatalf("yank = %q, want %q", got, want)
+	}
+}

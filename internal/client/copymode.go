@@ -191,7 +191,8 @@ func (cm *copyMode) selectedText() string {
 		if start < end {
 			b.WriteString(cellText(cm.lines[y], runes, start, end))
 		}
-		if y != y1 {
+		// A soft-wrapped row continues on the next one: no newline (tmux).
+		if y != y1 && !cm.lines[y].IsWrapped() {
 			b.WriteRune('\n')
 		}
 	}
@@ -217,7 +218,9 @@ func lineRunes(line emu.Line) []rune {
 		}
 	}
 	end := len(runes)
-	for end > 0 && runes[end-1] == ' ' {
+	// A soft-wrapped row is full: a trailing space is real text (the space
+	// between two words that the wrap fell on), not padding.
+	for !line.IsWrapped() && end > 0 && runes[end-1] == ' ' {
 		end--
 	}
 	return runes[:end]
