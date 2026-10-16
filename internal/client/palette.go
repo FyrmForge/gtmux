@@ -204,3 +204,23 @@ func (pl *palette) commit(p *picker) pickerResult {
 	}
 	return pickerResult{done: true, action: tokenize(p.filter)}
 }
+
+// confirmKill routes a palette kill-window / kill-session through the
+// confirm-before dialog, like prefix+& / prefix+q. The label goes through -p,
+// which splits on commas, so it must not contain one.
+func confirmKill(act []string) []string {
+	if len(act) == 0 {
+		return act
+	}
+	what := map[string]string{"kill-window": "window", "kill-session": "session"}[act[0]]
+	if what == "" {
+		return act
+	}
+	label := "kill this " + what + "?"
+	for i, a := range act {
+		if a == "-t" && i+1 < len(act) {
+			label = "kill " + what + " " + act[i+1] + "?"
+		}
+	}
+	return append([]string{"confirm-before", "-p", strings.ReplaceAll(label, ",", " "), "--"}, act...)
+}

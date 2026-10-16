@@ -939,6 +939,10 @@ func (c *compositor) activeCursor() (row, col int, visible bool) {
 			return r + off, col, c.popup.cursorVisible && inContent(r) && col >= 0 && col < c.cols()
 		}
 	}
+	// The confirm dialog takes keys, not text: no cursor blinking in a pane.
+	if c.prompt != nil && c.prompt.kind == "confirm" {
+		return 0, 0, false
+	}
 	// The finder's input owns the cursor: after the query, in the top box.
 	if c.picker != nil && c.picker.finder() {
 		g := c.findGeometry()
@@ -1572,7 +1576,7 @@ func (c *compositor) buildRow(row int) emu.Line {
 		if c.copyFocused() {
 			return renderPromptLine(c.cols(), "copy-mode", c.copy.helpText(), c.cfg)
 		}
-		if c.prompt != nil {
+		if c.prompt != nil && c.prompt.kind != "confirm" { // confirm is a centered dialog
 			return renderPromptLine(c.cols(), c.prompt.label(), string(c.prompt.buf), c.cfg)
 		}
 		if c.status != nil && c.status.PromptLabel != "" {
@@ -1588,7 +1592,7 @@ func (c *compositor) buildRow(row int) emu.Line {
 			if c.copyFocused() {
 				return renderPromptLine(c.cols(), "copy-mode", c.copy.helpText(), c.cfg)
 			}
-			if c.prompt != nil {
+			if c.prompt != nil && c.prompt.kind != "confirm" {
 				return renderPromptLine(c.cols(), c.prompt.label(), string(c.prompt.buf), c.cfg)
 			}
 			if c.status != nil && c.status.PromptLabel != "" {
@@ -1826,7 +1830,69 @@ func (c *compositor) composeOverlays(line emu.Line, row int) emu.Line {
 	if c.picker != nil && c.picker.finder() {
 		c.overlayRowFind(row, phys)
 	}
+	if c.prompt != nil && c.prompt.kind == "confirm" {
+		c.overlayRowConfirm(row, phys)
+	}
 	return phys
+}
+
+// overlayRowConfirm paints one row of the confirm-before dialog, centered over
+// the window in the finder's style (accent rounded box, bold text, dim hints):
+//
+//	╭────── confirm ──────╮
+//	│                     │
+//	│   kill this pane?   │
+//	│                     │
+//	│  y confirm  n cancel│
+//	╰─────────────────────╯
+func (c *compositor) overlayRowConfirm(row int, line emu.Line) {
+	label := []rune(c.prompt.label())
+	W, H := c.cols(), c.layout.Rows
+	w, h := min(W, max(32, len(label)+8)), 6
+	left, top := (W-w)/2, (H-h)/2
+	r := row - top
+	if r < 0 || r >= h {
+		return
+	}
+	accent, dim := c.cfg.ActiveBorderFG, emu.DarkGrey
+	put := func(x int, rs []rune, fg emu.Color, mode int16) int {
+		for _, ch := range rs {
+			if col := left + x; x >= 0 && x < w && col < len(line) {
+				line[col] = emu.Glyph{Char: ch, FG: fg, BG: emu.DefaultBG, Mode: mode}
+			}
+			x++
+		}
+		return x
+	}
+	center := func(rs []rune) int { return max(1, (w-len(rs))/2) }
+	l, rr, fill := '│', '│', ' '
+	switch r {
+	case 0:
+		l, rr, fill = '╭', '╮', '─'
+	case h - 1:
+		l, rr, fill = '╰', '╯', '─'
+	}
+	put(0, []rune{l}, accent, 0)
+	for x := 1; x < w-1; x++ {
+		put(x, []rune{fill}, accent, 0)
+	}
+	put(w-1, []rune{rr}, accent, 0)
+	switch r {
+	case 0:
+		t := []rune(" confirm ")
+		put(center(t), t, accent, emu.AttrBold)
+	case 2:
+		if len(label) > w-4 {
+			label = label[:max(0, w-4)]
+		}
+		put(center(label), label, emu.DefaultFG, emu.AttrBold)
+	case 4:
+		hint := []rune("y confirm   n cancel")
+		x := put(center(hint), []rune("y"), accent, emu.AttrBold)
+		x = put(x, []rune(" confirm   "), dim, 0)
+		x = put(x, []rune("n"), accent, emu.AttrBold)
+		put(x, []rune(" cancel"), dim, 0)
+	}
 }
 
 // composeContentRow wraps a content-width row (window content drawn in

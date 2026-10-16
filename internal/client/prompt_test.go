@@ -2,6 +2,7 @@ package client
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/FyrmForge/gtmux/internal/config"
@@ -143,5 +144,18 @@ func TestPickerFuzzyFilter(t *testing.T) {
 	r := p.feed([]byte("\x0e\r"))
 	if !reflect.DeepEqual(r.action, []string{"switch-session", "gtmux"}) {
 		t.Fatalf("action = %v", r.action)
+	}
+}
+
+func TestSplitSeq(t *testing.T) {
+	got := splitSeq([]string{"set-option", "detach-on-destroy", "off", ";", "kill-session", ";"})
+	if len(got) != 2 || strings.Join(got[0], " ") != "set-option detach-on-destroy off" || strings.Join(got[1], " ") != "kill-session" {
+		t.Fatalf("splitSeq = %q", got)
+	}
+	if got := splitSeq([]string{"kill-pane"}); len(got) != 1 || got[0][0] != "kill-pane" {
+		t.Fatalf("no-separator splitSeq = %q", got)
+	}
+	if got := splitSeq(nil); got != nil {
+		t.Fatalf("nil splitSeq = %q", got)
 	}
 }

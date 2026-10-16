@@ -3089,6 +3089,19 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string, re
 		case "unlink-window":
 			unlinkWindow()
 		case "kill-session":
+			// -t another session: hand the kill to its goroutine (like
+			// detach-client -t), instead of killing this one.
+			if len(args) >= 2 && args[0] == "-t" {
+				name := strings.TrimSuffix(strings.TrimPrefix(args[1], "="), ":")
+				if name != s.name {
+					peer, ok := reg.get(name)
+					if !ok {
+						return "can't find session: " + name
+					}
+					_, errText := peer.command([]string{"kill-session"})
+					return errText
+				}
+			}
 			// Ends this session after the current event finishes (the loop
 			// checks done). Runs on the session's own goroutine, so it can't
 			// block on kill() like the CLI path — it just flips the flags.

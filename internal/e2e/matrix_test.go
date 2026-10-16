@@ -1196,11 +1196,13 @@ func TestBaseIndex(t *testing.T) {
 	if s := strings.TrimSpace(c.Run("run", "default", "display-message", "-p", "#{pane_index}")); s != "3" {
 		t.Errorf("active pane_index after select-pane -t .3 = %q, want 3", s)
 	}
-	// display-panes overlay (prefix+q) must flash the base-adjusted numbers 3/4,
+	// display-panes overlay (from the palette) must flash the base-adjusted numbers 3/4,
 	// not the raw slice positions 1/2. Scan the pane rows (0..22) for the '4'
 	// glyph — it appears only as pane 4's flashed number under the fix; the
 	// status row (23) is skipped since its clock can hold stray digits.
-	c.Prefix("q")
+	c.Prefix(":")
+	c.WaitForText("─ commands ─")
+	c.TypeLine("display-panes")
 	c.WaitFor(func(s *harness.Screen) bool {
 		for y := 0; y < 23; y++ {
 			if s.Col(y, '4') >= 0 {

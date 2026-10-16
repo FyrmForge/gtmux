@@ -1153,8 +1153,10 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 						out, res := comp.promptFeed(pass)
 						os.Stdout.Write(out)
 						compMu.Unlock()
-						if res.action != nil {
-							dispatch(res.action)
+						// A lone ";" token separates commands (tmux's `\;`), run in
+						// order: confirm_before("a ; b") on prefix+q.
+						for _, act := range splitSeq(res.action) {
+							dispatch(act)
 						}
 					case comp != nil && comp.picker != nil:
 						out, res := comp.pickerFeed(pass)

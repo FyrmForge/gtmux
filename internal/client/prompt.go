@@ -364,6 +364,7 @@ func (p *picker) feed(data []byte) pickerResult {
 				switch b {
 				case '\r', '\n':
 					if res := p.palette.commit(p); res.done {
+						res.action = confirmKill(res.action)
 						return res
 					}
 					continue
@@ -407,4 +408,20 @@ func (p *picker) feed(data []byte) pickerResult {
 		}
 	}
 	return pickerResult{}
+}
+
+// splitSeq splits an action on lone ";" tokens into its commands, dropping
+// empty ones; no ";" returns it as the only command.
+func splitSeq(act []string) [][]string {
+	var out [][]string
+	start := 0
+	for i := 0; i <= len(act); i++ {
+		if i == len(act) || act[i] == ";" {
+			if i > start {
+				out = append(out, act[start:i])
+			}
+			start = i + 1
+		}
+	}
+	return out
 }

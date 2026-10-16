@@ -169,9 +169,13 @@ gtmux.bind("n", gtmux.next_window)
 gtmux.bind("p", gtmux.prev_window)
 gtmux.bind("%", gtmux.split_right) -- new pane to the right
 gtmux.bind("\"", gtmux.split_down) -- new pane below
-gtmux.bind("x", gtmux.kill_pane)
+gtmux.bind("x", function() gtmux.confirm_before("kill-pane", "kill this pane?") end)
 gtmux.bind("d", gtmux.detach)
-gtmux.bind("q", gtmux.show_pane_numbers)
+gtmux.bind("&", function() gtmux.confirm_before("kill-window", "kill this window?") end)
+-- prefix+q kills the session but keeps you in gtmux: detach-on-destroy off on
+-- just this session moves the client to another one (it only detaches when
+-- this was the last). prefix+Q-style binds without it kill and exit.
+gtmux.bind("q", function() gtmux.confirm_before("set-option detach-on-destroy off ; kill-session", "kill this session?") end)
 -- prompt: a one-line text-input widget on the status/message line (position =
 -- "status" — placeable elsewhere via gtmux.open). Type to edit, Enter submits
 -- the text to on_submit, Esc cancels. Basis for rename (and command-prompt).
