@@ -8,6 +8,7 @@ package client
 
 import (
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 	"time"
@@ -110,8 +111,16 @@ type compositor struct {
 	// modal, if set, is a modal keyboard widget (gtmux.open{...}): a centered
 	// component overlay that grabs every key via its on_key until it closes.
 	// Mutually exclusive with the other input modes; rendered topmost.
-	modal    *textBox
-	modalPos string // "center" (default) | "status" (renders on the status line)
+	modal     *textBox
+	modalPos  string // "center" (default) | "status" (renders on the status line)
+	modalMode string // the open modal's mode label (gtmux.open{mode=}), "" = "MODAL"
+	// Mode indicator (context().mode, see mode()): inputMode/repeatUntil mirror
+	// the input loop's key state (it owns prefixPending/curTable/repeatActive);
+	// shownMode is what the status bar last rendered with, so emit re-renders it
+	// only on a change.
+	inputMode   string    // "" | "prefix" | "table:<name>"
+	repeatUntil time.Time // end of the bind -r repeat window; zero = none
+	shownMode   string
 	// focusedDock is the dock currently owning the keyboard (focus="nav"/"bind"/
 	// "both" widgets): keys route to its on_key until it calls ui:close().
 	focusedDock *textBox
@@ -158,6 +167,7 @@ type compositor struct {
 	// "idle", absent = not an agent pane); agentBell tracks per-window bell flags
 	// for its own edge detection (detectAlerts consumes alertPrev first).
 	agentDefs    []config.AgentDef
+	userCmds     []paletteCmd // gtmux.command{} entries for the palette (built-in collisions dropped)
 	agentState   map[int]string
 	agentBell    map[string]bool
 	agentSeeded  bool
@@ -297,12 +307,17 @@ func (c *compositor) refreshDocks() {
 // toggle forces the opposite, so it always visibly does something and wins
 // over the min_cols breakpoint until toggled again. Returns false if no dock
 // has that name. Config reload resets to auto.
-func (c *compositor) toggleDock(name string) bool {
+func (c *compositor) toggleDock(name string) bool { return c.setDock(name, 0) }
+
+// setDock forces the named dock hidden (mode -1), shown (1), or the opposite
+// of its current state (0, toggleDock). Returns false if no dock has that name.
+func (c *compositor) setDock(name string, mode int8) bool {
 	for _, d := range c.allDocks {
 		if d.name != name {
 			continue
 		}
-		if d.hidden(c.cols()) {
+		show := mode > 0 || (mode == 0 && d.hidden(c.cols()))
+		if show {
 			d.forced = 1
 			// Size the canvas now so a draw/component dock paints this frame
 			// instead of blank-until-next-status-tick (mirrors apply's sizing).
@@ -321,6 +336,138 @@ func (c *compositor) toggleDock(name string) bool {
 		return true
 	}
 	return false
+}
+
+// mode is the client's current input mode, for the status bar's indicator
+// (context().mode): the overlay that owns the keys wins, then pending key
+// state (prefix/table/repeat), then copy mode, else NORMAL.
+func (c *compositor) mode() string {
+	switch {
+	case c.popup != nil:
+		return "POPUP"
+	case c.modal != nil:
+		if c.modalMode != "" {
+			return c.modalMode
+		}
+		return "MODAL"
+	case c.prompt != nil && c.prompt.kind == "confirm":
+		return "CONFIRM"
+	case c.prompt != nil:
+		return "PROMPT"
+	case c.picker != nil && c.picker.palette != nil:
+		return "COMMAND"
+	case c.picker != nil && c.picker.verb == "run":
+		return "MENU" // display-menu
+	case c.picker != nil:
+		return "PICKER"
+	case c.focusedDock != nil:
+		return "DOCK"
+	case c.inputMode == "prefix":
+		return "PREFIX"
+	case strings.HasPrefix(c.inputMode, "table:"):
+		return "TABLE:" + strings.TrimPrefix(c.inputMode, "table:")
+	case time.Now().Before(c.repeatUntil):
+		return "REPEAT"
+	case c.status != nil && c.status.PromptLabel != "":
+		return "MESSAGE" // display-message / run-shell output, while it's up
+	case c.copyFocused() && c.copy.selecting && c.copy.rectSel:
+		return "V-BLOCK"
+	case c.copyFocused() && c.copy.selecting && c.copy.lineSel:
+		return "V-LINE"
+	case c.copyFocused() && c.copy.selecting:
+		return "VISUAL"
+	case c.copyFocused():
+		return "COPY"
+	}
+	return "NORMAL"
+}
+
+// modeInfo is the short detail the status bar shows beside the mode
+// (context().mode_info): copy mode's position or search, or the message text.
+func (c *compositor) modeInfo() string {
+	switch m := c.mode(); {
+	case m == "MESSAGE":
+		return c.status.PromptText
+	case c.copyFocused() && c.copy.searching:
+		return "search: " + string(c.copy.searchBuf)
+	case c.copyFocused() && (m == "COPY" || strings.HasPrefix(m, "V")):
+		return fmt.Sprintf("line %d/%d", c.copy.cy+1, len(c.copy.lines))
+	}
+	return ""
+}
+
+// promptInput is the prompt's input line as shown: what it will run, then the
+// typed text ("rename-window: foo").
+func (c *compositor) promptInput() string {
+	return c.prompt.origin() + ": " + string(c.prompt.buf)
+}
+
+// overlayRowPrompt paints a text prompt into the command palette's top-centre
+// input box, so every prompt looks the same however it was opened:
+//
+//	╭─ question (the -p label, if any) ─╮
+//	│ ❯ rename-window: foo▏             │
+//	╰───────────────────────────────────╯
+func (c *compositor) overlayRowPrompt(row int, line emu.Line) {
+	g := c.findGeometry()
+	r := row - g.top
+	if r < 0 || r > 2 {
+		return
+	}
+	accent := c.cfg.ActiveBorderFG
+	w := g.inW
+	cells := make([]emu.Glyph, w)
+	for i := range cells {
+		cells[i] = emu.Glyph{Char: ' ', FG: emu.DefaultFG, BG: emu.DefaultBG}
+	}
+	put := func(x int, s string, fg emu.Color, mode int16) int {
+		for _, ch := range s {
+			if x >= 0 && x < w {
+				cells[x] = emu.Glyph{Char: ch, FG: fg, BG: emu.DefaultBG, Mode: mode}
+			}
+			x++
+		}
+		return x
+	}
+	switch r {
+	case 0, 2:
+		l, rr := '╭', '╮'
+		if r == 2 {
+			l, rr = '╰', '╯'
+		}
+		put(0, string(l)+strings.Repeat("─", max(0, w-2))+string(rr), accent, 0)
+		if q := c.prompt.question(); r == 0 && q != "" {
+			t := []rune(" " + q + " ")
+			if len(t) > w-4 {
+				t = t[:max(0, w-4)]
+			}
+			put(2, string(t), accent, emu.AttrBold)
+		}
+	case 1:
+		put(0, "│", accent, 0)
+		put(w-1, "│", accent, 0)
+		x := put(2, "❯ ", accent, emu.AttrBold)
+		x = put(x, c.prompt.origin()+": ", accent, 0)
+		t := []rune(string(c.prompt.buf))
+		if room := w - 2 - x; len(t) > room {
+			t = t[len(t)-max(0, room):] // keep the tail you're typing visible
+		}
+		put(x, string(t), emu.DefaultFG, emu.AttrBold)
+	}
+	for i, g2 := range cells {
+		if x := g.inLeft + i; x >= 0 && x < len(line) {
+			line[x] = g2
+		}
+	}
+}
+
+// syncMode repaints the status bar if the mode changed without a redraw (a
+// prefix press, the repeat window expiring); nil when nothing changed.
+func (c *compositor) syncMode() []byte {
+	if c.statusWidget == nil || c.layout == nil || c.mode() == c.shownMode {
+		return nil
+	}
+	return c.emit(map[int]bool{})
 }
 
 // activeZoomed reports whether the current window is zoomed, from the status
@@ -651,6 +798,7 @@ func (c *compositor) contentCols() int {
 // store it. A fresh modal each open — state starts empty (selection at 0).
 func (c *compositor) openModal(m *config.ModalOpen, binds *config.ClientBinds) {
 	c.modalPos = m.Position
+	c.modalMode = m.Mode
 	if c.modalPos == "" {
 		c.modalPos = "center"
 	}
@@ -946,7 +1094,17 @@ func (c *compositor) activeCursor() (row, col int, visible bool) {
 	// The finder's input owns the cursor: after the query, in the top box.
 	if c.picker != nil && c.picker.finder() {
 		g := c.findGeometry()
-		col := g.inLeft + 4 + min(len([]rune(c.picker.filter)), g.inW-12) // already physical
+		q := c.picker.filter
+		if c.picker.palette != nil {
+			q = c.picker.palette.inputText(c.picker)
+		}
+		col := g.inLeft + 4 + min(len([]rune(q)), g.inW-12) // already physical
+		return g.top + 1 + off, col, col < c.cols()
+	}
+	// A text prompt types into the same top-centre box (overlayRowPrompt).
+	if c.prompt != nil {
+		g := c.findGeometry()
+		col := g.inLeft + 4 + min(len([]rune(c.promptInput())), g.inW-6)
 		return g.top + 1 + off, col, col < c.cols()
 	}
 	// A preview is someone else's screen: a live cursor blinking over it points
@@ -1526,6 +1684,17 @@ func (c *compositor) redraw() []byte {
 // mid-paint. Without the latter a large repaint (a vim scroll dirties the
 // whole scroll region) flickers a stray cursor across the rows being drawn.
 func (c *compositor) emit(dirty map[int]bool) []byte {
+	// The status component reads context().mode, but only re-renders on the
+	// status push: when the mode moved since it last painted, re-render it here.
+	if m := c.mode(); m != c.shownMode && c.statusWidget != nil && c.layout != nil {
+		c.shownMode = m
+		c.statusWidget.rerender()
+		for row := 0; row < c.totalRows(); row++ {
+			if is, _ := c.statusRowKind(row); is {
+				dirty[row] = true
+			}
+		}
+	}
 	var b strings.Builder
 	b.WriteString("\x1b[?2026h\x1b[?25l")
 
@@ -1584,20 +1753,10 @@ func (c *compositor) buildRow(row int) emu.Line {
 		}
 	}
 	if isStatus, extra := c.statusRowKind(row); isStatus {
-		// Main bar row: client-owned input modes draw their own line, taking
-		// precedence over status content (component or bespoke bar alike).
+		// Copy mode, prompts and server messages don't take the bar over: the
+		// status component shows them in its centre (context().mode/mode_info)
+		// and prompts type into the top-centre box (overlayRowPrompt).
 		if extra < 0 {
-			// Focus moved off the copy-mode pane: the overlay stays frozen on it,
-			// but the bar belongs to the pane the keys are going to now.
-			if c.copyFocused() {
-				return renderPromptLine(c.cols(), "copy-mode", c.copy.helpText(), c.cfg)
-			}
-			if c.prompt != nil && c.prompt.kind != "confirm" {
-				return renderPromptLine(c.cols(), c.prompt.label(), string(c.prompt.buf), c.cfg)
-			}
-			if c.status != nil && c.status.PromptLabel != "" {
-				return renderPromptLine(c.cols(), c.status.PromptLabel, c.status.PromptText, c.cfg)
-			}
 			// A status-position modal (a prompt/input widget) overrides the status
 			// content on the main bar row, above the status component.
 			if c.modal != nil && c.modalPos == "status" && c.modal.canvas != nil {
@@ -1832,6 +1991,8 @@ func (c *compositor) composeOverlays(line emu.Line, row int) emu.Line {
 	}
 	if c.prompt != nil && c.prompt.kind == "confirm" {
 		c.overlayRowConfirm(row, phys)
+	} else if c.prompt != nil {
+		c.overlayRowPrompt(row, phys)
 	}
 	return phys
 }
@@ -2545,7 +2706,7 @@ func (c *compositor) findGeometry() findGeom {
 	g.left, g.top = (W-g.w)/2, (H-g.h)/2
 	g.inW = min(g.w, max(40, min(64, g.w/2)))
 	g.inLeft = g.left + (g.w-g.inW)/2
-	if c.picker.palette != nil {
+	if c.picker == nil || c.picker.palette != nil {
 		// Telescope: the list hangs under the input, same width, fixed height
 		// (doesn't jump while filtering); the input sits where the finder's does.
 		g.listL, g.listW = g.inLeft-g.left, g.inW
@@ -2634,6 +2795,9 @@ func (c *compositor) overlayRowFind(row int, line emu.Line) {
 		x := put(inL+2, []rune("❯ "), accent, emu.AttrBold)
 		count := []rune(fmt.Sprintf("%d/%d", len(view), len(pk.items)))
 		q := []rune(pk.filter)
+		if pk.palette != nil {
+			q = []rune(pk.palette.inputText(pk))
+		}
 		if room := inR - 2 - len(count) - 1 - x; len(q) > room {
 			q = q[len(q)-max(0, room):] // keep the tail you're typing visible
 		}
@@ -2946,6 +3110,14 @@ func (c *compositor) rebuildWidgets(binds *config.ClientBinds) {
 	c.statusWidget, c.docks, c.allDocks, c.overlays, c.focusedDock = nil, nil, nil, nil, nil
 	c.wantPreview("") // the dock that was browsing is gone; don't leave its preview up
 	c.agentDefs = binds.Agents
+	c.userCmds = nil
+	for _, uc := range binds.Commands {
+		if builtinCmd(uc.Name) {
+			log.Printf("gtmux: command %q shadows a built-in command; ignored", uc.Name)
+			continue
+		}
+		c.userCmds = append(c.userCmds, paletteCmd{uc.Name, uc.Desc, ""})
+	}
 	for _, w := range c.cfg.Widgets {
 		b := &textBox{
 			row: w.Row, col: w.Col, format: w.Text,
@@ -2983,7 +3155,7 @@ func (c *compositor) openLocal(kind string) []byte {
 	case "command-prompt":
 		// The plain ":" line is the fuzzy command palette; parameterized
 		// command-prompt (-p/-I/template) still opens the classic prompt.
-		c.picker = newPalettePicker(c.paletteCands)
+		c.picker = newPalettePicker(c.paletteCands, c.paletteExtra()...)
 	case "rename-window":
 		c.prompt = newPrompt(&proto.OpenPrompt{Kind: "window", Prefill: c.activeWindowName()}, c.editKeys())
 	case "rename-session":
@@ -3035,7 +3207,7 @@ func (c *compositor) openFlowPrompt(action []string) []byte {
 	} else if labels == nil && !hasTail {
 		// Plain command line (prefix+:): the fuzzy command palette, -I text
 		// prefilled. Labelled / templated prompts keep the classic prompt.
-		c.picker = newPalettePicker(c.paletteCands)
+		c.picker = newPalettePicker(c.paletteCands, c.paletteExtra()...)
 		c.picker.palette.setFilter(c.picker, initial)
 	} else {
 		p := &prompt{kind: "command", labels: labels, buf: []byte(initial), editKeys: c.editKeys()}
@@ -3205,6 +3377,18 @@ func (c *compositor) buildWindowPicker() *picker {
 		}
 	}
 	return newPicker(&proto.OpenPicker{Title: "choose window", Verb: "select-window", Items: items, Targets: targets})
+}
+
+// paletteExtra is what the palette lists after the built-ins: registered user
+// commands, then dock:hide/show/toggle-<name> for every named dock.
+func (c *compositor) paletteExtra() []paletteCmd {
+	var names []string
+	for _, d := range c.allDocks {
+		if d.name != "" {
+			names = append(names, d.name)
+		}
+	}
+	return append(c.userCmds[:len(c.userCmds):len(c.userCmds)], dockPaletteCmds(names)...)
 }
 
 // paletteCands supplies the command palette's stage-two candidates from state

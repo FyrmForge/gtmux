@@ -333,6 +333,8 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 				}
 				if comp != nil {
 					m["prefix"] = prefixLabel(curBinds().Prefix)
+					m["mode"] = comp.mode()
+					m["mode_info"] = comp.modeInfo()
 					m["width"] = strconv.Itoa(comp.phyCols)
 					m["height"] = strconv.Itoa(comp.phyRows)
 				}
@@ -488,6 +490,12 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 	// dispatch runs one resolved action. Client-local commands (source-file,
 	// set-option) are handled here with no server round-trip; anything else goes
 	// to the session's runCommand. Callers must not hold compMu.
+	// runOps is the input goroutine's bind-effect runner, assigned there before
+	// any input is read; dispatch uses it for gtmux.command / dock:* names.
+	// ponytail: a hook-fired dispatch (read goroutine) of a user command runs
+	// runOps off the input goroutine; fine unless that command switches key
+	// tables. Route through a channel to the input goroutine if that ever bites.
+	var runOps func([]config.BindOp)
 	dispatch := func(action []string) {
 		switch {
 		case len(action) > 0 && action[0] == "source-file":
@@ -534,6 +542,16 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 			// one that knows the byte.
 			send(&proto.ClientMsg{Input: &proto.Input{Data: []byte{curBinds().Prefix}}})
 		default:
+			if len(action) == 1 && runOps != nil && !builtinCmd(action[0]) {
+				if name, mode, ok := parseDockCmd(action[0]); ok {
+					runOps([]config.BindOp{{ToggleDock: name, DockMode: mode}})
+					return
+				}
+				if ops, ok := curBinds().RunCommand(action[0]); ok {
+					runOps(ops)
+					return
+				}
+			}
 			send(&proto.ClientMsg{Action: &proto.Action{Args: action}})
 		}
 	}
@@ -599,6 +617,9 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 				if out := comp.animateDocks(); len(out) > 0 {
 					os.Stdout.Write(out)
 				}
+				if out := comp.syncMode(); out != nil { // repeat window ran out
+					os.Stdout.Write(out)
+				}
 			}
 			compMu.Unlock()
 		}
@@ -647,7 +668,7 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 		// runOps performs a resolved keybind's effects: a server Action, or a
 		// local overlay opened from the client's own state. Local opens take
 		// compMu; sends must not hold it (lock-order vs the SIGWINCH goroutine).
-		runOps := func(ops []config.BindOp) {
+		runOps = func(ops []config.BindOp) {
 			for _, op := range ops {
 				if op.Table != "" {
 					// switch-client -T: the next key comes from this table.
@@ -697,7 +718,7 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 					var rc, rr int
 					toggled := false
 					compMu.Lock()
-					if comp != nil && comp.toggleDock(op.ToggleDock) {
+					if comp != nil && comp.setDock(op.ToggleDock, op.DockMode) {
 						os.Stdout.Write(comp.redraw())
 						rc, rr = comp.reportSize()
 						toggled = true
@@ -1170,6 +1191,25 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 						processInput(pass)
 					}
 				}
+				// Mirror the key state into the compositor for the mode indicator.
+				im := ""
+				switch {
+				case prefixPending || (escStage != 0 && escPrefixed):
+					im = "prefix"
+				case curTable != "":
+					im = "table:" + curTable
+				}
+				compMu.Lock()
+				if comp != nil {
+					comp.inputMode, comp.repeatUntil = im, time.Time{}
+					if repeatActive {
+						comp.repeatUntil = repeatDeadline
+					}
+					if out := comp.syncMode(); out != nil {
+						os.Stdout.Write(out)
+					}
+				}
+				compMu.Unlock()
 			}
 			if err != nil {
 				return
@@ -1244,16 +1284,37 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 		// the session just attached, not the previous one. Pop any extended-keys
 		// kitty entry the old session pushed first (the exit defer won't — a
 		// switch loops rather than returning), or it orphans on the outer terminal.
+		// toggle_dock state is per-client, not per-session: carry it across the
+		// rebuild by dock name so a hidden dock stays hidden after a switch.
 		compMu.Lock()
+		forced := map[string]int8{}
 		if comp != nil {
 			os.Stdout.Write(comp.restoreKitty())
 			os.Stdout.Write(comp.restoreCursor())
+			for _, d := range comp.allDocks {
+				if d.forced != 0 {
+					forced[d.name] = d.forced
+				}
+			}
 		}
 		comp = newCompositor()
 		comp.cfg = cliCfg
 		comp.setPhysical(cols, rows)
 		comp.rebuildWidgets(curBinds()) // the widgets' fns live in this VM
+		var rc, rr int
+		if len(forced) > 0 {
+			for _, d := range comp.allDocks {
+				d.forced = forced[d.name]
+			}
+			comp.refreshDocks()
+			rc, rr = comp.reportSize()
+		}
 		compMu.Unlock()
+		if len(forced) > 0 {
+			// The Attach above sized from the static config, which doesn't know
+			// about the override; re-report from the visible set (as toggle_dock does).
+			send(&proto.ClientMsg{Resize: &proto.Resize{Cols: rc, Rows: rr}})
+		}
 		switchTo := ""
 		var decodeErr error
 		// applyHookOps runs the ops a gtmux.on callback recorded (command-exited /

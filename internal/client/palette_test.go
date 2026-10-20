@@ -40,11 +40,11 @@ func TestPaletteStages(t *testing.T) {
 }
 
 // TestPaletteVerbatim: text that matches nothing runs as typed (the palette is
-// still a command line), and free-text arguments run with what was typed.
+// still a command line), and a free-text argument runs as ONE arg, spaces kept.
 func TestPaletteVerbatim(t *testing.T) {
 	p := testPalette()
 	r := p.feed([]byte("rename-window my win\r"))
-	if !reflect.DeepEqual(r.action, []string{"rename-window", "my", "win"}) {
+	if !reflect.DeepEqual(r.action, []string{"rename-window", "my win"}) {
 		t.Fatalf("free-text arg: action = %v", r.action)
 	}
 	p = testPalette()

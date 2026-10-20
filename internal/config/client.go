@@ -582,7 +582,8 @@ type BindOp struct {
 	Command    string      // a raw command line the client tokenizes + dispatches (gtmux.run_command)
 	Border     *PaneBorder // set a pane's border override color (pane:set_border)
 	Dock       string      // toggle focus on the named dock (gtmux.focus_dock)
-	ToggleDock string      // toggle visibility of the named dock (gtmux.toggle_dock)
+	ToggleDock string      // set visibility of the named dock (gtmux.toggle_dock/hide_dock/show_dock)
+	DockMode   int8        // with ToggleDock: 0 toggle, -1 hide, 1 show
 	Preview    *string     // gtmux.preview(target): paint that pane in place of the window content; "" clears
 }
 
@@ -601,6 +602,7 @@ type ModalOpen struct {
 	Component, OnKey *lua.LFunction
 	Width, Height    int
 	Position         string // "center" (default) | "status" (the status/message line)
+	Mode             string // label for #{mode}/context().mode while open ("PICKER"); "" = "MODAL"
 }
 
 // ClientBinds is the client's keybind table and prefix key, held in a Lua VM
@@ -637,6 +639,27 @@ type ClientBinds struct {
 	// Agents are the coding-agent definitions from gtmux.agents{}; the
 	// compositor derives per-pane agent states from them.
 	Agents []AgentDef
+	// Commands are the user commands from gtmux.command{}, listed in the
+	// command palette and run by name (RunCommand). Registration order.
+	Commands []UserCommand
+}
+
+// UserCommand is one gtmux.command{name, desc, run}: a named, palette-visible
+// command whose run fn executes like a keybind.
+type UserCommand struct {
+	Name, Desc string
+	Fn         *lua.LFunction
+}
+
+// RunCommand runs the user command with this name and returns its ops; ok is
+// false if no such command is registered.
+func (c *ClientBinds) RunCommand(name string) (ops []BindOp, ok bool) {
+	for _, uc := range c.Commands {
+		if uc.Name == name {
+			return c.run(uc.Fn), true
+		}
+	}
+	return nil, false
 }
 
 // AgentDef declares one coding agent (gtmux.agents{}): Match is a substring of
@@ -1570,6 +1593,16 @@ func LoadClientWith(path string, overrides [][2]string) (ClientConfig, *ClientBi
 		binds.ops = append(binds.ops, BindOp{ToggleDock: l.CheckString(1)})
 		return 0
 	}))
+	// hide_dock(name) / show_dock(name) force the named dock hidden / shown,
+	// like toggle_dock but idempotent.
+	L.SetField(tbl, "hide_dock", L.NewFunction(func(l *lua.LState) int {
+		binds.ops = append(binds.ops, BindOp{ToggleDock: l.CheckString(1), DockMode: -1})
+		return 0
+	}))
+	L.SetField(tbl, "show_dock", L.NewFunction(func(l *lua.LState) int {
+		binds.ops = append(binds.ops, BindOp{ToggleDock: l.CheckString(1), DockMode: 1})
+		return 0
+	}))
 
 	// --- Widget query primitives ------------------------------------------------
 	// These read the live gtmux state the client installs into binds.Hooks (the
@@ -1826,6 +1859,9 @@ func LoadClientWith(path string, overrides [][2]string) (ClientConfig, *ClientBi
 		if v, ok := t.RawGetString("position").(lua.LString); ok {
 			m.Position = string(v)
 		}
+		if v, ok := t.RawGetString("mode").(lua.LString); ok {
+			m.Mode = string(v)
+		}
 		binds.ops = append(binds.ops, BindOp{Modal: m})
 		return 0
 	}))
@@ -1996,6 +2032,26 @@ func LoadClientWith(path string, overrides [][2]string) (ClientConfig, *ClientBi
 	L.SetField(tbl, "on", L.NewFunction(func(l *lua.LState) int {
 		event := l.CheckString(1)
 		binds.Alerts[event] = append(binds.Alerts[event], l.CheckFunction(2))
+		return 0
+	}))
+	// command{name=, desc=, run=fn} registers a user command: it shows in the
+	// command palette and runs by name from the palette, run_command or a bind.
+	// Convention is "namespace:verb". Re-registering a name replaces it.
+	L.SetField(tbl, "command", L.NewFunction(func(l *lua.LState) int {
+		t := l.CheckTable(1)
+		uc := UserCommand{Name: lua.LVAsString(t.RawGetString("name")), Desc: lua.LVAsString(t.RawGetString("desc"))}
+		fn, ok := t.RawGetString("run").(*lua.LFunction)
+		if uc.Name == "" || !ok {
+			l.ArgError(1, "command needs name and run")
+		}
+		uc.Fn = fn
+		for i := range binds.Commands {
+			if binds.Commands[i].Name == uc.Name {
+				binds.Commands[i] = uc
+				return 0
+			}
+		}
+		binds.Commands = append(binds.Commands, uc)
 		return 0
 	}))
 	// agents{ {match="claude", busy="✳"}, ... } declares which foreground

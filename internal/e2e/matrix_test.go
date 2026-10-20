@@ -30,11 +30,9 @@ func TestCopyMode(t *testing.T) {
 	c.WaitForText("row100")
 
 	c.Prefix("[")
-	// The copy-mode help line is wider than 80 cols, so the status bar keeps
-	// its tail (statusrender.go) — "(copy-mode)" clips off the left. Assert on
-	// tail-visible markers instead: the help ends in "q quit", and the
-	// position reads "line N/M".
-	c.WaitForStatus("q quit")
+	// Copy mode shows in the status bar's centre: the COPY pill and the
+	// position, "line N/M" (the bar itself stays).
+	c.WaitForStatus("COPY")
 
 	c.Type("g") // jump to the top so the forward search can find row50 below
 	c.WaitFor(func(s *harness.Screen) bool { return s.Status().Has("line 1/") })
@@ -44,8 +42,8 @@ func TestCopyMode(t *testing.T) {
 
 	c.Type("v")  // start selection
 	c.Type("jj") // extend down two lines
-	c.Type("y")  // yank -> exits copy-mode (help line, and its "q quit", gone)
-	c.WaitFor(func(s *harness.Screen) bool { return !s.Status().Has("q quit") })
+	c.Type("y")  // yank -> exits copy-mode (back to NORMAL)
+	c.WaitForStatus("NORMAL")
 
 	c.TypeLine("cat")
 	c.Prefix("]") // paste the yanked lines into cat
@@ -62,7 +60,7 @@ func TestCopyModePrefixBinds(t *testing.T) {
 	c.WaitForText("marker")
 
 	c.Prefix("[")
-	c.WaitForStatus("q quit")
+	c.WaitForStatus("COPY")
 
 	c.Prefix("c") // prefixed bind must fire despite copy-mode
 	// Window 2 (fresh shell) replaces window 1's content; wait for the switch
@@ -86,7 +84,7 @@ func TestCopyModeMouseFramed(t *testing.T) {
 	c.WaitForText("item5")
 
 	c.Prefix("[")
-	c.WaitForStatus("q quit")
+	c.WaitForStatus("COPY")
 
 	// Locate "item3" in physical screen space, then drag across it.
 	prow, pcol := -1, -1
@@ -104,7 +102,7 @@ func TestCopyModeMouseFramed(t *testing.T) {
 	c.Drag(pcol+1, prow+1, pcol+len("item3"), prow+1)
 	// Drag-release yanks + exits (copy_drag_finish default); the yank pipes
 	// through copy-command async — poll the file for what was selected.
-	c.WaitFor(func(s *harness.Screen) bool { return !s.Status().Has("q quit") })
+	c.WaitForStatus("NORMAL")
 	var got string
 	for i := 0; i < 50; i++ {
 		if b, err := os.ReadFile(out); err == nil && len(b) > 0 {
@@ -130,7 +128,7 @@ func TestCopyCommand(t *testing.T) {
 	c.WaitForText("PIPEME")
 
 	c.Prefix("[")
-	c.WaitForStatus("q quit")
+	c.WaitForStatus("COPY")
 	c.Type("/")
 	c.TypeLine("PIPEME")
 	c.WaitForText("PIPEME")
@@ -313,7 +311,7 @@ func TestRenameWindow(t *testing.T) {
 	c := harness.Start(t)
 	c.WaitForStatus(" 1 ")
 	c.Prefix(",")
-	c.WaitForStatus("(rename-window") // prompt open before typing
+	c.WaitForText("rename-window: ") // prompt open before typing
 	// Prefilled with the current name; clear it, then type a new one.
 	for i := 0; i < 20; i++ {
 		c.Key(0x7f) // backspace
@@ -330,9 +328,9 @@ func TestCommandPromptMultiPrompt(t *testing.T) {
 	c := harness.StartWithConfig(t, lua, "")
 	c.WaitForStatus(" 1 ")
 	c.Prefix("m")
-	c.WaitForStatus("(first") // first stage label
+	c.WaitForText("─ first ") // first stage label, on the prompt box border
 	c.TypeLine("alpha")
-	c.WaitForStatus("(second") // advanced to the second prompt
+	c.WaitForText("─ second ") // advanced to the second prompt
 	c.TypeLine("beta")
 	c.WaitForStatus("1 alphabeta") // template ran with both answers substituted
 }
@@ -342,7 +340,7 @@ func TestRenameSession(t *testing.T) {
 	c := harness.Start(t)
 	c.WaitForStatus("default")
 	c.Prefix("$")
-	c.WaitForStatus("(rename-session")
+	c.WaitForText("rename-session: ")
 	for i := 0; i < 20; i++ {
 		c.Key(0x7f)
 	}
@@ -1002,7 +1000,7 @@ func TestTargetSyntaxWithinSession(t *testing.T) {
 
 	// window by name
 	c.Prefix(",")
-	c.WaitForStatus("(rename-window")
+	c.WaitForText("rename-window: ")
 	for i := 0; i < 20; i++ {
 		c.Key(0x7f)
 	}
@@ -1791,7 +1789,7 @@ func TestMouseWheelEntersCopyMode(t *testing.T) {
 	c := harness.Start(t)
 	c.WaitForStatus(" 1 ")
 	c.WheelUp(5, 5) // wheel up inside the pane grid
-	c.WaitForText("hjkl")
+	c.WaitForStatus("COPY")
 }
 
 // TestMouseBorderDrag: dragging a pane divider resizes the split. The client
@@ -1823,7 +1821,7 @@ func TestMouseDragCopy(t *testing.T) {
 	c.WaitForText("DRAGME")
 
 	c.Drag(3, 3, 12, 3) // press, motion, release across the pane
-	c.WaitForStatus("q quit")
+	c.WaitForStatus("VISUAL") // copy mode with the dragged selection
 }
 
 // `status 2` reserves a second status row (structural round-trip, kept): the

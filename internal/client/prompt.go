@@ -64,6 +64,29 @@ func (p *prompt) label() string {
 	return p.kind
 }
 
+// question is the current stage's custom label (command-prompt -p), shown on
+// the prompt box's top border; "" when the prompt has none.
+func (p *prompt) question() string {
+	if s := len(p.answers); s < len(p.labels) {
+		return p.labels[s]
+	}
+	return ""
+}
+
+// origin names what the prompt will run, shown before the typed text
+// ("rename-window: foo") however it was opened — keybind or typed command.
+func (p *prompt) origin() string {
+	switch {
+	case p.kind == "session":
+		return "rename-session"
+	case p.kind == "window":
+		return "rename-window"
+	case len(p.tmpl) > 0:
+		return p.tmpl[0]
+	}
+	return "command"
+}
+
 // commit maps the typed text to a runCommand action, or nil to cancel (empty).
 func (p *prompt) commit() []string {
 	text := string(p.buf)

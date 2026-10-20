@@ -64,7 +64,12 @@ gtmux.options.status_interval = 15
 -- the terminal's own background shows through):
 --   left = ● session in the accent colour, then a clickable window list (click
 --   selects): the active window bold, the rest dim, a zoomed one marked ⤢ and
---   bell/activity/silence alerts as a red •; right = branch · host · clock, dim.
+--   bell/activity/silence alerts as a red •; right = branch · host · clock, dim;
+--   centre = the input mode (gtmux.context().mode): NORMAL dim, anything else
+--   (PREFIX, COPY, VISUAL, COMMAND, PICKER, MESSAGE, ...) as a coloured pill,
+--   followed by context().mode_info ("line 2/23", "search: foo", a message's
+--   text). Copy mode and messages never take the bar over; they live here.
+--   Info is cut to fit; the pill is dropped when it would overlap either side.
 -- The accent is active_border_fg (green unless your config sets it), so the
 -- bar follows the pane-border theme. #{...} still expands via gtmux.expand.
 gtmux.widget{ dock = "status", component = function(props, ui)
@@ -102,7 +107,38 @@ gtmux.widget{ dock = "status", component = function(props, ui)
   parts[#parts + 1] = gtmux.expand("#{host}")
   parts[#parts + 1] = gtmux.expand("#{clock}")
   local right = table.concat(parts, " · ")
-  ui:text(ui.w - len(right) - 1, 0, right, DIM)
+  local ctx = gtmux.context()
+  local mode, ctx_info = ctx.mode or "NORMAL", ctx.mode_info
+  -- A message needs the room more than branch/host/clock: hide them while up.
+  local rx = ui.w - 1
+  if mode ~= "MESSAGE" then
+    rx = ui.w - len(right) - 1
+    ui:text(rx, 0, right, DIM)
+  end
+  local pill = {
+    PREFIX = "yellow", REPEAT = "yellow", COPY = "blue", VISUAL = "magenta",
+    ["V-LINE"] = "magenta", ["V-BLOCK"] = "magenta", COMMAND = "cyan",
+    PROMPT = "cyan", CONFIRM = "red", MESSAGE = "green",
+  }
+  local label = " " .. mode .. " "
+  local info = ctx_info or ""
+  local room = rx - x - 2 -- cells free between the window list and the right side
+  if len(label) + 1 + len(info) > room then
+    info = info:sub(1, math.max(0, room - len(label) - 2)) -- ASCII-ish cut
+    if info ~= "" then info = info .. "…" end
+  end
+  local total = len(label) + (info ~= "" and 1 + len(info) or 0)
+  local mx = math.floor((ui.w - total) / 2)
+  mx = math.max(mx, x + 1)
+  if mx + total < rx then
+    if mode == "NORMAL" then
+      ui:text(mx, 0, label, DIM)
+    else
+      local bg = pill[mode] or (mode:find("^TABLE:") and "yellow") or "light_blue"
+      ui:text(mx, 0, label, "fg=black,bold,bg=" .. bg)
+    end
+    if info ~= "" then ui:text(mx + len(label) + 1, 0, info, "fg=default") end
+  end
 end }
 
 -- Cap status-left / status-right to N cells (tmux status-left-length /
@@ -149,6 +185,9 @@ end }
 -- Bind gtmux.toggle_dock(name) to show/hide it manually — the toggle
 -- overrides the breakpoint until toggled again:
 -- gtmux.bind("b", function() gtmux.toggle_dock("sessions") end)
+-- gtmux.hide_dock(name) / gtmux.show_dock(name) force one state instead.
+-- Every named dock also gets palette commands dock:hide-<name>,
+-- dock:show-<name> and dock:toggle-<name> (runnable via gtmux.run_command too).
 --
 -- Small-screen maximize: below cols_below the client keeps the active pane
 -- zoomed (one pane at a time, phone-style); crossing back above unzooms.
@@ -176,34 +215,11 @@ gtmux.bind("&", function() gtmux.confirm_before("kill-window", "kill this window
 -- just this session moves the client to another one (it only detaches when
 -- this was the last). prefix+Q-style binds without it kill and exit.
 gtmux.bind("q", function() gtmux.confirm_before("set-option detach-on-destroy off ; kill-session", "kill this session?") end)
--- prompt: a one-line text-input widget on the status/message line (position =
--- "status" — placeable elsewhere via gtmux.open). Type to edit, Enter submits
--- the text to on_submit, Esc cancels. Basis for rename (and command-prompt).
-local function prompt(label, initial, on_submit)
-  gtmux.open{
-    position = "status",
-    component = function(props, ui)
-      local st = ui:state(); if st.text == nil then st.text = initial or "" end
-      ui:fill("fg=black,bg=yellow") -- message-style
-      ui:text(0, 0, "(" .. label .. ") " .. st.text, "fg=black,bg=yellow")
-    end,
-    on_key = function(key, ui)
-      local st = ui:state(); if st.text == nil then st.text = initial or "" end
-      if key == "Enter" then on_submit(st.text); ui:close()
-      elseif key == "Escape" then ui:close()
-      elseif key == "BSpace" then st.text = st.text:sub(1, -2)
-      elseif #key == 1 then st.text = st.text .. key
-      end
-    end,
-  }
-end
-
-gtmux.bind("$", function()
-  prompt("rename-session", gtmux.expand("#{session}"), function(t) gtmux.rename_session(t) end)
-end)
-gtmux.bind(",", function()
-  prompt("rename-window", gtmux.expand("#{window_name}"), function(t) gtmux.rename_window(t) end)
-end)
+-- rename (prefix+$ / prefix+,): the shared prompt box at the top centre,
+-- prefilled with the current name — reads "rename-window: <name>", the same
+-- as typing rename-window into the command palette.
+gtmux.bind("$", gtmux.rename_session_prompt)
+gtmux.bind(",", gtmux.rename_window_prompt)
 gtmux.bind("z", gtmux.zoom)
 -- prefix+e toggles prose highlighting in agent panes (see gtmux.agents below):
 -- "syntax highlighting for English" — function words dim, Capitalized bold,
@@ -237,7 +253,7 @@ gtmux.bind("w", function()
     return rows
   end
   gtmux.open{
-    width = 46, height = 16,
+    width = 46, height = 16, mode = "PICKER",
     component = function(props, ui)
       local st = ui:state(); st.sel = st.sel or 1; st.filter = st.filter or ""
       ui:fill("bg=black")
@@ -274,7 +290,7 @@ end)
 -- the items, label_fn the display string, select_fn acts on the chosen one.
 local function simple_picker(title, rows_fn, label_fn, select_fn)
   gtmux.open{
-    width = 34, height = 12,
+    width = 34, height = 12, mode = "PICKER",
     component = function(props, ui)
       local st = ui:state(); st.sel = st.sel or 1
       ui:fill("bg=black")
@@ -351,7 +367,7 @@ gtmux.bind("=", gtmux.choose_buffer)
 -- status tick, so #{clock} stays current.
 gtmux.bind("t", function()
   gtmux.open{
-    width = 16, height = 5,
+    width = 16, height = 5, mode = "CLOCK",
     component = function(props, ui)
       ui:fill("bg=black")
       ui:box(0, 0, ui.w, ui.h, { style = "fg=green" })
@@ -365,7 +381,7 @@ end)
 -- grabs all keys. Unlocks on the lock_password (or any key if none is set).
 function gtmux.lock()
   gtmux.open{
-    position = "full",
+    position = "full", mode = "LOCKED",
     component = function(props, ui)
       local st = ui:state(); st.buf = st.buf or ""
       ui:fill("bg=black")
@@ -390,6 +406,10 @@ end
 -- lists those to fuzzy-pick. Text matching nothing runs as typed. With -p
 -- labels or a template, gtmux.command_prompt() opens the classic prompt.
 gtmux.bind(":", gtmux.command_prompt)
+-- Your own palette commands: gtmux.command{name, desc, run}. Runs like a bind;
+-- name convention is "namespace:verb" (a name equal to a built-in is ignored).
+-- gtmux.command{ name = "my:agents", desc = "split a claude pane",
+--   run = function() gtmux.run_command("split-window -h claude") end }
 gtmux.bind("[", gtmux.enter_copy_mode)
 gtmux.bind("]", gtmux.paste)
 

@@ -96,12 +96,14 @@ type palette struct {
 	cmd   *paletteCmd // stage two: the command whose argument is being picked; nil = stage one
 	off   int         // where the query starts in picker.filter (0 in stage one)
 	cands func(kind string) (items, targets []string)
+	cmds  []paletteCmd // paletteCmds plus config-registered and generated dock commands
 }
 
 // newPalettePicker opens the palette; cands supplies stage-two candidates from
-// the compositor's mirrored state.
-func newPalettePicker(cands func(kind string) (items, targets []string)) *picker {
-	p := &picker{title: "command", verb: "run", filterable: true, palette: &palette{cands: cands}}
+// the compositor's mirrored state; extra are appended after the built-ins.
+func newPalettePicker(cands func(kind string) (items, targets []string), extra ...paletteCmd) *picker {
+	cmds := append(paletteCmds[:len(paletteCmds):len(paletteCmds)], extra...)
+	p := &picker{title: "command", verb: "run", filterable: true, palette: &palette{cands: cands, cmds: cmds}}
 	p.palette.refresh(p)
 	return p
 }
@@ -109,15 +111,15 @@ func newPalettePicker(cands func(kind string) (items, targets []string)) *picker
 // refresh re-derives the stage and item list from the typed text.
 func (pl *palette) refresh(p *picker) {
 	pl.cmd, pl.off = nil, 0
-	for i := range paletteCmds {
-		c := &paletteCmds[i]
+	for i := range pl.cmds {
+		c := &pl.cmds[i]
 		if c.arg != "" && strings.HasPrefix(p.filter, c.name+" ") && (pl.cmd == nil || len(c.name) > len(pl.cmd.name)) {
 			pl.cmd = c
 		}
 	}
 	if pl.cmd == nil {
 		p.items, p.targets, p.descs = nil, nil, nil
-		for _, c := range paletteCmds {
+		for _, c := range pl.cmds {
 			p.items = append(p.items, c.name)
 			p.targets = append(p.targets, c.name)
 			p.descs = append(p.descs, c.desc)
@@ -129,6 +131,15 @@ func (pl *palette) refresh(p *picker) {
 	if pl.cmd.arg != "text" && pl.cands != nil {
 		p.items, p.targets = pl.cands(pl.cmd.arg)
 	}
+}
+
+// inputText is the palette input as shown: a free-text argument reads as a
+// prompt, "rename-window: foo", like every other prompt (see overlayRowPrompt).
+func (pl *palette) inputText(p *picker) string {
+	if pl.cmd != nil && pl.cmd.arg == "text" {
+		return pl.cmd.name + ": " + p.filter[pl.off:]
+	}
+	return p.filter
 }
 
 // listTitle labels the list box: "commands", or the argument being picked.
@@ -143,13 +154,24 @@ func (pl *palette) listTitle() string {
 }
 
 // byName returns the catalog entry with this exact name.
-func paletteByName(name string) *paletteCmd {
-	for i := range paletteCmds {
-		if paletteCmds[i].name == name {
-			return &paletteCmds[i]
+func (pl *palette) byName(name string) *paletteCmd {
+	for i := range pl.cmds {
+		if pl.cmds[i].name == name {
+			return &pl.cmds[i]
 		}
 	}
 	return nil
+}
+
+// builtinCmd reports whether name is a built-in palette command (its first
+// word), so a gtmux.command can't shadow one.
+func builtinCmd(name string) bool {
+	for _, c := range paletteCmds {
+		if strings.Fields(c.name)[0] == name {
+			return true
+		}
+	}
+	return false
 }
 
 // setFilter replaces the typed text (Tab / Enter completion) and re-derives.
@@ -170,7 +192,7 @@ func (pl *palette) complete(p *picker) {
 		pl.setFilter(p, pl.cmd.name+" "+t)
 		return
 	}
-	if c := paletteByName(t); c != nil && c.arg != "" {
+	if c := pl.byName(t); c != nil && c.arg != "" {
 		t += " "
 	}
 	pl.setFilter(p, t)
@@ -184,7 +206,7 @@ func (pl *palette) commit(p *picker) pickerResult {
 		if !have {
 			return pickerResult{done: true, action: tokenize(p.filter)} // run as typed (nil = cancel)
 		}
-		c := paletteByName(p.targets[v[p.sel]])
+		c := pl.byName(p.targets[v[p.sel]])
 		if c.arg != "" {
 			pl.setFilter(p, c.name+" ") // needs an argument: move to stage two
 			return pickerResult{}
@@ -201,6 +223,9 @@ func (pl *palette) commit(p *picker) pickerResult {
 	}
 	if strings.TrimSpace(p.filter[pl.off:]) == "" {
 		return pickerResult{} // nothing typed for the argument yet: stay open
+	}
+	if pl.cmd.arg == "text" { // free text is ONE argument: spaces kept
+		return pickerResult{done: true, action: append(tokenize(pl.cmd.name), p.filter[pl.off:])}
 	}
 	return pickerResult{done: true, action: tokenize(p.filter)}
 }
@@ -223,4 +248,36 @@ func confirmKill(act []string) []string {
 		}
 	}
 	return append([]string{"confirm-before", "-p", strings.ReplaceAll(label, ",", " "), "--"}, act...)
+}
+
+// dockVerbs are the generated per-dock commands: dock:<verb>-<name> for every
+// named dock, mapped to setDock's mode.
+var dockVerbs = []struct {
+	verb string
+	mode int8
+}{{"hide", -1}, {"show", 1}, {"toggle", 0}}
+
+// dockPaletteCmds generates the dock:hide/show/toggle-<name> entries.
+func dockPaletteCmds(names []string) []paletteCmd {
+	var out []paletteCmd
+	for _, n := range names {
+		for _, v := range dockVerbs {
+			out = append(out, paletteCmd{"dock:" + v.verb + "-" + n, v.verb + " the " + n + " dock", ""})
+		}
+	}
+	return out
+}
+
+// parseDockCmd is dockPaletteCmds' inverse: "dock:hide-sidebar" → ("sidebar", -1).
+func parseDockCmd(cmd string) (name string, mode int8, ok bool) {
+	rest, ok := strings.CutPrefix(cmd, "dock:")
+	if !ok {
+		return "", 0, false
+	}
+	for _, v := range dockVerbs {
+		if n, ok := strings.CutPrefix(rest, v.verb+"-"); ok && n != "" {
+			return n, v.mode, true
+		}
+	}
+	return "", 0, false
 }
