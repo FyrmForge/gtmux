@@ -30,3 +30,7 @@ make install    # go install ./cmd/gtmux
 go test ./...   # unit tests
 go test -tags=e2e ./internal/e2e/   # full-stack e2e
 ```
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE) for details.
