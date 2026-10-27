@@ -1942,3 +1942,19 @@ func TestSwitchClientPaneTarget(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 }
+
+// Killing the current window returns to the previously active one (tmux), not
+// the neighbour that slides into its index.
+func TestKillWindowReturnsToLast(t *testing.T) {
+	c := harness.Start(t)
+	promptReady(c)
+	for _, n := range []string{"a", "b", "c"} {
+		c.Run("run", "default", "new-window", "-n", n)
+	}
+	c.Run("run", "default", "select-window", "-t", "a")
+	c.Run("run", "default", "select-window", "-t", "b")
+	c.Run("run", "default", "kill-window")
+	if got := strings.TrimSpace(c.Run("run", "default", "display-message", "-p", "#{window_name}")); got != "a" {
+		t.Fatalf("after kill, current window = %q, want a (the last one)", got)
+	}
+}

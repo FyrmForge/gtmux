@@ -1626,6 +1626,15 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string, re
 			done = true
 			return
 		}
+		// Killing the current window returns to the previous one (tmux), else
+		// the neighbour that slid into its slot.
+		next := active % len(windows)
+		if idx == active && lastWindow != idx && lastWindow <= len(windows) {
+			next = lastWindow
+			if idx < lastWindow {
+				next--
+			}
+		}
 		// Keep lastWindow pointing at the same window across the index shift;
 		// if that window is the one removed, there's no meaningful last.
 		switch {
@@ -1638,7 +1647,7 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string, re
 		case idx < active:
 			active--
 		case idx == active:
-			switchToWindow(active % len(windows))
+			switchToWindow(next)
 		}
 	}
 

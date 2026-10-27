@@ -396,10 +396,21 @@ func (c *compositor) modeInfo() string {
 	return ""
 }
 
-// promptInput is the prompt's input line as shown: what it will run, then the
-// typed text ("rename-window: foo").
-func (c *compositor) promptInput() string {
-	return c.prompt.origin() + ": " + string(c.prompt.buf)
+// promptView is the slice of the prompt text that fits in room cells, and the
+// cursor's offset into it: the tail while the cursor is at the end, scrolled
+// back just enough to keep it in view when it moves left.
+func (c *compositor) promptView(room int) ([]rune, int) {
+	t := []rune(string(c.prompt.buf))
+	cur := len([]rune(string(c.prompt.head())))
+	room = max(1, room)
+	if len(t) <= room {
+		return t, cur
+	}
+	start := max(0, min(len(t)-room, cur-room+1))
+	if cur == len(t) {
+		start = len(t) - room + 1 // leave a cell for the cursor after the text
+	}
+	return t[start:min(len(t), start+room)], cur - start
 }
 
 // overlayRowPrompt paints a text prompt into the command palette's top-centre
@@ -448,10 +459,7 @@ func (c *compositor) overlayRowPrompt(row int, line emu.Line) {
 		put(w-1, "│", accent, 0)
 		x := put(2, "❯ ", accent, emu.AttrBold)
 		x = put(x, c.prompt.origin()+": ", accent, 0)
-		t := []rune(string(c.prompt.buf))
-		if room := w - 2 - x; len(t) > room {
-			t = t[len(t)-max(0, room):] // keep the tail you're typing visible
-		}
+		t, _ := c.promptView(w - 2 - x)
 		put(x, string(t), emu.DefaultFG, emu.AttrBold)
 	}
 	for i, g2 := range cells {
@@ -1104,7 +1112,9 @@ func (c *compositor) activeCursor() (row, col int, visible bool) {
 	// A text prompt types into the same top-centre box (overlayRowPrompt).
 	if c.prompt != nil {
 		g := c.findGeometry()
-		col := g.inLeft + 4 + min(len([]rune(c.promptInput())), g.inW-6)
+		x := 4 + len([]rune(c.prompt.origin()+": ")) // overlayRowPrompt's text start
+		_, cur := c.promptView(g.inW - 2 - x)
+		col := g.inLeft + x + cur
 		return g.top + 1 + off, col, col < c.cols()
 	}
 	// A preview is someone else's screen: a live cursor blinking over it points

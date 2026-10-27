@@ -4,6 +4,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/FyrmForge/gtmux/internal/emu"
 	"github.com/FyrmForge/gtmux/internal/proto"
@@ -15,6 +16,7 @@ import (
 type prompt struct {
 	kind    string // "session" | "window" | "command" | "confirm"
 	buf     []byte
+	back    int      // cursor: bytes from the end of buf (0 = at the end, the zero value)
 	labels  []string // custom labels (command-prompt -p, comma-split; confirm-before -p); one per prompt stage. empty = default
 	answers []string // command-prompt: answers collected from stages already committed
 	tmpl    []string // command-prompt template: %1..%N/%% substituted with the answers; nil = run text verbatim
@@ -205,7 +207,35 @@ func (p *prompt) feed(data []byte) promptResult {
 		}
 		return promptResult{}
 	}
-	for _, b := range data {
+	for i := 0; i < len(data); i++ {
+		b := data[i]
+		// Cursor keys arrive as ESC [ x / ESC O x; read them in-chunk so the ESC
+		// doesn't cancel. Unknown sequences are swallowed.
+		if b == 0x1b && i+1 < len(data) && (data[i+1] == '[' || data[i+1] == 'O') {
+			j := i + 2
+			for j < len(data) && (data[j] < 0x40 || data[j] > 0x7e) {
+				j++
+			}
+			if j < len(data) {
+				switch string(data[i+2 : j+1]) {
+				case "D":
+					p.left()
+				case "C":
+					p.right()
+				case "H", "1~", "7~":
+					p.back = len(p.buf)
+				case "F", "4~", "8~":
+					p.back = 0
+				case "3~": // Delete: the rune under the cursor
+					if p.back > 0 {
+						p.right()
+						p.backspace()
+					}
+				}
+				i = j
+				continue
+			}
+		}
 		switch b {
 		case '\r', '\n':
 			// command-prompt may have more stages to collect (tmux -p "a,b");
@@ -217,31 +247,61 @@ func (p *prompt) feed(data []byte) promptResult {
 		case 0x1b:
 			return promptResult{done: true}
 		case 0x7f, 0x08: // DEL / backspace
-			if len(p.buf) > 0 {
-				p.buf = p.buf[:len(p.buf)-1]
-			}
-		case 0x15: // C-u: kill the whole line (emacs status-keys)
+			p.backspace()
+		case 0x01: // C-a / C-e: start / end of line (emacs status-keys)
 			if p.editKeys {
-				p.buf = p.buf[:0]
+				p.back = len(p.buf)
 			}
-		case 0x17: // C-w: kill the last word (emacs status-keys)
+		case 0x05:
 			if p.editKeys {
-				n := len(p.buf)
+				p.back = 0
+			}
+		case 0x15: // C-u: kill everything before the cursor (emacs status-keys)
+			if p.editKeys {
+				p.buf = p.buf[len(p.buf)-p.back:]
+			}
+		case 0x17: // C-w: kill the word before the cursor (emacs status-keys)
+			if p.editKeys {
+				at := len(p.buf) - p.back
+				n := at
 				for n > 0 && p.buf[n-1] == ' ' {
 					n--
 				}
 				for n > 0 && p.buf[n-1] != ' ' {
 					n--
 				}
-				p.buf = p.buf[:n]
+				p.buf = append(p.buf[:n], p.buf[at:]...)
 			}
 		default:
 			if b >= 0x20 && b < 0x7f {
-				p.buf = append(p.buf, b)
+				at := len(p.buf) - p.back
+				p.buf = append(p.buf[:at], append([]byte{b}, p.buf[at:]...)...)
 			}
 		}
 	}
 	return promptResult{}
+}
+
+// head is the text before the cursor.
+func (p *prompt) head() []byte { return p.buf[:len(p.buf)-p.back] }
+
+func (p *prompt) left() {
+	if _, n := utf8.DecodeLastRune(p.head()); n > 0 {
+		p.back += n
+	}
+}
+
+func (p *prompt) right() {
+	if _, n := utf8.DecodeRune(p.buf[len(p.buf)-p.back:]); n > 0 {
+		p.back -= n
+	}
+}
+
+func (p *prompt) backspace() {
+	h := p.head()
+	if _, n := utf8.DecodeLastRune(h); n > 0 {
+		p.buf = append(h[:len(h)-n], p.buf[len(h):]...)
+	}
 }
 
 // picker is a client-owned selection list (choose-window / choose-session).

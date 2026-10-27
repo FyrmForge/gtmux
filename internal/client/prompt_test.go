@@ -159,3 +159,24 @@ func TestSplitSeq(t *testing.T) {
 		t.Fatalf("nil splitSeq = %q", got)
 	}
 }
+
+// Arrow keys move the cursor instead of the ESC cancelling the prompt; typing,
+// backspace and Delete edit at the cursor, Home/End jump.
+func TestPromptCursor(t *testing.T) {
+	p := &prompt{kind: "window", buf: []byte("héllo")}
+	if r := p.feed([]byte("\x1b[D\x1b[D")); r.done {
+		t.Fatal("left arrow closed the prompt")
+	}
+	p.feed([]byte("X\x7f\x7fY")) // insert, then backspace twice: X and the l before it
+	if string(p.buf) != "héYlo" {
+		t.Fatalf("buf = %q", p.buf)
+	}
+	p.feed([]byte("\x1b[H\x1b[C\x1b[3~")) // Home, right past h, Delete the é
+	if string(p.buf) != "hYlo" || string(p.head()) != "h" {
+		t.Fatalf("buf = %q head = %q", p.buf, p.head())
+	}
+	p.feed([]byte("\x1b[F!"))
+	if string(p.buf) != "hYlo!" {
+		t.Fatalf("buf = %q", p.buf)
+	}
+}
