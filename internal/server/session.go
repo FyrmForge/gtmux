@@ -3133,26 +3133,37 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string, re
 			rest = flags
 			wasZoomed := tw.zoomed
 			hasDir := len(rest) > 0 && flagDir[rest[0]] != ""
+			switched := false
 			if targeted {
-				active = twi
 				if tp != tw.active {
 					tw.lastActive = tw.active
 					tw.setActive(tp)
+				}
+				// A pane in another window: a real window switch. A bare
+				// `active = twi` left the new window's view inactive, so it
+				// painted once and never sent diffs again (frozen pane).
+				if twi != active {
+					if keepZoom && wasZoomed { // re-zoom first: the switch's fullSync then shows it
+						actorDo(tw, func() { tw.zoomed = true; tw.reflow() })
+					}
+					switchToWindow(twi) // sends its own fullSync
+					prevFocus = windows[active].actor.active // switchToWindow refocused
+					switched = true
 				}
 			}
 			if hasDir {
 				navigate(flagDir[rest[0]])
 			}
-			if keepZoom && wasZoomed {
+			if keepZoom && wasZoomed && !switched {
 				// navigate() unzoomed (directional), or a targeted change left
 				// zoom pointing at the old pane's rect: re-zoom onto the new
 				// active pane so its PTY reflows to the full window.
 				w := activeWindow()
 				actorDo(w, func() { w.zoomed = true; w.reflow() })
 				send(fullSync())
-			} else if targeted {
-				// A target may switch windows; navigate only sends Layout (no
-				// cells), so fullSync to redraw the target window's content.
+			} else if targeted && !switched {
+				// navigate only sends Layout (no cells): fullSync to redraw the
+				// newly active pane's content.
 				send(fullSync())
 			}
 			refocus(prevFocus)
