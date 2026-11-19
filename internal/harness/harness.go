@@ -215,6 +215,19 @@ func (c *Client) NewPeerReadOnly(cols, rows int) *Client {
 	return &Client{t: c.t, srv: c.srv, sess: c.sess, be: be, cols: cols, rows: rows}
 }
 
+// Bin is the gtmux binary under test — for typing gtmux CLI commands into a
+// pane (they inherit the daemon's GTMUX_SOCK, so they talk to this server).
+func (c *Client) Bin() string { return c.srv.bin }
+
+// SpawnTTY runs `gtmux <verb> <arg> [extra...]` on its own pty against this
+// server — e.g. the standalone `gtmux workspace` picker — as a drivable Client.
+// Pty backend only.
+func (c *Client) SpawnTTY(cols, rows int, verb, arg string, extra ...string) *Client {
+	c.t.Helper()
+	be := c.srv.ptyAttach(c.t, verb, arg, cols, rows, extra...)
+	return &Client{t: c.t, srv: c.srv, be: be, cols: cols, rows: rows}
+}
+
 // AttachSession attaches an 80x24 client to a different session name (created
 // on demand) — for choose-session / multi-session tests.
 func (c *Client) AttachSession(name string) *Client {

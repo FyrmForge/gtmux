@@ -187,18 +187,15 @@ func paneEnv(sessionName string, id int) []string {
 	)
 }
 
-// spawnPane starts a new shell in dir (the empty string leaves it to the
-// shell's own default, generally the server process's cwd). command, if set,
-// runs via `shell -c command` (tmux's new-window/split-window [command]) — the
-// pane exits when it finishes, same as tmux. win == nil is a display-popup
-// backing pane: no window wiring, held at session level (sessionName is passed
-// explicitly since there's no window to read it from).
-func spawnPane(win *window, sessionName string, r rect, dir, command string) (*pane, error) {
+// paneCmd is the process a pane runs (spawn and respawn alike): command via
+// the shell, default-command when command is empty, else a login shell; env is
+// the pane's own, then global (set-environment -g), then session on top —
+// tmux's precedence. win == nil (popup) gets only the pane env.
+func paneCmd(win *window, sessionName string, id int, dir, command string) *exec.Cmd {
 	shell := resolveShell()
 	if command == "" {
-		command = defaultCommand // empty leaves a login shell (below)
+		command = defaultCommand
 	}
-	id := int(nextPaneID.Add(1))
 	cmd := exec.Command(shell)
 	if command != "" {
 		cmd = exec.Command(shell, "-c", command)
@@ -206,8 +203,6 @@ func spawnPane(win *window, sessionName string, r rect, dir, command string) (*p
 	cmd.Dir = dir
 	cmd.Env = paneEnv(sessionName, id)
 	if win != nil {
-		// Environment: global (set-environment -g) first, then session env on top
-		// so a session-scoped var overrides a global one — tmux's precedence.
 		for k, v := range win.globalEnv {
 			cmd.Env = append(cmd.Env, k+"="+v)
 		}
@@ -215,6 +210,18 @@ func spawnPane(win *window, sessionName string, r rect, dir, command string) (*p
 			cmd.Env = append(cmd.Env, k+"="+v)
 		}
 	}
+	return cmd
+}
+
+// spawnPane starts a new shell in dir (the empty string leaves it to the
+// shell's own default, generally the server process's cwd). command, if set,
+// runs via `shell -c command` (tmux's new-window/split-window [command]) — the
+// pane exits when it finishes, same as tmux. win == nil is a display-popup
+// backing pane: no window wiring, held at session level (sessionName is passed
+// explicitly since there's no window to read it from).
+func spawnPane(win *window, sessionName string, r rect, dir, command string) (*pane, error) {
+	id := int(nextPaneID.Add(1))
+	cmd := paneCmd(win, sessionName, id, dir, command)
 	f, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: uint16(r.Rows), Cols: uint16(r.Cols)})
 	if err != nil {
 		return nil, err
@@ -240,13 +247,7 @@ func spawnPane(win *window, sessionName string, r rect, dir, command string) (*p
 // Bumps gen so the old reader goroutine's trailing events are ignored; the
 // caller must start a new watcher (watchPane) afterward.
 func (p *pane) respawn(sessionName, command string) error {
-	shell := resolveShell()
-	cmd := exec.Command(shell)
-	if command != "" {
-		cmd = exec.Command(shell, "-c", command)
-	}
-	cmd.Dir = p.cwd()
-	cmd.Env = paneEnv(sessionName, p.id)
+	cmd := paneCmd(p.win, sessionName, p.id, p.cwd(), command)
 	f, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: uint16(p.rect.Rows), Cols: uint16(p.rect.Cols)})
 	if err != nil {
 		return err

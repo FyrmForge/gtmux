@@ -29,6 +29,12 @@ Commands:
   kill-server                           shut down the daemon and all sessions
   upgrade                               re-exec the daemon into the installed binary, sessions kept
   init-config [--force]                 write default server.lua + client.lua to ~/.config/gtmux
+  workspace, ws [<ws> [<project>]]      project picker / open a project (clones if needed)
+  workspace, ws home [<ws>]             open a workspace's home session (ws.add{ home = ... })
+  workspace, ws refresh [<ws>]          refresh a workspace's GitHub repo list now
+  workspace, ws new [<ws>] [<name>]     new-project wizard (flags skip it: --template T --gh --private)
+  temp, t [<name>]                      temp workspace under $TMPDIR (no name = next number)
+  temp, t rm <name>                     delete a temp workspace's folder
   help, -h, --help                      show this help
 `
 
@@ -143,6 +149,10 @@ func main() {
 			os.Exit(1)
 		}
 		err = client.RenameSession(os.Args[2], os.Args[3])
+	case "temp", "t":
+		err = client.Temp(os.Args[2:])
+	case "workspace", "ws":
+		err = client.Workspace(os.Args[2:])
 	case "help", "-h", "--help":
 		usage(os.Stdout)
 	default:

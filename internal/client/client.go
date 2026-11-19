@@ -369,6 +369,7 @@ func RunGroup(session string, create bool, groupTarget string, readOnly bool) er
 				}
 				return ""
 			},
+			Workspace: workspaceQuery,
 		}
 	}
 	installHooks(binds0)

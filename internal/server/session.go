@@ -18,6 +18,7 @@ import (
 	"github.com/FyrmForge/gtmux/internal/emu"
 	"github.com/FyrmForge/gtmux/internal/format"
 	"github.com/FyrmForge/gtmux/internal/proto"
+	"github.com/FyrmForge/gtmux/internal/workspace"
 )
 
 // attachment is one client attached to a session. A session can have several
@@ -221,6 +222,9 @@ type session struct {
 	name   string
 	events chan interface{}
 	gone   chan struct{} // closed when the run loop exits; unblocks command()
+	// initEnv seeds the set-environment map before the first pane spawns
+	// (workspace sessions). Set before run starts, read-only after.
+	initEnv map[string]string
 }
 
 // ptyOutput is a chunk of output read from one pane's PTY, or its
@@ -591,6 +595,9 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string, re
 	// created earlier (future panes only, like tmux). ponytail: session-scoped;
 	// tmux -g (global) deferred.
 	sessionEnv := map[string]string{}
+	for k, v := range s.initEnv {
+		sessionEnv[k] = v
+	}
 	if resume != nil {
 		for k, v := range resume.Env {
 			sessionEnv[k] = v
@@ -1526,6 +1533,9 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string, re
 	// detached focus ran, and either side may have died meanwhile.
 	finishSwitch := func(epoch int, name string) {
 		if _, ok := attachments[epoch]; !ok {
+			return
+		}
+		if name == s.name { // already here (e.g. workspace-open of this project)
 			return
 		}
 		if _, ok := reg.get(name); !ok {
@@ -3845,6 +3855,58 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string, re
 			content := p.fullContent()
 			// Only the opening client sees/drives its popup.
 			sendTo(actingEpoch, &proto.ServerMsg{Popup: &proto.PopupMsg{Open: true, Cols: pr.Cols, Rows: pr.Rows, X: px, Y: py, Content: &content}})
+		case "workspace-open", "workspace-new":
+			// workspace-open <workspace|""> <project>: clone if needed, build the
+			// project's session, then switch the acting client to it.
+			// workspace-new <workspace|""> <name> [<template> [gh [private]]]:
+			// scaffold it first (gh/private = "1"). Async — a clone or GitHub
+			// call can take seconds and must not stall this session; failures
+			// land as a status message. "" = this session's own workspace.
+			if len(args) < 2 {
+				return cmd + ": usage: " + cmd + " <workspace> <project>"
+			}
+			ws, project := args[0], args[1]
+			if ws == "" || ws == `""` {
+				ws = userOpts["@workspace"]
+			}
+			if project == `""` { // temp: "" = next number
+				project = ""
+			}
+			env := map[string]string{"SSH_AUTH_SOCK": sessionEnv["SSH_AUTH_SOCK"]}
+			ep := actingEpoch // the asker: switch THIS client, not whoever acts later
+			go func() {
+				showMsg := func(text string) {
+					select {
+					case s.events <- messageEvent{text: text}:
+					case <-s.gone:
+					}
+				}
+				var name string
+				var err error
+				if cmd == "workspace-new" {
+					arg := func(i int) string {
+						if i < len(args) && args[i] != `""` {
+							return args[i]
+						}
+						return ""
+					}
+					showMsg("workspace: creating " + project + "…")
+					name, err = reg.workspaceNew(ws, workspace.NewOpts{
+						Name: project, Template: arg(2), GitHub: arg(3) == "1", Private: arg(4) == "1", Env: env,
+					})
+				} else {
+					showMsg("workspace: opening " + project + "…")
+					name, err = reg.workspaceOpen(ws, project, env)
+				}
+				if err != nil {
+					showMsg("workspace: " + err.Error())
+					return
+				}
+				select {
+				case s.events <- switchHandoffEvent{epoch: ep, name: name}:
+				case <-s.gone:
+				}
+			}()
 		case "run-shell":
 			if rest == "" {
 				return "run-shell: no command"

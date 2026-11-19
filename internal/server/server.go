@@ -22,6 +22,7 @@ import (
 
 	"github.com/FyrmForge/gtmux/internal/config"
 	"github.com/FyrmForge/gtmux/internal/proto"
+	"github.com/FyrmForge/gtmux/internal/workspace"
 )
 
 // registry is the daemon's lookup of live sessions by name. It's touched
@@ -113,6 +114,10 @@ type registry struct {
 	// summary build + status stamp are skipped when it's zero. Guarded by mu.
 	snapshots map[string]*proto.SnapSession
 	snapWant  int
+	// ws is the workspace manager (gtmux.workspace.*); never nil, errors
+	// politely when no workspaces are configured.
+	ws      *workspace.Manager
+	opening map[string]*sync.Mutex // per-project workspace-open locks (workspace.go)
 }
 
 // wantSnapshot adjusts the count of attached clients that use widget queries. A
@@ -304,20 +309,35 @@ func (r *registry) resolve(name string, create bool, cols, rows int, cwd string)
 	return r.resolveGroup(name, create, cols, rows, cwd, "")
 }
 
+// createWithEnv creates a session whose first pane already has env (workspace
+// sessions), instead of set-environment + respawn after the fact.
+func (r *registry) createWithEnv(name string, cols, rows int, cwd string, env map[string]string) (*session, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.createLocked(name, cols, rows, cwd, "", env)
+}
+
+// createLocked registers and starts a new session ("" = auto-named); env
+// seeds its set-environment map before the first pane spawns. Caller holds r.mu.
+func (r *registry) createLocked(name string, cols, rows int, cwd, groupTarget string, env map[string]string) (*session, error) {
+	if name == "" {
+		name = r.autoName()
+	} else if _, taken := r.sessions[name]; taken {
+		return nil, fmt.Errorf("duplicate session: %s", name)
+	}
+	s := newSession(name)
+	s.initEnv = env
+	r.sessions[name] = s
+	go s.run(r, cols, rows, cwd, groupTarget, nil)
+	return s, nil
+}
+
 func (r *registry) resolveGroup(name string, create bool, cols, rows int, cwd, groupTarget string) (*session, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if create {
-		if name == "" {
-			name = r.autoName()
-		} else if _, taken := r.sessions[name]; taken {
-			return nil, fmt.Errorf("duplicate session: %s", name)
-		}
-		s := newSession(name)
-		r.sessions[name] = s
-		go s.run(r, cols, rows, cwd, groupTarget, nil)
-		return s, nil
+		return r.createLocked(name, cols, rows, cwd, groupTarget, nil)
 	}
 
 	if name == "" {
@@ -620,6 +640,7 @@ func Run(resumePath string) error {
 		clientOpts:        map[string]string{},
 		userOpts:          map[string]string{},
 		waitCh:            map[string]*waitChan{},
+		ws:                workspace.Start(cfg.Workspaces),
 	}
 	if lf, err := ln.(*net.UnixListener).File(); err == nil {
 		reg.lnFile = lf
@@ -792,6 +813,15 @@ func acceptConn(reg *registry, conn net.Conn) {
 			}
 		} else {
 			enc.Encode(&proto.ServerMsg{Ack: &proto.Ack{Ok: false, Err: "no such session: " + sess}})
+		}
+		conn.Close()
+		return
+	}
+	if msg.Workspace != nil {
+		if rep, err := reg.handleWorkspace(msg.Workspace); err != nil {
+			enc.Encode(&proto.ServerMsg{Ack: &proto.Ack{Ok: false, Err: err.Error()}})
+		} else {
+			enc.Encode(&proto.ServerMsg{Ack: &proto.Ack{Ok: true}, Workspace: rep})
 		}
 		conn.Close()
 		return

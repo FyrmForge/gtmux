@@ -12,6 +12,8 @@ import (
 	"strings"
 
 	lua "github.com/yuin/gopher-lua"
+
+	"github.com/FyrmForge/gtmux/internal/workspace"
 )
 
 //go:embed default_server.lua
@@ -139,6 +141,9 @@ type ServerConfig struct {
 	// when that event fires. Seeded globally here; each session gets its own
 	// copy so a runtime set-hook stays session-local (no shared mutable state).
 	Hooks map[string][]string
+	// Workspaces is gtmux.workspace.* (WORKSPACE_PLAN.md); nil when none are
+	// declared. It keeps the server VM alive for function layouts.
+	Workspaces *workspace.Config
 }
 
 // DefaultUpdateEnvironment is tmux's built-in update-environment list.
@@ -263,15 +268,25 @@ func parseKeyName(s string) (string, bool) {
 }
 
 // LoadServer reads the server's options from the bundled defaults, then the
-// user's server.lua (if any) layered on top. A throwaway VM: no bound
-// functions outlive the load.
+// user's server.lua (if any) layered on top. A throwaway VM — unless the file
+// declares workspaces, whose function layouts need it alive (cfg.Workspaces).
 func LoadServer(userPath string) ServerConfig {
 	L := lua.NewState()
-	defer L.Close()
 	cfg := ServerConfig{SessionName: "%d", MainPaneWidth: 80, MainPaneHeight: 24, HistoryLimit: 2000, DisplayTime: 750, MessageLimit: 1000, AutomaticRename: true, AutomaticRenameFormat: "#{pane_command}", DetachOnDestroy: true, PaneBorderStatus: "off", PaneBorderFormat: "#{pane_index} #{pane_command}", WindowSize: "latest", RemainOnExit: "off", UpdateEnvironment: DefaultUpdateEnvironment(), ExitEmpty: true, BellAction: "any", ActivityAction: "other", Hooks: map[string][]string{}}
 
 	tbl := L.NewTable()
+	// loaded flips once the files have run. The VM can outlive the load (function
+	// layouts run at open time on other goroutines), where these setters would
+	// write maps the live daemon reads: refuse there. Checked inside the real
+	// closures, so a `local set = gtmux.set_option` alias is covered too.
+	loaded := false
+	loadOnly := func(l *lua.LState) {
+		if loaded {
+			l.RaiseError("gtmux.set_option/set_hook are load-time only (not from a layout or template function)")
+		}
+	}
 	L.SetField(tbl, "set_option", L.NewFunction(func(l *lua.LState) int {
+		loadOnly(l)
 		// The server-side options; status_* / prefix are the client's and are
 		// ignored here.
 		switch l.CheckString(1) {
@@ -364,9 +379,11 @@ func LoadServer(userPath string) ServerConfig {
 	// set_hook(name, cmd): register a command to run when the event fires.
 	// Replaces any previous command for that name (tmux set-hook default).
 	L.SetField(tbl, "set_hook", L.NewFunction(func(l *lua.LState) int {
+		loadOnly(l)
 		cfg.Hooks[l.CheckString(1)] = []string{l.CheckString(2)}
 		return 0
 	}))
+	wsCfg := workspace.Register(L, tbl)
 	L.SetGlobal("gtmux", tbl)
 
 	if err := L.DoString(defaultServerLua); err != nil {
@@ -377,5 +394,14 @@ func LoadServer(userPath string) ServerConfig {
 			log.Printf("gtmux: %s: %v (ignoring, using defaults)", userPath, err)
 		}
 	}
+	loaded = true
+	ws, err := wsCfg.Finish(tbl) // freezes gtmux.workspace.* the same way
+	if err != nil {
+		log.Printf("gtmux: %s: %v (workspaces disabled)", userPath, err)
+	}
+	if ws == nil {
+		L.Close() // no function layouts to keep it for
+	}
+	cfg.Workspaces = ws
 	return cfg
 }

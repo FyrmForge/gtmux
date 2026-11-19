@@ -381,6 +381,40 @@ type ClientMsg struct {
 	ResizeBorder  *ResizeBorder
 	CopyDrag      *CopyDrag
 	Preview       *PreviewRequest
+	Workspace     *WorkspaceRequest
+}
+
+// WorkspaceRequest is a one-shot workspace query/action (`gtmux workspace`, the
+// workspace picker). Op: "list" (projects of Workspace; "" = the workspace of
+// Session, else the default), "open" (clone if needed, build the session, reply
+// with its name), "refresh" (kick a background full sweep), "new" (scaffold
+// Project from Template, optionally on GitHub, build + reply with the session).
+// Env carries the requester's environment for git (SSH_AUTH_SOCK): the
+// daemon's is frozen.
+type WorkspaceRequest struct {
+	Op                          string
+	Workspace, Project, Session string
+	Env                         map[string]string
+	Template                    string
+	GitHub, Private             bool
+}
+
+// WorkspaceReply answers a WorkspaceRequest (alongside an Ok Ack).
+type WorkspaceReply struct {
+	Workspace  string   // the resolved workspace
+	Workspaces []string // every configured workspace, declaration order
+	Projects   []WorkspaceProject
+	Session    string   // open: the session to attach/switch to
+	Status     string   // last background refresh error, "" = fine
+	Templates  []string // `new` scaffolds, in order
+	Account    bool     // has a GitHub account (new can create the repo)
+}
+
+// WorkspaceProject is one picker row.
+type WorkspaceProject struct {
+	Name, Description string
+	Local, Remote     bool
+	Open              bool // a session for it exists
 }
 
 // PreviewRequest asks the server for a styled snapshot of a pane, to paint in
@@ -425,6 +459,7 @@ type CopyDrag struct {
 // carry just a Status update (the clock ticking), just one pane's content
 // (a keystroke), or a full Layout+PaneContent set (attach, split, resize).
 type ServerMsg struct {
+	Workspace     *WorkspaceReply
 	Layout        *Layout
 	PaneContent   []PaneContent
 	Status        *StatusInfo

@@ -642,12 +642,9 @@ Details to be fleshed out per item before work starts.
   (window/pane tree, layouts, working dirs, running commands; scrollback
   TBD) so a reboot doesn't lose the workspace. tmux needs plugins for this
   (resurrect/continuum): built-in here.
-- [ ] **Workspacer replacement**: cover
-  github.com/JamesTiberiusKirk/workspacer either via integration or by
-  absorbing its features (project/workspace-driven session creation,
-  pickers, prompts), through first-party features and/or the Lua API.
-  Depends on: multi-arg `command-prompt`, `new-window <command>` (A),
-  choose-tree filtering, richer Lua API (B1).
+- [x] **Workspacer replacement**: absorbed as first-party `gtmux workspace`
+  (2026-11-06) — see WORKSPACE_PLAN.md for what's built, deferred and parked
+  (temp workspaces, time tracking).
 - [ ] **Session preview + fzf-style pickers**: live pane preview in the
   session/window/tree pickers (like tmux choose-tree's preview, but nicer),
   and fuzzy-find-as-you-type filtering across the pickers generally

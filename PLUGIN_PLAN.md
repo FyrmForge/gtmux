@@ -1,5 +1,10 @@
 # Plugin system + workspacer integration — plan (2026-08-31)
 
+> **Superseded (2026-11-06) for the workspacer parts** by WORKSPACE_PLAN.md:
+> workspaces are now first-party Go in gtmux, not a Lua plugin + external
+> workspacer binary. The generic plugin-system parts (package.path, sync) stand
+> on their own if a real out-of-tree plugin ever needs them.
+
 Context: workspacer (JamesTiberiusKirk/workspacer) already drives gtmux via its
 `SessionBackend` CLI shim (`workspacer/gtmux_backend.go`), but its Attach nests a
 second client when launched from inside gtmux. Goal: an in-gtmux project picker

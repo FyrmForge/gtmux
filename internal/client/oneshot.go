@@ -40,6 +40,16 @@ func Command(session string, args []string) (string, error) {
 // oneShot sends a single request that expects a single Ack reply, for
 // requests that don't attach a terminal to a session (kill/rename/...).
 func oneShot(msg *proto.ClientMsg) (*proto.Ack, error) {
+	reply, err := oneShotReply(msg)
+	if err != nil {
+		return nil, err
+	}
+	return reply.Ack, nil
+}
+
+// oneShotReply is oneShot returning the whole reply, for requests whose answer
+// rides alongside the Ack (Workspace).
+func oneShotReply(msg *proto.ClientMsg) (*proto.ServerMsg, error) {
 	conn, err := net.Dial("unix", proto.SockPath())
 	if err != nil {
 		return nil, fmt.Errorf("connect to gtmux server (is it running?): %w", err)
@@ -60,5 +70,5 @@ func oneShot(msg *proto.ClientMsg) (*proto.Ack, error) {
 	if !reply.Ack.Ok {
 		return nil, fmt.Errorf("%s", reply.Ack.Err)
 	}
-	return reply.Ack, nil
+	return &reply, nil
 }

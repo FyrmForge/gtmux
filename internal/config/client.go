@@ -710,6 +710,9 @@ type WidgetHooks struct {
 	// dropped by its min_cols breakpoint or a toggle_dock override), so a keybind
 	// that drives a dock can fall back instead of going dead.
 	DockVisible func(name string) bool
+	// Workspace runs a one-shot workspace request against the daemon
+	// (gtmux.workspace.projects/refresh). Installed by the client; nil = none.
+	Workspace func(req *proto.WorkspaceRequest) (*proto.WorkspaceReply, error)
 }
 
 func (c *ClientBinds) Close() { c.l.Close() }
@@ -884,8 +887,22 @@ func (c *ClientBinds) buildUI(cv *Canvas, regions *[]Region, state *lua.LTable) 
 			cv.put(gx, gy, ch, g)
 		}
 		at := func(lx, ly int) (emu.Glyph, bool) { return cv.At(ox+lx, oy+ly) }
+		// pen resolves a draw verb's style once and returns its putter: a style
+		// without bg= keeps the cell's current background (e.g. a ui:fill
+		// underneath), not the canvas base — "fg=yellow" text on a black-filled
+		// modal stays on black. Every styled verb draws through a pen.
+		pen := func(s string) func(lx, ly int, ch rune) {
+			g, keepBG := cv.style(s), !strings.Contains(s, "bg=")
+			return func(lx, ly int, ch rune) {
+				c := g
+				if cur, ok := at(lx, ly); ok && keepBG {
+					c.BG = cur.BG
+				}
+				put(lx, ly, ch, c)
+			}
+		}
 		// drawTitle is drawFrameTitle in local coords (put clips for us).
-		drawTitle := func(x, y, bw, bh int, label, atStr string, offset int, g emu.Glyph) {
+		drawTitle := func(x, y, bw, bh int, label, atStr string, offset int, draw func(lx, ly int, ch rune)) {
 			rs := []rune(label)
 			if bw < 3 || len(rs) == 0 {
 				return
@@ -905,7 +922,7 @@ func (c *ClientBinds) buildUI(cv *Canvas, regions *[]Region, state *lua.LTable) 
 			start += offset
 			for i, r := range rs {
 				if col := start + i; col > x && col < x+bw-1 {
-					put(col, row, r, g)
+					draw(col, row, r)
 				}
 			}
 		}
@@ -915,17 +932,17 @@ func (c *ClientBinds) buildUI(cv *Canvas, regions *[]Region, state *lua.LTable) 
 		t.RawSetString("h", lua.LNumber(h))
 		// ui:set(x, y, char, style?)
 		L.SetField(t, "set", L.NewFunction(func(l *lua.LState) int {
-			put(l.CheckInt(2), l.CheckInt(3), firstRune(l.CheckString(4)), cv.style(l.OptString(5, "")))
+			pen(l.OptString(5, ""))(l.CheckInt(2), l.CheckInt(3), firstRune(l.CheckString(4)))
 			return 0
 		}))
 		// ui:text(x, y, str, style?)
 		L.SetField(t, "text", L.NewFunction(func(l *lua.LState) int {
 			x, y := l.CheckInt(2), l.CheckInt(3)
-			g := cv.style(l.OptString(5, ""))
+			draw := pen(l.OptString(5, ""))
 			// index by rune, not byte: a range over a string yields byte
 			// offsets, so "⠋" (3 bytes) used to leave two blank cells behind it
 			for i, r := range []rune(l.CheckString(4)) {
-				put(x+i, y, r, g)
+				draw(x+i, y, r)
 			}
 			return 0
 		}))
@@ -947,7 +964,7 @@ func (c *ClientBinds) buildUI(cv *Canvas, regions *[]Region, state *lua.LTable) 
 					titleAt = string(v)
 				}
 			}
-			g := cv.style(s)
+			draw := pen(s)
 			if bw < 2 || bh < 2 {
 				return 0
 			}
@@ -956,19 +973,19 @@ func (c *ClientBinds) buildUI(cv *Canvas, regions *[]Region, state *lua.LTable) 
 				tl, tr, bl, br = '╭', '╮', '╰', '╯'
 			}
 			for i := 1; i < bw-1; i++ {
-				put(x+i, y, '─', g)
-				put(x+i, y+bh-1, '─', g)
+				draw(x+i, y, '─')
+				draw(x+i, y+bh-1, '─')
 			}
 			for j := 1; j < bh-1; j++ {
-				put(x, y+j, '│', g)
-				put(x+bw-1, y+j, '│', g)
+				draw(x, y+j, '│')
+				draw(x+bw-1, y+j, '│')
 			}
-			put(x, y, tl, g)
-			put(x+bw-1, y, tr, g)
-			put(x, y+bh-1, bl, g)
-			put(x+bw-1, y+bh-1, br, g)
+			draw(x, y, tl)
+			draw(x+bw-1, y, tr)
+			draw(x, y+bh-1, bl)
+			draw(x+bw-1, y+bh-1, br)
 			if title != "" {
-				drawTitle(x, y, bw, bh, " "+title+" ", titleAt, 0, g)
+				drawTitle(x, y, bw, bh, " "+title+" ", titleAt, 0, draw)
 			}
 			// Return the box's INTERIOR as a clipped child ui, so drawing "inside
 			// the box" is the natural thing to reach for:
@@ -988,12 +1005,12 @@ func (c *ClientBinds) buildUI(cv *Canvas, regions *[]Region, state *lua.LTable) 
 		// ui:hline(y, style?) — separator across THIS ui's width, junction-aware.
 		L.SetField(t, "hline", L.NewFunction(func(l *lua.LState) int {
 			y := l.CheckInt(2)
-			g := cv.style(l.OptString(3, ""))
+			draw := pen(l.OptString(3, ""))
 			for x := 0; x < w; x++ {
 				if cur, ok := at(x, y); ok && hasVertical(cur.Char) {
 					put(x, y, mergeH(x == 0, x == w-1), cur)
 				} else {
-					put(x, y, '─', g)
+					draw(x, y, '─')
 				}
 			}
 			return 0
@@ -1001,12 +1018,12 @@ func (c *ClientBinds) buildUI(cv *Canvas, regions *[]Region, state *lua.LTable) 
 		// ui:vline(x, style?) — separator down THIS ui's height, junction-aware.
 		L.SetField(t, "vline", L.NewFunction(func(l *lua.LState) int {
 			x := l.CheckInt(2)
-			g := cv.style(l.OptString(3, ""))
+			draw := pen(l.OptString(3, ""))
 			for y := 0; y < h; y++ {
 				if cur, ok := at(x, y); ok && hasHorizontal(cur.Char) {
 					put(x, y, mergeV(y == 0, y == h-1), cur)
 				} else {
-					put(x, y, '│', g)
+					draw(x, y, '│')
 				}
 			}
 			return 0
@@ -1330,6 +1347,37 @@ func (c *ClientBinds) run(fn *lua.LFunction) []BindOp {
 	c.ops = nil
 	if err := c.l.CallByParam(lua.P{Fn: fn, NRet: 0, Protect: true}); err != nil {
 		log.Printf("gtmux: keybind error: %v", err)
+	}
+	ops := c.ops
+	c.ops = nil
+	return ops
+}
+
+// RunWorkspacePicker calls gtmux.workspace.picker(ws, {new=, name=}) and
+// returns the ops it recorded (normally one Modal) — the standalone `gtmux
+// workspace [new]` entry point, outside any attached session. isNew opens the
+// new-project wizard, prefilled with name.
+func (c *ClientBinds) RunWorkspacePicker(ws string, isNew bool, name string) []BindOp {
+	g, ok := c.l.GetGlobal("gtmux").(*lua.LTable)
+	if !ok {
+		return nil
+	}
+	t, ok := g.RawGetString("workspace").(*lua.LTable)
+	if !ok {
+		return nil
+	}
+	fn, ok := t.RawGetString("picker").(*lua.LFunction)
+	if !ok {
+		return nil
+	}
+	c.vmMu.Lock()
+	defer c.vmMu.Unlock()
+	c.ops = nil
+	opts := c.l.NewTable()
+	opts.RawSetString("new", lua.LBool(isNew))
+	opts.RawSetString("name", lua.LString(name))
+	if err := c.l.CallByParam(lua.P{Fn: fn, NRet: 0, Protect: true}, lua.LString(ws), opts); err != nil {
+		log.Printf("gtmux: workspace picker error: %v", err)
 	}
 	ops := c.ops
 	c.ops = nil
@@ -1865,6 +1913,104 @@ func LoadClientWith(path string, overrides [][2]string) (ClientConfig, *ClientBi
 		binds.ops = append(binds.ops, BindOp{Modal: m})
 		return 0
 	}))
+
+	// gtmux.workspace.*: the client half of workspaces (WORKSPACE_PLAN.md). The
+	// picker UI is Lua (gtmux.workspace.picker in default_client.lua); these are
+	// its data + action primitives. ws nil/"" = this session's workspace, else
+	// the default one.
+	wsTbl := L.NewTable()
+	wsQuery := func(l *lua.LState, op string) (*proto.WorkspaceReply, bool) {
+		if binds.Hooks.Workspace == nil {
+			l.Push(lua.LNil)
+			l.Push(lua.LString("workspaces unavailable"))
+			return nil, false
+		}
+		rep, err := binds.Hooks.Workspace(&proto.WorkspaceRequest{Op: op, Workspace: l.OptString(1, ""), Session: ctxSession()})
+		if err != nil {
+			l.Push(lua.LNil)
+			l.Push(lua.LString(err.Error()))
+			return nil, false
+		}
+		return rep, true
+	}
+	// gtmux.workspace.projects([ws]) -> {workspace, workspaces, status, projects}
+	// | nil, err. Rows come pre-sorted (open sessions, newest push, local A-Z).
+	// ponytail: one socket round-trip per call (local, sub-ms); cache here if a
+	// remote daemon ever makes it slow.
+	L.SetField(wsTbl, "projects", L.NewFunction(func(l *lua.LState) int {
+		rep, ok := wsQuery(l, "list")
+		if !ok {
+			return 2
+		}
+		t := l.NewTable()
+		t.RawSetString("workspace", lua.LString(rep.Workspace))
+		t.RawSetString("status", lua.LString(rep.Status))
+		names := l.NewTable()
+		for _, n := range rep.Workspaces {
+			names.Append(lua.LString(n))
+		}
+		t.RawSetString("workspaces", names)
+		rows := l.NewTable()
+		for _, p := range rep.Projects {
+			r := l.NewTable()
+			r.RawSetString("name", lua.LString(p.Name))
+			r.RawSetString("description", lua.LString(p.Description))
+			r.RawSetString("local", lua.LBool(p.Local))
+			r.RawSetString("remote", lua.LBool(p.Remote))
+			r.RawSetString("open", lua.LBool(p.Open))
+			rows.Append(r)
+		}
+		t.RawSetString("projects", rows)
+		tpls := l.NewTable()
+		for _, n := range rep.Templates {
+			tpls.Append(lua.LString(n))
+		}
+		t.RawSetString("templates", tpls)
+		t.RawSetString("account", lua.LBool(rep.Account))
+		l.Push(t)
+		return 1
+	}))
+	// gtmux.workspace.refresh([ws]): kick a background full sweep.
+	L.SetField(wsTbl, "refresh", L.NewFunction(func(l *lua.LState) int {
+		if _, ok := wsQuery(l, "refresh"); !ok {
+			return 2
+		}
+		return 0
+	}))
+	// gtmux.workspace.open(ws, project): clone if needed, build the session,
+	// switch this client to it (server-side, async; errors show as a message).
+	L.SetField(wsTbl, "open", L.NewFunction(func(l *lua.LState) int {
+		binds.ops = append(binds.ops, BindOp{Action: []string{"workspace-open", l.OptString(1, ""), l.CheckString(2)}})
+		return 0
+	}))
+	// gtmux.workspace.create(ws, name, template, github, private): scaffold a new
+	// project (WORKSPACE_PLAN.md `new`), build its session, switch to it.
+	L.SetField(wsTbl, "create", L.NewFunction(func(l *lua.LState) int {
+		flag := func(i int) string {
+			if l.ToBool(i) {
+				return "1"
+			}
+			return "0"
+		}
+		binds.ops = append(binds.ops, BindOp{Action: []string{"workspace-new",
+			l.OptString(1, ""), l.CheckString(2), l.OptString(3, ""), flag(4), flag(5)}})
+		return 0
+	}))
+	// gtmux.workspace.remove_temp(name) -> nil | err: delete a temp workspace's
+	// folder (refused while its session is open). Synchronous: the picker
+	// shows the error in place, inside gtmux or on the blank screen.
+	L.SetField(wsTbl, "remove_temp", L.NewFunction(func(l *lua.LState) int {
+		if binds.Hooks.Workspace == nil {
+			l.Push(lua.LString("workspaces unavailable"))
+			return 1
+		}
+		if _, err := binds.Hooks.Workspace(&proto.WorkspaceRequest{Op: "temp-rm", Project: l.CheckString(1)}); err != nil {
+			l.Push(lua.LString(err.Error()))
+			return 1
+		}
+		return 0
+	}))
+	L.SetField(tbl, "workspace", wsTbl)
 
 	// gtmux.rename_window(name) / rename_session(name): the argv dispatch behind a
 	// rename prompt component (the typed text is one arg, spaces preserved).

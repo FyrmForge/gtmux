@@ -518,3 +518,304 @@ end)
 -- require("gtmux.sidebar"){ size = 25, min_cols = 110 }
 -- gtmux.bind("B", function() gtmux.toggle_dock("sidebar") end)
 -- gtmux.session_switcher = "dock"
+
+-- Workspace picker (prefix+P; WORKSPACE_PLAN.md): the projects of a workspace,
+-- open sessions first (●), then newest push, then local-only folders; ↓ marks
+-- remote-only repos (Enter clones them). Type to filter (fuzzy: letters in
+-- order), Enter opens/switches, Tab cycles workspaces, C-r refreshes from
+-- GitHub now, C-o starts a new project (so does Enter on a filter that matches
+-- nothing), Esc closes. `gtmux workspace` shows this same picker on a blank
+-- screen outside gtmux. Rows re-query the daemon's cache each render, so a
+-- background refresh fills in while it's open.
+--
+-- A workspace with ws.add{ home = "root" | "<folder>" } gets a pinned "⌂ home"
+-- row: session <prefix>-home in the workspace folder (or that folder), for an
+-- agent that works across every repo (`gtmux ws home [<ws>]`).
+--
+-- "folders" lists single folders declared with gtmux.workspace.folder{} (notes,
+-- dotfiles): one session each, named after the folder; nothing to create.
+--
+-- "temp" (last in the Tab cycle; `gtmux ws temp`) lists scratch folders under
+-- $TMPDIR (`gtmux temp`): Enter on a no-match filter creates a temp with that
+-- name, C-o the next numbered one, C-d deletes the selected (y to confirm;
+-- refused while its session is open).
+--
+-- New-project wizard (`gtmux ws new`, or from the picker): name → template
+-- (2+ templates) → create on GitHub? (account only) → private? → summary.
+-- Esc steps back, C-c cancels. Enter on the summary scaffolds the project and
+-- runs the template's commands in its first pane, joined with && (one command
+-- per entry: a `;` or `#` inside an entry changes what the chain does).
+local function ws_fuzzy(s, pat)
+  local i = 1
+  s = s:lower()
+  for c in pat:lower():gmatch(".") do
+    i = s:find(c, i, true)
+    if not i then return false end
+    i = i + 1
+  end
+  return true
+end
+
+local function ws_wiz_steps(d, wz)
+  local steps = { "name" }
+  if #d.templates >= 2 then steps[#steps + 1] = "template" end
+  if d.account then steps[#steps + 1] = "github" end
+  if d.account and wz.gh then steps[#steps + 1] = "private" end
+  steps[#steps + 1] = "summary"
+  return steps
+end
+
+local function ws_wiz_check(d, name)
+  if name == "" then return "name required" end
+  if not name:match("^[%w_][%w%._%-]*$") then
+    return "letters, digits, . _ - only (no leading dot or dash)"
+  end
+  if #name > 100 then return "max 100 characters" end
+  for _, p in ipairs(d.projects) do
+    if p.name:lower() == name:lower() then return name .. " already exists" end
+  end
+end
+
+local function ws_wiz_template(d, wz)
+  if #d.templates == 1 then return d.templates[1] end
+  return d.templates[wz.tpl] or ""
+end
+
+local function ws_wiz_render(inner, d, wz)
+  local step = ws_wiz_steps(d, wz)[wz.step]
+  local function field(y, label, value, active)
+    inner:text(1, y, (active and "> " or "  ") .. label .. value, active and "fg=black,bg=green" or "fg=white")
+  end
+  local y = 0
+  field(y, "name:     ", wz.name .. (step == "name" and "_" or ""), step == "name")
+  if #d.templates >= 1 then
+    y = y + 1
+    field(y, "template: ", ws_wiz_template(d, wz), step == "template")
+    if step == "template" then
+      for i, n in ipairs(d.templates) do
+        y = y + 1
+        inner:text(5, y, (i == wz.tpl and "● " or "  ") .. n, i == wz.tpl and "fg=green" or "fg=white")
+      end
+    end
+  end
+  if d.account then
+    y = y + 1
+    field(y, "github:   ", wz.gh and "yes" or "no", step == "github")
+    if wz.gh then
+      y = y + 1
+      field(y, "private:  ", wz.private and "yes" or "no", step == "private")
+    end
+  end
+  local hint = ({
+    name = "type a name, Enter next",
+    template = "Up/Down choose, Enter next",
+    github = "y/n (Space toggles), Enter next",
+    private = "y/n (Space toggles), Enter next",
+    summary = "Enter create, Esc back",
+  })[step]
+  inner:text(1, inner.h - 2, hint, "fg=cyan")
+  if wz.err then inner:text(1, inner.h - 1, wz.err, "fg=red") end
+end
+
+-- ws_wiz_key returns "close" to close the modal, "back" to leave the wizard.
+local function ws_wiz_key(key, d, wz)
+  local steps = ws_wiz_steps(d, wz)
+  local step = steps[wz.step]
+  wz.err = nil
+  if key == "C-c" then return "close" end
+  if key == "Escape" then
+    if wz.step == 1 then return "back" end
+    wz.step = wz.step - 1
+    return
+  end
+  local enter = key == "Enter" or key == "C-m"
+  if step == "name" then
+    if enter then
+      wz.err = ws_wiz_check(d, wz.name)
+      if not wz.err then wz.step = wz.step + 1 end
+    elseif key == "BSpace" then
+      wz.name = wz.name:sub(1, -2)
+    elseif #key == 1 then
+      wz.name = wz.name .. key
+    end
+  elseif step == "template" then
+    if key == "Down" or key == "C-n" or key == "j" then
+      wz.tpl = math.min(#d.templates, wz.tpl + 1)
+    elseif key == "Up" or key == "C-p" or key == "k" then
+      wz.tpl = math.max(1, wz.tpl - 1)
+    elseif enter then
+      wz.step = wz.step + 1
+    end
+  elseif step == "github" or step == "private" then
+    local f = step == "github" and "gh" or "private"
+    if key == "y" or key == "n" then
+      wz[f] = key == "y"
+      wz.step = wz.step + 1
+    elseif key == "Space" or key == " " or key == "Left" or key == "Right" or key == "Tab" or key == "C-i" then
+      wz[f] = not wz[f]
+    elseif enter then
+      wz.step = wz.step + 1
+    end
+  elseif step == "summary" and enter then
+    gtmux.workspace.create(d.workspace, wz.name, ws_wiz_template(d, wz), d.account and wz.gh, d.account and wz.gh and wz.private)
+    return "close"
+  end
+end
+
+function gtmux.workspace.picker(ws, opts)
+  opts = opts or {}
+  local function view(st)
+    local d, err = gtmux.workspace.projects(st.ws)
+    local rows = {}
+    if d then
+      st.ws = st.ws or d.workspace -- resolve "this session's workspace" once
+      for _, p in ipairs(d.projects) do
+        if st.filter == "" or ws_fuzzy(p.name, st.filter) then
+          rows[#rows + 1] = p
+        end
+      end
+    end
+    return d, rows, err
+  end
+  local function wizard(name, standalone)
+    return { step = 1, name = name or "", tpl = 1, gh = false, private = false, standalone = standalone }
+  end
+  local function init(ui)
+    local st = ui:state()
+    if st.sel == nil then
+      st.sel, st.filter = 1, ""
+      if ws ~= nil and ws ~= "" then st.ws = ws end
+      if opts.new then st.wiz = wizard(opts.name, true) end
+    end
+    return st
+  end
+  gtmux.open{
+    width = 72, height = 22, mode = "WORKSPACE",
+    component = function(props, ui)
+      local st = init(ui)
+      local d, rows, err = view(st)
+      ui:fill("bg=black")
+      local inner = ui:box(0, 0, ui.w, ui.h, {
+        style = "fg=cyan",
+        title = (st.wiz and "new project: " or "workspace: ") .. (d and d.workspace or "?"),
+      })
+      if not d then
+        inner:text(1, 2, err or "no data", "fg=red")
+        return
+      end
+      if st.wiz then
+        ws_wiz_render(inner, d, st.wiz)
+        return
+      end
+      inner:text(1, 0, "filter: " .. st.filter, "fg=yellow")
+      local list_h = inner.h - 3
+      if d.status ~= "" then
+        inner:text(1, inner.h - 1, d.status, "fg=red")
+      end
+      local temp = d.workspace == "temp"
+      if #rows == 0 and st.filter ~= "" and d.workspace ~= "folders" then
+        inner:text(1, 2, "Enter: create " .. (temp and "temp " or "") .. st.filter, "fg=cyan")
+      end
+      if st.confirm then
+        inner:text(1, inner.h - 1, "delete temp " .. st.confirm .. "? y/n", "fg=black,bg=yellow")
+      elseif st.err then
+        inner:text(1, inner.h - 1, st.err, "fg=red")
+      elseif temp then
+        inner:text(1, inner.h - 1, "C-o new temp, C-d delete", "fg=cyan")
+      end
+      if st.sel > #rows then st.sel = math.max(1, #rows) end
+      local top = math.max(0, st.sel - list_h)
+      for i = 1, math.min(#rows - top, list_h) do
+        local p = rows[top + i]
+        local mark = p.open and "● " or (p["local"] and "  " or "↓ ")
+        local label = mark .. (p.name == "@home" and "⌂ home" or p.name)
+        if p.description ~= "" then
+          label = label .. "  — " .. p.description
+        end
+        local sel = (top + i == st.sel)
+        local style = "fg=white"
+        if sel then
+          style = "fg=black,bg=green"
+        elseif p.open then
+          style = "fg=green"
+        end
+        inner:text(0, i + 1, (sel and "> " or "  ") .. label, style)
+      end
+    end,
+    on_key = function(key, ui)
+      local st = init(ui)
+      local d, rows = view(st)
+      if st.wiz then
+        if not d then
+          if key == "Escape" or key == "C-c" then ui:close() end
+          return
+        end
+        local r = ws_wiz_key(key, d, st.wiz)
+        if r == "close" or (r == "back" and st.wiz.standalone) then
+          ui:close()
+        elseif r == "back" then
+          st.wiz = nil
+        end
+        return
+      end
+      local temp = d and d.workspace == "temp"
+      local fixed = d and d.workspace == "folders" -- declared in server.lua: no create
+      st.err = nil
+      if st.confirm then
+        if key == "y" then
+          st.err = gtmux.workspace.remove_temp(st.confirm)
+        end
+        st.confirm = nil
+        return
+      end
+      if key == "Down" or key == "C-n" then
+        st.sel = math.max(1, math.min(#rows, st.sel + 1))
+      elseif key == "Up" or key == "C-p" then
+        st.sel = math.max(1, st.sel - 1)
+      elseif key == "Enter" or key == "C-m" then
+        local p = rows[st.sel]
+        if not p and st.filter ~= "" and temp then
+          gtmux.workspace.open("temp", st.filter)
+          ui:close()
+          return
+        end
+        if not p and st.filter ~= "" and not fixed then
+          st.wiz = wizard(st.filter, false)
+          return
+        end
+        if not p and fixed then return end
+        if p and d then gtmux.workspace.open(d.workspace, p.name) end
+        ui:close()
+      elseif key == "C-o" and temp then
+        gtmux.workspace.open("temp", "")
+        ui:close()
+      elseif key == "C-o" and not fixed then
+        st.wiz = wizard(st.filter, false)
+      elseif key == "C-d" and temp then
+        local p = rows[st.sel]
+        if p then st.confirm = p.name end
+      elseif key == "Escape" or key == "C-c" then
+        ui:close()
+      elseif key == "Tab" or key == "C-i" then
+        if d and #d.workspaces > 1 then
+          for i, n in ipairs(d.workspaces) do
+            if n == d.workspace then
+              st.ws = d.workspaces[i % #d.workspaces + 1]
+              break
+            end
+          end
+          st.sel, st.filter = 1, ""
+        end
+      elseif key == "C-r" then
+        gtmux.workspace.refresh(d and d.workspace or st.ws)
+      elseif key == "BSpace" then
+        st.filter = st.filter:sub(1, -2)
+        st.sel = 1
+      elseif #key == 1 then
+        st.filter = st.filter .. key
+        st.sel = 1
+      end
+    end,
+  }
+end
+gtmux.bind("P", function() gtmux.workspace.picker() end)
