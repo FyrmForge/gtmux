@@ -950,7 +950,10 @@ func (c *compositor) modalOffset() (ox, oy int) {
 	if c.modalPos == "full" {
 		return 0, c.contentOffset()
 	}
-	ox = (c.cols() - b.w) / 2
+	// Centered in the content area: modalRow paints into the content line
+	// (docks are wrapped on afterwards), so centering on the full terminal
+	// width shifted the modal right by the left dock's width.
+	ox = (c.contentCols() - b.w) / 2
 	contentH := c.totalRows() - c.contentOffset() - c.bottomReserve()
 	oy = c.contentOffset() + (contentH-b.h)/2
 	if ox < 0 {
