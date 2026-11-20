@@ -237,6 +237,43 @@ gtmux.bind("J", gtmux.join_marked)
 -- choose-tree (prefix+w): a cross-session tree (every session's windows), type
 -- to filter, arrows to move, Enter switches to that session AND focuses that
 -- window. Composed in Lua over gtmux.sessions()/windows() + switch_session(name,idx).
+-- Single-line text input with a real cursor, shared by the pickers' filter
+-- and name fields. t = { text = "", pos = 0 } (pos = chars before the cursor).
+-- input_key edits/moves and returns true when it used the key; the caller
+-- checks its own keys (Enter, Tab, C-o, ...) first. input_draw paints
+-- label .. text with a reverse-video block on the cursor cell.
+local function input_new(text)
+  text = text or ""
+  return { text = text, pos = #text }
+end
+
+local function input_key(t, key)
+  local s, p = t.text, t.pos
+  if key == "Left" then t.pos = math.max(0, p - 1)
+  elseif key == "Right" then t.pos = math.min(#s, p + 1)
+  elseif key == "Home" or key == "C-a" then t.pos = 0
+  elseif key == "End" or key == "C-e" then t.pos = #s
+  elseif key == "BSpace" then
+    if p > 0 then t.text, t.pos = s:sub(1, p - 1) .. s:sub(p + 1), p - 1 end
+  elseif key == "Delete" then t.text = s:sub(1, p) .. s:sub(p + 2)
+  elseif key == "C-u" then t.text, t.pos = s:sub(p + 1), 0
+  elseif key == "C-k" then t.text = s:sub(1, p)
+  elseif key == "C-w" then
+    local head = s:sub(1, p):gsub("%S*%s*$", "")
+    t.text, t.pos = head .. s:sub(p + 1), #head
+  elseif #key == 1 then t.text, t.pos = s:sub(1, p) .. key .. s:sub(p + 1), p + 1
+  elseif key == "Space" then t.text, t.pos = s:sub(1, p) .. " " .. s:sub(p + 1), p + 1
+  else return false
+  end
+  return true
+end
+
+local function input_draw(ui, x, y, label, t, style)
+  ui:text(x, y, label .. t.text, style)
+  local c = t.text:sub(t.pos + 1, t.pos + 1)
+  ui:text(x + #label + t.pos, y, c == "" and " " or c, style .. ",reverse")
+end
+
 gtmux.bind("w", function()
   -- Recomputed on demand (not stashed): a multi-key chunk like "WTARGET<Enter>"
   -- updates the filter then selects, so on_key must see the CURRENT filter's rows.
@@ -255,10 +292,11 @@ gtmux.bind("w", function()
   gtmux.open{
     width = 46, height = 16, mode = "PICKER",
     component = function(props, ui)
-      local st = ui:state(); st.sel = st.sel or 1; st.filter = st.filter or ""
+      local st = ui:state(); st.sel = st.sel or 1; st.input = st.input or input_new()
+      st.filter = st.input.text
       ui:fill("bg=black")
       ui:box(0, 0, ui.w, ui.h, { style = "fg=cyan", title = "choose tree" })
-      ui:text(2, 1, "filter: " .. st.filter, "fg=yellow")
+      input_draw(ui, 2, 1, "filter: ", st.input, "fg=yellow")
       local rows = tree_rows(st.filter)
       if st.sel > #rows then st.sel = math.max(1, #rows) end
       for i, r in ipairs(rows) do
@@ -270,7 +308,8 @@ gtmux.bind("w", function()
       end
     end,
     on_key = function(key, ui)
-      local st = ui:state(); st.sel = st.sel or 1; st.filter = st.filter or ""
+      local st = ui:state(); st.sel = st.sel or 1; st.input = st.input or input_new()
+      st.filter = st.input.text
       if key == "Down" then st.sel = math.min(#tree_rows(st.filter), st.sel + 1)
       elseif key == "Up" then st.sel = math.max(1, st.sel - 1)
       elseif key == "Enter" then
@@ -278,8 +317,7 @@ gtmux.bind("w", function()
         if r then gtmux.switch_session(r.session, r.index) end
         ui:close()
       elseif key == "Escape" then ui:close()
-      elseif key == "BSpace" then st.filter = st.filter:sub(1, -2); st.sel = 1
-      elseif #key == 1 then st.filter = st.filter .. key; st.sel = 1
+      elseif input_key(st.input, key) then st.filter = st.input.text; st.sel = 1
       end
     end,
   }
@@ -520,7 +558,7 @@ end)
 -- gtmux.session_switcher = "dock"
 
 -- Workspace picker (prefix+P; WORKSPACE_PLAN.md): the projects of a workspace,
--- open sessions first (●), then newest push, then local-only folders; ↓ marks
+-- ⌂ home and open sessions (●) first, then everything A-Z; ↓ marks
 -- remote-only repos (Enter clones them). Type to filter (fuzzy: letters in
 -- order), Enter opens/switches, Tab cycles workspaces, C-r refreshes from
 -- GitHub now, C-o starts a new project (so does Enter on a filter that matches
@@ -587,7 +625,12 @@ local function ws_wiz_render(inner, d, wz)
     inner:text(1, y, (active and "> " or "  ") .. label .. value, active and "fg=black,bg=green" or "fg=white")
   end
   local y = 0
-  field(y, "name:     ", wz.name .. (step == "name" and "_" or ""), step == "name")
+  if step == "name" then
+    inner:text(1, y, "> ", "fg=black,bg=green")
+    input_draw(inner, 3, y, "name:     ", wz.input, "fg=black,bg=green")
+  else
+    field(y, "name:     ", wz.name, false)
+  end
   if #d.templates >= 1 then
     y = y + 1
     field(y, "template: ", ws_wiz_template(d, wz), step == "template")
@@ -633,10 +676,8 @@ local function ws_wiz_key(key, d, wz)
     if enter then
       wz.err = ws_wiz_check(d, wz.name)
       if not wz.err then wz.step = wz.step + 1 end
-    elseif key == "BSpace" then
-      wz.name = wz.name:sub(1, -2)
-    elseif #key == 1 then
-      wz.name = wz.name .. key
+    elseif input_key(wz.input, key) then
+      wz.name = wz.input.text
     end
   elseif step == "template" then
     if key == "Down" or key == "C-n" or key == "j" then
@@ -678,12 +719,12 @@ function gtmux.workspace.picker(ws, opts)
     return d, rows, err
   end
   local function wizard(name, standalone)
-    return { step = 1, name = name or "", tpl = 1, gh = false, private = false, standalone = standalone }
+    return { step = 1, name = name or "", input = input_new(name), tpl = 1, gh = false, private = false, standalone = standalone }
   end
   local function init(ui)
     local st = ui:state()
     if st.sel == nil then
-      st.sel, st.filter = 1, ""
+      st.sel, st.filter, st.input = 1, "", input_new()
       if ws ~= nil and ws ~= "" then st.ws = ws end
       if opts.new then st.wiz = wizard(opts.name, true) end
     end
@@ -707,7 +748,7 @@ function gtmux.workspace.picker(ws, opts)
         ws_wiz_render(inner, d, st.wiz)
         return
       end
-      inner:text(1, 0, "filter: " .. st.filter, "fg=yellow")
+      input_draw(inner, 1, 0, "filter: ", st.input, "fg=yellow")
       local list_h = inner.h - 3
       if d.status ~= "" then
         inner:text(1, inner.h - 1, d.status, "fg=red")
@@ -804,16 +845,12 @@ function gtmux.workspace.picker(ws, opts)
               break
             end
           end
-          st.sel, st.filter = 1, ""
+          st.sel, st.filter, st.input = 1, "", input_new()
         end
       elseif key == "C-r" then
         gtmux.workspace.refresh(d and d.workspace or st.ws)
-      elseif key == "BSpace" then
-        st.filter = st.filter:sub(1, -2)
-        st.sel = 1
-      elseif #key == 1 then
-        st.filter = st.filter .. key
-        st.sel = 1
+      elseif input_key(st.input, key) then
+        st.filter, st.sel = st.input.text, 1
       end
     end,
   }

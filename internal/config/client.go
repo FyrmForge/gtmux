@@ -1950,7 +1950,7 @@ func LoadClientWith(path string, overrides [][2]string) (ClientConfig, *ClientBi
 		return rep, true
 	}
 	// gtmux.workspace.projects([ws]) -> {workspace, workspaces, status, projects}
-	// | nil, err. Rows come pre-sorted (open sessions, newest push, local A-Z).
+	// | nil, err. Rows come pre-sorted (home, open sessions, then A-Z).
 	// ponytail: one socket round-trip per call (local, sub-ms); cache here if a
 	// remote daemon ever makes it slow.
 	L.SetField(wsTbl, "projects", L.NewFunction(func(l *lua.LState) int {

@@ -54,7 +54,8 @@ subcommand backed by a daemon-side actor. GitHub users/orgs are first-class
     `find_session`, user-overridable. Data from `gtmux.workspace.projects(ws)`
     (served from the actor's cache), updates live as pages arrive, fuzzy
     filter replaces workspacer's `search`. Order: open sessions first, then
-    pushed desc, then local-only folders alphabetically.
+    A-Z (changed 2026-11-20 from push date, which read as random when
+    scanning names; temp stays newest first).
 11. Outside gtmux: client draws a blank canvas in raw mode, shows the picker
     on it, and on Enter hands off to a normal attach in the same process
     (creating the session first). Esc returns to the shell, nothing created.

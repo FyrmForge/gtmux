@@ -70,8 +70,8 @@ type Row struct {
 }
 
 // Projects lists a workspace: local folders merged with the cached remote
-// list. Order: open sessions first, then most recently pushed, then
-// local-only folders alphabetically. open reports whether a session exists.
+// list. Order: home, open sessions, then A-Z (temp: newest folder first).
+// open reports whether a session exists.
 // status is the last refresh error ("" = fine), for the picker to show.
 func (m *Manager) Projects(name string, open func(session string) bool) (w *Workspace, rows []Row, status string, err error) {
 	if w, err = m.cfg.Get(name); err != nil {
@@ -128,8 +128,11 @@ func (m *Manager) Projects(name string, open func(session string) bool) (w *Work
 		if a.Open != b.Open {
 			return a.Open
 		}
-		if !a.PushedAt.Equal(b.PushedAt) {
-			return a.PushedAt.After(b.PushedAt) // zero (local-only) sorts last
+		if w.Name == "temp" && !a.PushedAt.Equal(b.PushedAt) {
+			return a.PushedAt.After(b.PushedAt) // temp: newest folder first (mtime)
+		}
+		if la, lb := strings.ToLower(a.Name), strings.ToLower(b.Name); la != lb {
+			return la < lb // everything else A-Z, case-insensitive
 		}
 		return a.Name < b.Name
 	})
