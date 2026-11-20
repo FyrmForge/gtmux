@@ -627,7 +627,8 @@ type ClientBinds struct {
 	// goroutine, but widget text/click functions now also run from the render
 	// (decode) goroutine — gopher-lua's LState is not goroutine-safe, so all
 	// CallByParam/PCall go through this.
-	vmMu sync.Mutex
+	vmMu   sync.Mutex
+	closed bool // set by Close under vmMu; entry points bail out after locking
 	// Hooks are the live client-state accessors the widget query primitives read
 	// (gtmux.sessions/panes/context/expand/...). The client installs them after
 	// load; nil-safe (unset returns empty).
@@ -715,7 +716,18 @@ type WidgetHooks struct {
 	Workspace func(req *proto.WorkspaceRequest) (*proto.WorkspaceReply, error)
 }
 
-func (c *ClientBinds) Close() { c.l.Close() }
+// Close shuts the Lua VM down. Under vmMu, so it waits for a call in flight,
+// and every entry point checks closed after locking: the input goroutine can
+// still be repainting the status bar (a mode change) while detach/kill tears
+// the client down, and a call into a closed LState crashed gopher-lua.
+func (c *ClientBinds) Close() {
+	c.vmMu.Lock()
+	defer c.vmMu.Unlock()
+	if !c.closed {
+		c.closed = true
+		c.l.Close()
+	}
+}
 
 // RunText runs a widget's text function and returns its string result. Distinct
 // from run(): NRet=1, no ops recorded. Empty string on error or non-string.
@@ -725,6 +737,9 @@ func (c *ClientBinds) RunText(fn *lua.LFunction) string {
 	}
 	c.vmMu.Lock()
 	defer c.vmMu.Unlock()
+	if c.closed { // the VM is gone (detach/kill/reload raced this call)
+		return ""
+	}
 	if err := c.l.CallByParam(lua.P{Fn: fn, NRet: 1, Protect: true}); err != nil {
 		log.Printf("gtmux: widget text error: %v", err)
 		return ""
@@ -1118,6 +1133,9 @@ func (c *ClientBinds) runPaint(fn *lua.LFunction, twoArg bool, state *lua.LTable
 	}
 	c.vmMu.Lock()
 	defer c.vmMu.Unlock()
+	if c.closed { // the VM is gone (detach/kill/reload raced this call)
+		return cv, nil, state, nil
+	}
 	c.ops = nil // a draw may emit ops (gtmux.run_command) like a click does
 	if state == nil {
 		state = c.l.NewTable() // first render: create the widget's persistent state
@@ -1165,6 +1183,9 @@ func (c *ClientBinds) RunClick(fn *lua.LFunction, line int, lineText string, col
 	}
 	c.vmMu.Lock()
 	defer c.vmMu.Unlock()
+	if c.closed { // the VM is gone (detach/kill/reload raced this call)
+		return nil
+	}
 	hit := c.l.NewTable()
 	hit.RawSetString("line", lua.LNumber(line))
 	hit.RawSetString("line_text", lua.LString(lineText))
@@ -1190,6 +1211,9 @@ func (c *ClientBinds) RunKey(onKey *lua.LFunction, key string, state *lua.LTable
 	}
 	c.vmMu.Lock()
 	defer c.vmMu.Unlock()
+	if c.closed { // the VM is gone (detach/kill/reload raced this call)
+		return nil, true
+	}
 	if state == nil {
 		state = c.l.NewTable()
 	}
@@ -1212,6 +1236,9 @@ func (c *ClientBinds) RunKey(onKey *lua.LFunction, key string, state *lua.LTable
 func (c *ClientBinds) MarkFocused(state *lua.LTable, on bool) *lua.LTable {
 	c.vmMu.Lock()
 	defer c.vmMu.Unlock()
+	if c.closed { // the VM is gone (detach/kill/reload raced this call)
+		return state
+	}
 	if state == nil {
 		state = c.l.NewTable()
 	}
@@ -1229,6 +1256,9 @@ func (c *ClientBinds) RunAlert(ev AlertEvent) []BindOp {
 	}
 	c.vmMu.Lock()
 	defer c.vmMu.Unlock()
+	if c.closed { // the VM is gone (detach/kill/reload raced this call)
+		return nil
+	}
 	arg := c.l.NewTable()
 	c.l.SetField(arg, "event", lua.LString(ev.Event))
 	c.l.SetField(arg, "session", lua.LString(ev.Session))
@@ -1265,6 +1295,9 @@ func (c *ClientBinds) RunPaneEvent(event, session string, window, paneID int, ex
 	}
 	c.vmMu.Lock()
 	defer c.vmMu.Unlock()
+	if c.closed { // the VM is gone (detach/kill/reload raced this call)
+		return nil
+	}
 	pane := c.l.NewTable()
 	c.l.SetField(pane, "session", lua.LString(session))
 	c.l.SetField(pane, "window", lua.LNumber(window))
@@ -1360,6 +1393,9 @@ func (c *ClientBinds) run(fn *lua.LFunction) []BindOp {
 	}
 	c.vmMu.Lock()
 	defer c.vmMu.Unlock()
+	if c.closed { // the VM is gone (detach/kill/reload raced this call)
+		return nil
+	}
 	c.ops = nil
 	if err := c.l.CallByParam(lua.P{Fn: fn, NRet: 0, Protect: true}); err != nil {
 		log.Printf("gtmux: keybind error: %v", err)
@@ -1388,6 +1424,9 @@ func (c *ClientBinds) RunWorkspacePicker(ws string, isNew bool, name string) []B
 	}
 	c.vmMu.Lock()
 	defer c.vmMu.Unlock()
+	if c.closed { // the VM is gone (detach/kill/reload raced this call)
+		return nil
+	}
 	c.ops = nil
 	opts := c.l.NewTable()
 	opts.RawSetString("new", lua.LBool(isNew))
