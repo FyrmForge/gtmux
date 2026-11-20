@@ -764,7 +764,7 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string, re
 		if ar {
 			w.autoName = format.Expand(af, map[string]string{
 				"pane_command": w.active.currentCommand(),
-				"pane_path":    w.active.cwd(),
+				"pane_path":    w.active.cwdCached(),
 				"pane_title":   w.active.term.Title(),
 				"pane_id":      fmt.Sprintf("%%%d", w.active.id),
 			})
@@ -932,7 +932,7 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string, re
 	var cachedClock, cachedGitBranch string
 	refreshStatus := func() {
 		cachedClock = time.Now().Format("15:04")
-		cachedGitBranch = gitBranch(windows[active].actor.active.cwd())
+		cachedGitBranch = gitBranch(windows[active].actor.active.cwdCached())
 	}
 	refreshStatus()
 
@@ -977,7 +977,7 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string, re
 				}
 				sw.Panes = append(sw.Panes, proto.PaneInfo{
 					Number: j + paneBaseIndex, ID: p.id,
-					Command: p.currentCommand(), Path: p.cwd(), Title: p.term.Title(),
+					Command: p.currentCommand(), Path: p.cwdCached(), Title: p.term.Title(),
 					ScreenTail: p.screenTail(),
 					PID:        pid, Active: p == w.active, Marked: p.marked,
 					Width: p.rect.Cols, Height: p.rect.Rows,
@@ -1017,7 +1017,7 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string, re
 				"git_branch":   cachedGitBranch,
 				"clock":        cachedClock,
 				"pane_id":      fmt.Sprintf("%%%d", p.id),
-				"pane_path":    p.cwd(),
+				"pane_path":    p.cwdCached(),
 				"pane_command": p.currentCommand(),
 				"pane_title":   p.term.Title(),
 			},
@@ -2503,8 +2503,8 @@ func (s *session) run(reg *registry, cols, rows int, cwd, groupTarget string, re
 			"window_name": windowName(w), "window_index": strconv.Itoa(wi + baseIndex),
 			"pane_title":         p.term.Title(),
 			"window_zoomed_flag": bitStr(w.zoomed),
-			"clock":              cachedClock, "git_branch": gitBranch(p.cwd()),
-			"pane_path": p.cwd(), "pane_command": p.currentCommand(),
+			"clock":              cachedClock, "git_branch": gitBranch(p.cwdCached()),
+			"pane_path": p.cwdCached(), "pane_command": p.currentCommand(),
 			"pane_id": fmt.Sprintf("%%%d", p.id), "pane_index": strconv.Itoa(pi),
 			"pane_active": bitStr(p == w.active),
 			"pane_width":  strconv.Itoa(p.rect.Cols), "pane_height": strconv.Itoa(p.rect.Rows),
@@ -4095,7 +4095,7 @@ loop:
 				// tick runs, and adopt its cache cadence.
 				serverCmds = mergeCmds(serverCmds, e.statusCmds)
 				if e.statusInterval > 0 {
-					shellRunner.interval = time.Duration(e.statusInterval) * time.Second
+					shellRunner.setInterval(time.Duration(e.statusInterval) * time.Second)
 				}
 				// A fresh attach becomes the acting client, so the window
 				// resizes to it (tmux window-size "latest").

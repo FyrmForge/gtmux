@@ -322,6 +322,15 @@ func (p *pane) cwd() string {
 	return procCwd(p.cmd.Process.Pid)
 }
 
+// cwdCached is cwd() for the status tick, snapshot and format paths: served
+// from bgcache so the lsof subprocess never runs on the session goroutine.
+// Spawn paths (split, new-window) keep the synchronous cwd(): a stale or
+// empty dir would start the shell in the wrong place.
+func (p *pane) cwdCached() string {
+	pid := p.cmd.Process.Pid
+	return cwdCache.Get(strconv.Itoa(pid), func() string { return procCwd(pid) })
+}
+
 func (p *pane) Close() {
 	if p.dead {
 		// remain-on-exit already reaped the process and closed the pty in

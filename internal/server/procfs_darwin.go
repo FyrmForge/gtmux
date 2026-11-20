@@ -32,10 +32,10 @@ func procComm(pid int) string {
 
 // procCwd returns pid's current working directory. tmux uses
 // proc_pidinfo(PROC_PIDVNODEPATHINFO), but that's libproc/cgo territory;
-// lsof reads the same kernel state. Only called at split/new-window time,
-// never on a hot path.
-// ponytail: ~50-100ms subprocess per split; swap for a cgo libproc call if
-// that ever registers.
+// lsof reads the same kernel state. ~25ms subprocess: called synchronously
+// only at split/new-window time; the status tick goes through pane.cwdCached
+// (bgcache) so it never blocks the session goroutine.
+// ponytail: swap for a cgo libproc call if 1 lsof per pane per 3s ever registers.
 func procCwd(pid int) string {
 	out, err := exec.Command("lsof", "-a", "-p", strconv.Itoa(pid), "-d", "cwd", "-Fn").Output()
 	if err != nil {

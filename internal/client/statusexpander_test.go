@@ -35,13 +35,16 @@ func TestExpandStatus(t *testing.T) {
 
 func TestExpandClientShellCached(t *testing.T) {
 	e := newStatusExpander(time.Minute)
-	if got := e.expand("#client(echo hi)", nil, nil); got != "hi" {
-		t.Fatalf("#client shell = %q, want %q", got, "hi")
+	// First expansion never blocks: empty now, the command runs in the background.
+	if got := e.expand("#client(echo hi)", nil, nil); got != "" {
+		t.Fatalf("first #client shell = %q, want empty (non-blocking)", got)
 	}
-	// Second expansion within the interval must come from the cache.
-	e.cache["echo hi"] = shellResult{out: "cached", at: time.Now()}
-	if got := e.expand("#client(echo hi)", nil, nil); got != "cached" {
-		t.Errorf("#client shell = %q, want cached value", got)
+	deadline := time.Now().Add(2 * time.Second)
+	for e.expand("#client(echo hi)", nil, nil) != "hi" {
+		if time.Now().After(deadline) {
+			t.Fatalf("#client shell never landed")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/FyrmForge/gtmux/internal/bgcache"
 	fmtx "github.com/FyrmForge/gtmux/internal/format"
 )
 
@@ -17,20 +18,15 @@ import (
 //	##              a literal #
 //	#(...)          bare form has no side declared — ignored
 //
-// One per compositor. #client() output is cached for interval; #server()
-// output is whatever the server last streamed (it caches server-side).
+// One per compositor. #client() output is served from bgcache (refreshed off
+// the receive loop every interval); #server() output is whatever the server
+// last streamed (it caches server-side).
 type statusExpander struct {
-	interval time.Duration
-	cache    map[string]shellResult // #client(cmd) local cache
-}
-
-type shellResult struct {
-	out string
-	at  time.Time
+	cache *bgcache.Cache // #client(cmd) local cache
 }
 
 func newStatusExpander(interval time.Duration) *statusExpander {
-	return &statusExpander{interval: interval, cache: map[string]shellResult{}}
+	return &statusExpander{cache: bgcache.New(interval)}
 }
 
 func (e *statusExpander) expand(format string, vars, serverShell map[string]string) string {
@@ -114,17 +110,14 @@ func (e *statusExpander) expandBrace(body string, vars, serverShell map[string]s
 	return e.expand(branch, vars, serverShell)
 }
 
-// clientShell runs a #client(cmd) locally, serving cached output if it ran
-// within the last interval. ponytail: synchronous on the decode goroutine —
-// fine for subsecond commands; make it async if a slow one stalls redraws.
+// clientShell serves a #client(cmd)'s last output and refreshes it in the
+// background once it is older than interval, so a slow command (a ping with
+// no reply) never stalls the receive loop's redraws.
 func (e *statusExpander) clientShell(cmd string) string {
-	if r, ok := e.cache[cmd]; ok && time.Since(r.at) < e.interval {
-		return r.out
-	}
-	out, _ := exec.Command("sh", "-c", cmd).Output()
-	line := firstLine(out)
-	e.cache[cmd] = shellResult{out: line, at: time.Now()}
-	return line
+	return e.cache.Get(cmd, func() string {
+		out, _ := exec.Command("sh", "-c", cmd).Output()
+		return firstLine(out)
+	})
 }
 
 // extractServerCmds returns the deduplicated bodies of every #server(cmd) in

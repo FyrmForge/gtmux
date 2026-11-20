@@ -50,3 +50,10 @@ Crop to just the test pane (`%31`, right half) and read it as an image:
 ```
 grim -g "962,24 951x1049" .tmp/pane.png
 ```
+
+## Slow lookups stay off the loops
+
+Any `exec.Command` (lsof, git, sh) reachable from a session goroutine or the
+client receive loop goes through `internal/bgcache`: the loop reads the last
+value, the subprocess runs in the background. Never block either loop on a
+subprocess.
