@@ -939,10 +939,26 @@ func (c *ClientBinds) buildUI(cv *Canvas, regions *[]Region, state *lua.LTable) 
 		L.SetField(t, "text", L.NewFunction(func(l *lua.LState) int {
 			x, y := l.CheckInt(2), l.CheckInt(3)
 			draw := pen(l.OptString(5, ""))
-			// index by rune, not byte: a range over a string yields byte
-			// offsets, so "⠋" (3 bytes) used to leave two blank cells behind it
-			for i, r := range []rune(l.CheckString(4)) {
-				draw(x+i, y, r)
+			// Lay runes by display width, like the dock text (layText): a wide
+			// rune (emoji, CJK) takes its cell plus a spacer (Char 0, skipped by
+			// WriteLine); a variation selector takes no cell and marks the rune
+			// before it as emoji. One rune per cell used to put a selector in a
+			// cell of its own, which hung the width-stepping renderer.
+			col, last := x, -1
+			for _, r := range l.CheckString(4) {
+				w := (emu.Glyph{Char: r}).Width()
+				if w == 0 {
+					if cur, ok := at(last, y); ok && r == 0xFE0F && last >= x {
+						cur.Mode |= emu.AttrEmoji
+						put(last, y, cur.Char, cur)
+					}
+					continue
+				}
+				draw(col, y, r)
+				for k := 1; k < w; k++ {
+					draw(col+k, y, 0)
+				}
+				last, col = col, col+w
 			}
 			return 0
 		}))

@@ -31,7 +31,7 @@ func WriteLine(b *strings.Builder, line Line) {
 		if g.Mode&AttrEmoji != 0 {
 			b.WriteRune(0xFE0F)
 		}
-		i += g.Width() - 1
+		i += max(g.Width(), 1) - 1 // a zero-width cell (stray variation selector) must still advance
 	}
 	b.WriteString("\x1b[0m")
 }

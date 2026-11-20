@@ -160,7 +160,7 @@ type Line []Glyph
 func (l Line) String() (str string) {
 	for i := 0; i < len(l); i++ {
 		str += string(l[i].Char)
-		i += l[i].Width() - 1
+		i += max(l[i].Width(), 1) - 1 // zero-width cell: still advance (an infinite loop otherwise)
 	}
 
 	return str
