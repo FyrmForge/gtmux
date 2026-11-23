@@ -748,14 +748,21 @@ function gtmux.workspace.picker(ws, opts)
         ws_wiz_render(inner, d, st.wiz)
         return
       end
-      input_draw(inner, 1, 0, "filter: ", st.input, "fg=yellow")
-      local list_h = inner.h - 3
+      -- Workspace tabs (Tab cycles); clipped at the box edge if they overflow.
+      local x = 1
+      for _, n in ipairs(d.workspaces) do
+        local on = n == d.workspace
+        inner:text(x, 0, " " .. n .. " ", on and "fg=black,bg=cyan" or "fg=white")
+        x = x + #n + 3
+      end
+      input_draw(inner, 1, 1, "filter: ", st.input, "fg=yellow")
+      local list_h = inner.h - 4
       if d.status ~= "" then
         inner:text(1, inner.h - 1, d.status, "fg=red")
       end
       local temp = d.workspace == "temp"
       if #rows == 0 and st.filter ~= "" and d.workspace ~= "folders" then
-        inner:text(1, 2, "Enter: create " .. (temp and "temp " or "") .. st.filter, "fg=cyan")
+        inner:text(1, 3, "Enter: create " .. (temp and "temp " or "") .. st.filter, "fg=cyan")
       end
       if st.confirm then
         inner:text(1, inner.h - 1, "delete temp " .. st.confirm .. "? y/n", "fg=black,bg=yellow")
@@ -780,7 +787,7 @@ function gtmux.workspace.picker(ws, opts)
         elseif p.open then
           style = "fg=green"
         end
-        inner:text(0, i + 1, (sel and "> " or "  ") .. label, style)
+        inner:text(0, i + 2, (sel and "> " or "  ") .. label, style)
       end
     end,
     on_key = function(key, ui)

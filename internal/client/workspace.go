@@ -59,12 +59,28 @@ func insideSession() string {
 	return name
 }
 
+// wsNewOrder accepts workspacer's order, `<ws> new|n [<name>] [flags]`
+// (what the `ff` alias gives `ff new`), as `new <ws> [<name>] [flags]`. A
+// project literally named new/n opens from the picker instead.
+func wsNewOrder(args []string) []string {
+	if len(args) < 2 || (args[1] != "new" && args[1] != "n") {
+		return args
+	}
+	switch args[0] {
+	case "new", "home", "refresh":
+		return args
+	}
+	return append([]string{"new", args[0]}, args[2:]...)
+}
+
 // Workspace is `gtmux workspace|ws [refresh] [<ws> [<project>]]` and
-// `gtmux ws new [<ws>] [<name>] [--template T] [--gh] [--private]`.
+// `gtmux ws new [<ws>] [<name>] [--template T] [--gh] [--private]`
+// (also `<ws> new|n ...`, and workspacer's single-dash flags).
 func Workspace(args []string) error {
 	if err := ensureServer(); err != nil {
 		return err
 	}
+	args = wsNewOrder(args)
 	inside := insideSession()
 	if len(args) > 0 && args[0] == "home" { // gtmux ws home [<ws>]
 		if len(args) > 2 {
@@ -90,11 +106,11 @@ func Workspace(args []string) error {
 		tpl, gh, priv, flags := "", false, false, false
 		for i := 1; i < len(args); i++ {
 			switch a := args[i]; a {
-			case "--gh":
+			case "--gh", "-gh":
 				gh, flags = true, true
-			case "--private":
+			case "--private", "-private":
 				priv, flags = true, true
-			case "--template":
+			case "--template", "-template":
 				if i+1 >= len(args) {
 					return fmt.Errorf("--template needs a name")
 				}

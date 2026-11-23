@@ -33,6 +33,7 @@ Commands:
   workspace, ws home [<ws>]             open a workspace's home session (ws.add{ home = ... })
   workspace, ws refresh [<ws>]          refresh a workspace's GitHub repo list now
   workspace, ws new [<ws>] [<name>]     new-project wizard (flags skip it: --template T --gh --private)
+  workspace, ws <ws> new|n [<name>]     same, workspacer order ("ff new" via an alias)
   temp, t [<name>]                      temp workspace under $TMPDIR (no name = next number)
   temp, t rm <name>                     delete a temp workspace's folder
   help, -h, --help                      show this help

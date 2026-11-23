@@ -33,7 +33,7 @@ func TestPickerFilterCursor(t *testing.T) {
 	var row strings.Builder
 	cursor := -1
 	for x := 0; x < cv.W; x++ {
-		g, _ := cv.At(x, 1)
+		g, _ := cv.At(x, 2) // row 0 border, 1 workspace tabs
 		row.WriteRune(g.Char)
 		if g.Mode&emu.AttrReverse != 0 && cursor < 0 {
 			cursor = x
