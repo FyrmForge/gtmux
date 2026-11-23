@@ -115,6 +115,7 @@ var csiKeyName = map[string]string{
 	"11~": "F1", "12~": "F2", "13~": "F3", "14~": "F4", "15~": "F5",
 	"17~": "F6", "18~": "F7", "19~": "F8", "20~": "F9", "21~": "F10",
 	"23~": "F11", "24~": "F12",
+	"Z": "BTab", // Shift-Tab
 }
 
 // ss3KeyName maps an SS3 final byte (after "ESC O") to a bind token: F1–F4 and

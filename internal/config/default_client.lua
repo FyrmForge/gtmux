@@ -748,7 +748,7 @@ function gtmux.workspace.picker(ws, opts)
         ws_wiz_render(inner, d, st.wiz)
         return
       end
-      -- Workspace tabs (Tab cycles); clipped at the box edge if they overflow.
+      -- Workspace tabs (Tab / Shift-Tab cycle); clipped at the box edge if they overflow.
       local x = 1
       for _, n in ipairs(d.workspaces) do
         local on = n == d.workspace
@@ -844,11 +844,12 @@ function gtmux.workspace.picker(ws, opts)
         if p then st.confirm = p.name end
       elseif key == "Escape" or key == "C-c" then
         ui:close()
-      elseif key == "Tab" or key == "C-i" then
+      elseif key == "Tab" or key == "C-i" or key == "BTab" then
         if d and #d.workspaces > 1 then
+          local step = key == "BTab" and -2 or 0 -- Shift-Tab cycles back
           for i, n in ipairs(d.workspaces) do
             if n == d.workspace then
-              st.ws = d.workspaces[i % #d.workspaces + 1]
+              st.ws = d.workspaces[(i + step) % #d.workspaces + 1]
               break
             end
           end
