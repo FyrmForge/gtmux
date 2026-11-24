@@ -89,9 +89,9 @@ func (r *registry) build(ws string, spec *workspace.SessionSpec) (string, error)
 }
 
 // adopt returns an existing session for workspace ws, refusing one that
-// belongs to another workspace (<prefix>-<project> can collide: a + b-c vs
-// a-b + c). An untagged one (made by hand or by workspacer) is tagged, so it
-// counts as this session's workspace from now on.
+// belongs to another workspace (two workspaces sharing a prefix map a project
+// to the same <prefix>/<project>). An untagged one (made by hand) is
+// tagged, so it counts as this session's workspace from now on.
 func (r *registry) adopt(ws, project, name string) (string, error) {
 	owner := r.sessionWorkspace(name)
 	if owner != "" && owner != ws {

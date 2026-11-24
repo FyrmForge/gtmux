@@ -117,4 +117,11 @@ func TestChooseTreeFilterExpr(t *testing.T) {
 	if truthy("play-api") {
 		t.Errorf("play-api should NOT match %q", expr)
 	}
+	// * crosses "/" like tmux's fnmatch (workspace sessions are <prefix>/<project>).
+	if got := Expand("#{m:work*,work/api}", nil); got != "1" {
+		t.Errorf("work* vs work/api = %q, want 1", got)
+	}
+	if got := Expand("#{m:work/a?i,work/api}", nil); got != "1" {
+		t.Errorf("literal / = %q, want 1", got)
+	}
 }

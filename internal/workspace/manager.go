@@ -84,7 +84,7 @@ func (m *Manager) Projects(name string, open func(session string) bool) (w *Work
 		}
 	} else if ents, err := os.ReadDir(w.Path); err == nil {
 		for _, e := range ents {
-			if e.IsDir() && !strings.HasPrefix(e.Name(), ".") {
+			if e.IsDir() && (w.Name != "temp" || !strings.HasPrefix(e.Name(), ".")) { // temp names can't start with "."
 				r := &Row{Name: e.Name(), Local: true}
 				if w.Name == "temp" { // newest first: mtime stands in for push time
 					if fi, err := e.Info(); err == nil {
@@ -154,16 +154,16 @@ func homeDir(w *Workspace) string {
 	return filepath.Join(w.Path, w.Home)
 }
 
-// SessionName is workspacer's <prefix>-<project>; a folder's session is just
-// its name; a home session is <prefix>-home.
+// SessionName is <prefix>/<project>; a folder's session is just its name; a
+// home session is <prefix>/home.
 func SessionName(w *Workspace, project string) string {
 	if w.Name == "folders" {
 		return project
 	}
 	if project == HomeProject {
-		return w.Prefix + "-home"
+		return w.Prefix + "/home"
 	}
-	return w.Prefix + "-" + project
+	return w.Prefix + "/" + project
 }
 
 // SessionSpec is the session the server builds with its own commands.
@@ -270,10 +270,10 @@ func (m *Manager) spec(w *Workspace, project, dir string) (*SessionSpec, error) 
 	return spec, nil
 }
 
-// homeClash: a project named "home" would share <prefix>-home with the home
+// homeClash: a project named "home" would share <prefix>/home with the home
 // session, so it's refused while the workspace declares a home.
 func homeClash(w *Workspace) error {
-	return fmt.Errorf("project \"home\" clashes with workspace %s's home session (%s-home); rename the repo or drop home", w.Name, w.Prefix)
+	return fmt.Errorf("project \"home\" clashes with workspace %s's home session (%s/home); rename the repo or drop home", w.Name, w.Prefix)
 }
 
 // prepareHome resolves w's home session: the workspace folder itself (root),
@@ -302,8 +302,8 @@ func (m *Manager) prepareHome(w *Workspace, env map[string]string) (*SessionSpec
 	return m.spec(w, HomeProject, dir)
 }
 
-// validName: GitHub's repo-name charset and length, minus a leading "." (the
-// picker hides dot-folders) or "-" (`gtmux temp -h` would read as a name).
+// validName: GitHub's repo-name charset and length, minus a leading "." (no
+// new dot-projects/temps) or "-" (`gtmux temp -h` would read as a name).
 var validName = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._-]{0,99}$`)
 
 // NewOpts is one `gtmux workspace new` request.

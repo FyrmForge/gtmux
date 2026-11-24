@@ -37,7 +37,7 @@ subcommand backed by a daemon-side actor. GitHub users/orgs are first-class
 7. Cloning: SSH, like workspacer (`git@<host>:<login>/<repo>.git`). Optional
    per-account `ssh_host` alias (`git@github-work:...`) so `~/.ssh/config`
    picks the key for multi-identity setups.
-8. Session names keep workspacer's `<prefix>-<project>`. Workspace membership
+8. Session names are `<prefix>/<project>` (workspacer used `-`). Workspace membership
    is stored as session metadata, never parsed from the name.
 9. CLI (alias `gtmux ws`):
    ```

@@ -567,7 +567,7 @@ end)
 -- background refresh fills in while it's open.
 --
 -- A workspace with ws.add{ home = "root" | "<folder>" } gets a pinned "⌂ home"
--- row: session <prefix>-home in the workspace folder (or that folder), for an
+-- row: session <prefix>/home in the workspace folder (or that folder), for an
 -- agent that works across every repo (`gtmux ws home [<ws>]`).
 --
 -- "folders" lists single folders declared with gtmux.workspace.folder{} (notes,

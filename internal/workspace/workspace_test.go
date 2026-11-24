@@ -131,7 +131,11 @@ func TestLuaConfigErrors(t *testing.T) {
 		`gtmux.workspace.account{ name = "a", login = "x", kind = "team" }`,
 		`gtmux.workspace.add{ name = "x", layout = 3 }`,
 		`gtmux.workspace.add{ name = "tmp" }`,
-		`gtmux.workspace.add{ name = "x", prefix = "tmp-x" }`,
+		`gtmux.workspace.add{ name = "x", prefix = "tmp/x" }`,
+		`gtmux.workspace.add{ name = "x", home = ".." }`,
+		`gtmux.workspace.add{ name = "x", home = "." }`,
+		`gtmux.workspace.add{ name = "x", home = "../y" }`,
+		`gtmux.workspace.add{ name = "x", prefix = "work/" }`,
 	} {
 		L := lua.NewState()
 		g := L.NewTable()
@@ -167,7 +171,7 @@ func TestPrepare(t *testing.T) {
 		t.Fatal(err)
 	}
 	api := filepath.Join(root, "work", "api")
-	if spec.Name != "w-api" || spec.Dir != api || spec.Workspace != "work" {
+	if spec.Name != "w/api" || spec.Dir != api || spec.Workspace != "work" {
 		t.Fatalf("spec: %+v", spec)
 	}
 	// function layout window, then sister api-protos (exists); docs missing → skipped.
@@ -304,8 +308,8 @@ func TestActorAndProjects(t *testing.T) {
 	var rows []Row
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		_, rows, _, _ = m.Projects("", func(s string) bool { return s == "acme-mid" })
-		if len(rows) == 4 && rows[2].Remote { // pages land 2 at a time: wait for "old"'s
+		_, rows, _, _ = m.Projects("", func(s string) bool { return s == "acme/mid" })
+		if len(rows) == 5 && rows[3].Remote { // pages land 2 at a time: wait for "old"'s
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -314,11 +318,11 @@ func TestActorAndProjects(t *testing.T) {
 	for _, r := range rows {
 		got = append(got, r.Name)
 	}
-	// open first, then newest push, then local-only A-Z; hidden dirs skipped.
-	if strings.Join(got, ",") != "mid,new,old,zlocal" {
+	// open first, then A-Z (dot-folders included).
+	if strings.Join(got, ",") != "mid,.hidden,new,old,zlocal" {
 		t.Fatalf("order = %v", got)
 	}
-	if !rows[2].Local || !rows[2].Remote || rows[1].Description != "fresh" || rows[3].Remote {
+	if !rows[3].Local || !rows[3].Remote || rows[2].Description != "fresh" || rows[4].Remote {
 		t.Fatalf("row flags: %+v", rows)
 	}
 
@@ -431,7 +435,7 @@ ws.add{
 	if _, err := os.Stat(filepath.Join(dir, "README.md")); err != nil {
 		t.Fatal("no README:", err)
 	}
-	if got := spec.Windows[0].Panes[0].Cmd; got != commit+"; nvim" || spec.Name != "me-a" {
+	if got := spec.Windows[0].Panes[0].Cmd; got != commit+"; nvim" || spec.Name != "me/a" {
 		t.Fatalf("spec %s cmd = %q", spec.Name, got)
 	}
 
@@ -452,7 +456,7 @@ ws.add{
 		{Name: ".."},                  // bad name
 		{Name: "c", Template: "nope"}, // unknown template
 		{Name: "c", GitHub: true},     // no account
-		{Name: ".hidden"},             // picker hides dot-folders
+		{Name: ".hidden"},             // no new dot-projects
 		{Name: strings.Repeat("x", 101)},
 		{Name: "c", Private: true},     // private without github
 		{Name: "c", Template: "multi"}, // newline in a command
@@ -593,7 +597,7 @@ func TestTemp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if spec.Name != "tmp-1" || spec.Workspace != "temp" || spec.Dir != filepath.Join(TempRoot(), "1") {
+	if spec.Name != "tmp/1" || spec.Workspace != "temp" || spec.Dir != filepath.Join(TempRoot(), "1") {
 		t.Fatalf("spec = %+v", spec)
 	}
 	if fi, _ := os.Stat(TempRoot()); fi.Mode().Perm() != 0o700 {
@@ -610,8 +614,8 @@ func TestTemp(t *testing.T) {
 	if len(rows) != 2 || rows[0].Name != "scratch" {
 		t.Fatalf("rows (newest first) = %+v", rows)
 	}
-	if n := m.NextTemp(func(s string) bool { return s == "tmp-2" }); n != "3" {
-		t.Fatalf("open tmp-2: next = %s", n)
+	if n := m.NextTemp(func(s string) bool { return s == "tmp/2" }); n != "3" {
+		t.Fatalf("open tmp/2: next = %s", n)
 	}
 	if _, err := m.Create("", NewOpts{Name: "z"}); err == nil {
 		t.Fatal("new on temp: want error")
@@ -698,7 +702,7 @@ gtmux.workspace.add{ name = "a", path = "/tmp/a", layout = function(p) add{ name
 	}
 }
 
-// TestHome: ws.add{ home = ... } adds a pinned home row (session <prefix>-home)
+// TestHome: ws.add{ home = ... } adds a pinned home row (session <prefix>/home)
 // in the workspace folder itself (root) or a folder under it, which is then
 // hidden from the normal rows and created when missing (no remote).
 func TestHome(t *testing.T) {
@@ -711,6 +715,7 @@ ws.root = "`+root+`"
 ws.add{ name = "a", home = "root", layout = { {}, { name = "two" } } }
 ws.add{ name = "b", home = "hq" }
 ws.add{ name = "c", home = "made" }
+ws.add{ name = "d2", home = ".llm" }
 ws.add{ name = "d" }`)
 	m := Start(cfg)
 	_, rows, _, _ := m.Projects("b", nil)
@@ -721,7 +726,7 @@ ws.add{ name = "d" }`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if spec.Name != "a-home" || spec.Dir != filepath.Join(root, "a") || spec.Windows[0].Name != "home" || len(spec.Windows) != 2 {
+	if spec.Name != "a/home" || spec.Dir != filepath.Join(root, "a") || spec.Windows[0].Name != "home" || len(spec.Windows) != 2 {
 		t.Fatalf("a home spec = %+v", spec)
 	}
 	if _, err := m.Prepare("c", HomeProject, nil); err != nil {
@@ -729,6 +734,17 @@ ws.add{ name = "d" }`)
 	}
 	if fi, err := os.Stat(filepath.Join(root, "c", "made")); err != nil || !fi.IsDir() {
 		t.Fatalf("home folder not created: %v", err)
+	}
+	// A dot-folder home: created on open, and not also listed as a normal row.
+	spec, err = m.Prepare("d2", HomeProject, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Stat(filepath.Join(root, "d2", ".llm")); err != nil || !fi.IsDir() || spec.Name != "d2/home" {
+		t.Fatalf("d2 home: spec %+v, stat err %v", spec, err)
+	}
+	if _, rows, _, _ := m.Projects("d2", nil); len(rows) != 1 || rows[0].Name != HomeProject {
+		t.Fatalf("d2 rows = %+v", rows)
 	}
 	if _, err := m.Prepare("d", HomeProject, nil); err == nil {
 		t.Fatal("no home declared: want error")

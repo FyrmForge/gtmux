@@ -76,7 +76,9 @@ func applyOp(op, rest string, vars map[string]string, loop LoopFunc) string {
 	case "&&":
 		return boolStr(truthy(get(0)) && truthy(get(1)))
 	case "m":
-		ok, err := path.Match(get(0), get(1))
+		// "/" -> NUL: path.Match's * never crosses "/", tmux's fnmatch does
+		// (session names are <prefix>/<project>).
+		ok, err := path.Match(strings.ReplaceAll(get(0), "/", "\x00"), strings.ReplaceAll(get(1), "/", "\x00"))
 		return boolStr(err == nil && ok)
 	case "m/r":
 		re, err := regexp.Compile(get(0))

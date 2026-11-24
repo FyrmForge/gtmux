@@ -20,7 +20,7 @@ import (
 // env) and switches this client to it; the session is tagged @workspace.
 func TestWorkspaceOpen(t *testing.T) {
 	root := t.TempDir()
-	for _, d := range []string{"work/alpha", "work/beta", "work/x-y", "other/y"} {
+	for _, d := range []string{"work/alpha", "work/beta", "work/x-y", "other/x-y"} {
 		if err := os.MkdirAll(filepath.Join(root, d), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -42,8 +42,8 @@ ws.add{
     { name = "logs" },
   },
 }
--- prefix "work-x" + project "y" collides with work's "work" + "x-y".
-ws.add{ name = "other", prefix = "work-x" }
+-- a shared prefix collides: other's "work" + "x-y" vs work's "work" + "x-y".
+ws.add{ name = "other", prefix = "work" }
 `, root)
 	c := harness.StartWithConfig(t, "", serverLua)
 	c.WaitForStatus("default")
@@ -55,51 +55,51 @@ ws.add{ name = "other", prefix = "work-x" }
 	time.Sleep(200 * time.Millisecond)
 	c.TypeLine("")
 
-	waitStatus(c, "work-beta") // a build: give it more than the 2s default
+	waitStatus(c, "work/beta") // a build: give it more than the 2s default
 	// The first pane spawned with the workspace env and then had a command
 	// typed into it: give a cold login shell more than the default 2s.
 	c.WaitForUntil(10*time.Second, func(s *harness.Screen) bool { return strings.Contains(s.String(), "PANE-from-env") })
 
-	out := c.Run("run", "work-beta", "list-windows")
+	out := c.Run("run", "work/beta", "list-windows")
 	if !strings.Contains(out, "edit") || !strings.Contains(out, "logs") || strings.Count(strings.TrimSpace(out), "\n") != 1 {
 		t.Fatalf("windows:\n%s", out)
 	}
-	if out := c.Run("run", "work-beta", "display-message", "-p", "#{@workspace}"); strings.TrimSpace(out) != "work" {
+	if out := c.Run("run", "work/beta", "display-message", "-p", "#{@workspace}"); strings.TrimSpace(out) != "work" {
 		t.Fatalf("@workspace = %q", out)
 	}
-	if out := c.Run("run", "work-beta", "display-message", "-p", "#{pane_path}"); !strings.Contains(out, "work/beta") {
+	if out := c.Run("run", "work/beta", "display-message", "-p", "#{pane_path}"); !strings.Contains(out, "work/beta") {
 		t.Fatalf("pane path = %q", out)
 	}
 
 	// The headline fix over workspacer: `gtmux ws` typed in a pane of this
 	// daemon switches THIS client (no nested attach).
 	c.TypeLine(c.Bin() + " ws work alpha")
-	waitStatus(c, "work-alpha")
+	waitStatus(c, "work/alpha")
 
 	// "" = the acting session's own workspace; an existing session is just
 	// switched to, not rebuilt.
-	c.Run("run", "work-alpha", "workspace-open", "", "beta")
-	waitStatus(c, "work-beta")
-	if out := c.Run("run", "work-beta", "list-windows"); strings.Count(strings.TrimSpace(out), "\n") != 1 {
+	c.Run("run", "work/alpha", "workspace-open", "", "beta")
+	waitStatus(c, "work/beta")
+	if out := c.Run("run", "work/beta", "list-windows"); strings.Count(strings.TrimSpace(out), "\n") != 1 {
 		t.Fatalf("beta rebuilt? windows:\n%s", out)
 	}
 	// Opening the project you're in is a no-op: no detach/reattach, and the
 	// last session stays alpha (it used to become beta itself).
-	c.Run("run", "work-beta", "workspace-open", "work", "beta")
+	c.Run("run", "work/beta", "workspace-open", "work", "beta")
 	time.Sleep(300 * time.Millisecond)
-	c.Run("run", "work-beta", "switch-client", "-l")
-	waitStatus(c, "work-alpha")
-	c.Run("run", "work-alpha", "workspace-open", "work", "beta")
-	waitStatus(c, "work-beta")
+	c.Run("run", "work/beta", "switch-client", "-l")
+	waitStatus(c, "work/alpha")
+	c.Run("run", "work/alpha", "workspace-open", "work", "beta")
+	waitStatus(c, "work/beta")
 
 	// A colliding session name owned by another workspace is refused, not reused.
-	c.Run("run", "work-beta", "workspace-open", "work", "x-y")
-	waitStatus(c, "work-x-y")
-	c.Run("run", "work-x-y", "workspace-open", "other", "y")
+	c.Run("run", "work/beta", "workspace-open", "work", "x-y")
+	waitStatus(c, "work/x-y")
+	c.Run("run", "work/x-y", "workspace-open", "other", "x-y")
 	deadline := time.Now().Add(10 * time.Second)
-	for !strings.Contains(c.Run("run", "work-x-y", "show-messages"), "belongs to workspace work") {
+	for !strings.Contains(c.Run("run", "work/x-y", "show-messages"), "belongs to workspace work") {
 		if time.Now().After(deadline) {
-			t.Fatalf("collision not refused; messages:\n%s", c.Run("run", "work-x-y", "show-messages"))
+			t.Fatalf("collision not refused; messages:\n%s", c.Run("run", "work/x-y", "show-messages"))
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -130,7 +130,7 @@ gtmux.workspace.add{ name = "work" }
 	quit.WaitForText("alpha")
 	quit.Ctrl('c')
 	time.Sleep(300 * time.Millisecond)
-	if err := c.RunErr("has-session", "work-alpha"); err == nil {
+	if err := c.RunErr("has-session", "work/alpha"); err == nil {
 		t.Fatal("C-c must not create a session")
 	}
 
@@ -139,7 +139,7 @@ gtmux.workspace.add{ name = "work" }
 	p.Type("alp")
 	time.Sleep(200 * time.Millisecond)
 	p.TypeLine("")
-	waitStatus(p, "work-alpha")
+	waitStatus(p, "work/alpha")
 }
 
 // TestWorkspaceNew: the new-project wizard, local only (no account). From the
@@ -206,14 +206,14 @@ ws.add{ name = "bare" }
 	c.TypeLine("") // template chosen
 	c.WaitForText("Enter create")
 	c.TypeLine("") // summary: create
-	waitStatus(c, "work-fresh")
+	waitStatus(c, "work/fresh")
 	committed("fresh")
 	if b, err := os.ReadFile(filepath.Join(root, "work", "fresh", "mark.txt")); err != nil || !strings.Contains(string(b), "SCAFFOLD-fresh") {
 		t.Fatalf("template didn't run: %q %v", b, err)
 	}
 
 	c.TypeLine(c.Bin() + " ws new work quick --template empty")
-	waitStatus(c, "work-quick")
+	waitStatus(c, "work/quick")
 	committed("quick")
 	if _, err := os.Stat(filepath.Join(root, "work", "quick", "README.md")); err != nil {
 		t.Fatal("empty template: no README")
@@ -232,20 +232,20 @@ ws.add{ name = "bare" }
 	c.TypeLine("") // name
 	c.WaitForText("Enter create")
 	c.TypeLine("")
-	waitStatus(c, "bare-plain")
+	waitStatus(c, "bare/plain")
 	if _, err := os.Stat(filepath.Join(root, "bare", "plain", "README.md")); err != nil {
 		t.Fatal("bare: no README")
 	}
 
 	// A leftover session (folder deleted) must refuse, not swallow the scaffold.
-	c.Run("run", "bare-plain", "workspace-open", "work", "alpha")
-	waitStatus(c, "work-alpha")
+	c.Run("run", "bare/plain", "workspace-open", "work", "alpha")
+	waitStatus(c, "work/alpha")
 	os.RemoveAll(filepath.Join(root, "work", "alpha"))
-	c.Run("run", "work-alpha", "workspace-new", "work", "alpha", "", "0", "0")
+	c.Run("run", "work/alpha", "workspace-new", "work", "alpha", "", "0", "0")
 	deadline := time.Now().Add(10 * time.Second)
-	for !strings.Contains(c.Run("run", "work-alpha", "show-messages"), "session work-alpha already exists") {
+	for !strings.Contains(c.Run("run", "work/alpha", "show-messages"), "session work/alpha already exists") {
 		if time.Now().After(deadline) {
-			t.Fatalf("leftover session not refused; messages:\n%s", c.Run("run", "work-alpha", "show-messages"))
+			t.Fatalf("leftover session not refused; messages:\n%s", c.Run("run", "work/alpha", "show-messages"))
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -260,7 +260,7 @@ ws.add{ name = "bare" }
 	p.TypeLine("") // template (empty)
 	p.WaitForText("Enter create")
 	p.TypeLine("")
-	waitStatus(p, "work-solo")
+	waitStatus(p, "work/solo")
 	committed("solo")
 }
 
@@ -279,10 +279,10 @@ func TestWorkspaceTemp(t *testing.T) {
 	c.Run("rename", "default", "renamed")
 	waitStatus(c, "renamed")
 	c.TypeLine(c.Bin() + " temp")
-	waitStatus(c, "tmp-1")
+	waitStatus(c, "tmp/1")
 	c.TypeLine(c.Bin() + " t notes")
-	waitStatus(c, "tmp-notes")
-	if out := c.Run("run", "tmp-notes", "display-message", "-p", "#{@workspace} #{pane_path}"); !strings.Contains(out, "temp "+filepath.Join(root, "notes")) {
+	waitStatus(c, "tmp/notes")
+	if out := c.Run("run", "tmp/notes", "display-message", "-p", "#{@workspace} #{pane_path}"); !strings.Contains(out, "temp "+filepath.Join(root, "notes")) {
 		t.Fatalf("tag/path = %q", out)
 	}
 
@@ -290,17 +290,17 @@ func TestWorkspaceTemp(t *testing.T) {
 	c.WaitForText("workspace: temp")
 	c.WaitForText("notes")
 	c.Ctrl('o')
-	waitStatus(c, "tmp-2")
+	waitStatus(c, "tmp/2")
 
 	if err := c.RunErr("temp", "rm", "1"); err == nil {
 		t.Fatal("rm of an open temp must be refused")
 	}
 	// A renamed temp session still holds its folder.
-	c.Run("rename", "tmp-notes", "kept")
+	c.Run("rename", "tmp/notes", "kept")
 	if err := c.RunErr("temp", "rm", "notes"); err == nil {
 		t.Fatalf("rm of a renamed open temp: %v", err)
 	}
-	c.Run("run", "tmp-2", "kill-session", "-t", "tmp-1")
+	c.Run("run", "tmp/2", "kill-session", "-t", "tmp/1")
 	if err := c.RunErr("temp", "rm", "1"); err != nil {
 		t.Fatal(err)
 	}
@@ -328,7 +328,7 @@ func TestWorkspaceTemp(t *testing.T) {
 	}
 }
 
-// TestWorkspaceHomeAndAdopt: `gtmux ws home <ws>` opens <prefix>-home in the
+// TestWorkspaceHomeAndAdopt: `gtmux ws home <ws>` opens <prefix>/home in the
 // workspace folder (home = "root"); opening a project whose session was made
 // by hand (untagged) reuses it and tags it.
 func TestWorkspaceHomeAndAdopt(t *testing.T) {
@@ -339,18 +339,18 @@ gtmux.workspace.add{ name = "work", home = "root" }`, root))
 	c.WaitForStatus("default")
 
 	c.TypeLine(c.Bin() + " ws home work")
-	waitStatus(c, "work-home")
-	if out := c.Run("run", "work-home", "display-message", "-p", "#{@workspace} #{pane_path}"); !strings.Contains(out, "work "+filepath.Join(root, "work")) {
+	waitStatus(c, "work/home")
+	if out := c.Run("run", "work/home", "display-message", "-p", "#{@workspace} #{pane_path}"); !strings.Contains(out, "work "+filepath.Join(root, "work")) {
 		t.Fatalf("home tag/path = %q", out)
 	}
 
-	c.Run("run", "work-home", "new-session", "-d", "-s", "work-beta")
-	if out := c.Run("run", "work-beta", "display-message", "-p", "[#{@workspace}]"); strings.TrimSpace(out) != "[]" {
+	c.Run("run", "work/home", "new-session", "-d", "-s", "work/beta")
+	if out := c.Run("run", "work/beta", "display-message", "-p", "[#{@workspace}]"); strings.TrimSpace(out) != "[]" {
 		t.Fatalf("hand-made session already tagged: %q", out)
 	}
 	c.TypeLine(c.Bin() + " ws work beta")
-	waitStatus(c, "work-beta")
-	if out := c.Run("run", "work-beta", "display-message", "-p", "#{@workspace}/#{@project}"); strings.TrimSpace(out) != "work/beta" {
+	waitStatus(c, "work/beta")
+	if out := c.Run("run", "work/beta", "display-message", "-p", "#{@workspace}/#{@project}"); strings.TrimSpace(out) != "work/beta" {
 		t.Fatalf("adopted session tags = %q", out)
 	}
 }

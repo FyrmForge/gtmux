@@ -213,12 +213,15 @@ func Register(L *lua.LState, gtmux *lua.LTable) *Config {
 		if w.Prefix == "" {
 			w.Prefix = w.Name
 		}
-		if w.Prefix == "tmp" || strings.HasPrefix(w.Prefix, "tmp-") {
-			l.ArgError(1, "prefix \"tmp\" is taken by temp workspaces (tmp-<name> sessions)")
+		if strings.HasSuffix(w.Prefix, "/") {
+			l.ArgError(1, "prefix must not end in / (sessions are <prefix>/<project>)")
+		}
+		if w.Prefix == "tmp" || strings.HasPrefix(w.Prefix, "tmp/") {
+			l.ArgError(1, "prefix \"tmp\" is taken by temp workspaces (tmp/<name> sessions)")
 		}
 		w.Default = lua.LVAsBool(t.RawGetString("default"))
-		if w.Home = lstr(t, "home"); w.Home != "" && w.Home != "root" && !validName.MatchString(w.Home) {
-			l.ArgError(1, "home must be \"root\" or a folder name (letters, digits, . _ -)")
+		if w.Home = lstr(t, "home"); w.Home != "" && w.Home != "root" && !validName.MatchString(strings.TrimPrefix(w.Home, ".")) {
+			l.ArgError(1, "home must be \"root\" or a folder name (letters, digits, . _ -; may start with .)")
 		}
 		if et, ok := t.RawGetString("env").(*lua.LTable); ok {
 			et.ForEach(func(k, v lua.LValue) { w.Env[k.String()] = v.String() })
