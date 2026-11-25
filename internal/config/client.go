@@ -72,7 +72,7 @@ type ClientConfig struct {
 	StatusRight        string
 	StatusInterval     int    // #client()/#server() cache cadence, seconds
 	ModeKeys           string // copy-mode keytable: "vi" (default) or "emacs"
-	// CopyLineNumbers draws a line-number gutter in copy-mode: "off" (default),
+	// CopyLineNumbers draws line numbers over the pane's left border in copy-mode: "off" (default),
 	// "absolute" (index into the frozen snapshot, oldest scrollback line = 1) or
 	// "relative" (distance from the cursor line, which shows 0).
 	CopyLineNumbers string

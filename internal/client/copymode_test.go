@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/FyrmForge/gtmux/internal/emu"
+	"github.com/FyrmForge/gtmux/internal/proto"
 )
 
 func mkLine(s string) emu.Line {
@@ -227,5 +228,19 @@ func TestCopyModeYankJoinsSoftWrap(t *testing.T) {
 	cm.cy, cm.cx = 2, 3
 	if got, want := cm.selectedText(), "echo foo bar\nnext"; got != want {
 		t.Fatalf("yank = %q, want %q", got, want)
+	}
+}
+
+// Entering copy-mode shows the live screen as it was: the view starts at the
+// bottom of the snapshot, not scrolled so the cursor sits on the last row.
+func TestCopyModeEnterKeepsView(t *testing.T) {
+	var lines []emu.Line
+	for i := 0; i < 10; i++ {
+		lines = append(lines, mkLine("x"))
+	}
+	// 10 lines, 4-row pane: screen is lines 6-9, cursor on its top row (6).
+	cm := newCopyMode(&proto.CopyModeEnter{Lines: lines, CursorY: 6}, 4, false, "")
+	if cm.top != 6 {
+		t.Errorf("top = %d, want 6 (the live screen)", cm.top)
 	}
 }

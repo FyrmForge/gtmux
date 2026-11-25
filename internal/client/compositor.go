@@ -1071,7 +1071,8 @@ func (c *compositor) rectFor(paneID int) (proto.PaneRect, bool) {
 // grab: once focus moves elsewhere the overlay keeps rendering but keys and
 // mouse belong to the newly active pane, and switching back resumes it.
 func (c *compositor) copyFocused() bool {
-	if c.copy == nil || c.layout == nil {
+	// A prompt or picker opened on top (prefix+s etc.) takes the keys.
+	if c.copy == nil || c.layout == nil || c.prompt != nil || c.picker != nil {
 		return false
 	}
 	pr, ok := c.rectFor(c.copy.paneID)
@@ -1128,7 +1129,7 @@ func (c *compositor) activeCursor() (row, col int, visible bool) {
 	if c.copyFocused() {
 		if pr, ok := c.rectFor(c.copy.paneID); ok {
 			r := pr.Row + (c.copy.cy - c.copy.top)
-			col := pr.Col + c.copyGutterWidth(pr) + c.copy.cx + coff
+			col := pr.Col + c.copy.cx + coff
 			return r + off, col, inContent(r) && col >= 0 && col < c.cols()
 		}
 	}
@@ -1907,6 +1908,8 @@ func (c *compositor) buildRow(row int) emu.Line {
 		}
 	}
 
+	c.drawCopyNumber(row, line)
+
 	// pane-border-status: each pane reserved a row (BorderRow) for its label;
 	// draw the border rule across the pane and overlay the expanded label.
 	for _, pr := range c.layout.Panes {
@@ -2304,10 +2307,6 @@ func (c *compositor) drawCentered(text string, line emu.Line) {
 func (c *compositor) buildCopyRow(pr proto.PaneRect, localRow int, line emu.Line) {
 	cm := c.copy
 	bufY := cm.top + localRow
-	gut := c.copyGutterWidth(pr)
-	if gut > 0 {
-		c.drawCopyGutter(pr, bufY, gut, line)
-	}
 	var src emu.Line
 	if bufY >= 0 && bufY < len(cm.lines) {
 		src = cm.lines[bufY]
@@ -2320,10 +2319,8 @@ func (c *compositor) buildCopyRow(pr proto.PaneRect, localRow int, line emu.Line
 	if cursorX > 0 && cursorX < len(src) && src[cursorX-1].Width() > 1 {
 		cursorX--
 	}
-	// x is the buffer column (what the cursor/selection are indexed by); col is
-	// the screen cell, shifted right past the number gutter.
-	for x := 0; x < pr.Cols-gut; x++ {
-		col := pr.Col + gut + x
+	for x := 0; x < pr.Cols; x++ {
+		col := pr.Col + x
 		if col < 0 || col >= c.contentCols() {
 			continue
 		}
@@ -2339,40 +2336,29 @@ func (c *compositor) buildCopyRow(pr proto.PaneRect, localRow int, line emu.Line
 			g.FG, g.BG = c.cfg.CopySelectionFG, c.cfg.CopySelectionBG
 			g.Mode &^= emu.AttrReverse
 		}
-		line[col] = clipWide(g, roomIn(pr.Cols-gut-x, c.contentCols()-col))
+		line[col] = clipWide(g, roomIn(pr.Cols-x, c.contentCols()-col))
 	}
 }
 
-// copyGutterWidth is the number-gutter width for a copy-mode pane, fixed for
-// the whole redraw (copy_line_numbers). Deriving it from the pane height, not
-// from the numbers actually on screen, keeps the content from sliding sideways
-// every time the cursor moves. 0 = no gutter.
-func (c *compositor) copyGutterWidth(pr proto.PaneRect) int {
-	n := 0
-	switch c.cfg.CopyLineNumbers {
-	case "relative":
-		n = pr.Rows - 1 // largest distance from the cursor that can be on screen
-	case "absolute":
-		n = len(c.copy.lines)
-	default:
-		return 0
-	}
-	w := 1
-	for n >= 10 {
-		n /= 10
-		w++
-	}
-	w++ // trailing space between the numbers and the text
-	if w >= pr.Cols {
-		return 0 // pane too narrow to spare the cells
-	}
-	return w
-}
-
-// drawCopyGutter paints one row's line number, right-aligned in the gutter.
+// drawCopyNumber paints a copy-mode row's line number (copy_line_numbers) over
+// the pane's left border, so the text never shifts: the last digit sits on the
+// border and longer numbers spill left into the neighbour pane. A pane with no
+// room on its left (window edge) takes the number over its own first columns.
+// Runs after every pane is painted, or a neighbour drawn later would cover it.
 // Relative mode counts from the cursor line, which shows 0.
-func (c *compositor) drawCopyGutter(pr proto.PaneRect, bufY, gut int, line emu.Line) {
+func (c *compositor) drawCopyNumber(row int, line emu.Line) {
 	cm := c.copy
+	if cm == nil || (c.cfg.CopyLineNumbers != "relative" && c.cfg.CopyLineNumbers != "absolute") {
+		return
+	}
+	pr, ok := c.rectFor(cm.paneID)
+	if !ok || row < pr.Row || row >= pr.Row+pr.Rows {
+		return
+	}
+	bufY := cm.top + row - pr.Row
+	if bufY < 0 || bufY >= len(cm.lines) {
+		return
+	}
 	num := bufY + 1
 	if c.cfg.CopyLineNumbers == "relative" {
 		num = cm.cy - bufY
@@ -2380,17 +2366,22 @@ func (c *compositor) drawCopyGutter(pr proto.PaneRect, bufY, gut int, line emu.L
 			num = -num
 		}
 	}
-	// Past the end of the snapshot the gutter is blank, not left as whatever the
-	// base row had (the dot fill) — these cells belong to nobody else now that
-	// the content loop starts past them.
-	text := strings.Repeat(" ", gut)
-	if bufY >= 0 && bufY < len(cm.lines) {
-		text = fmt.Sprintf("%*d ", gut-1, num)
+	text := strconv.Itoa(num)
+	start := pr.Col - len(text)
+	if start < 0 {
+		start = pr.Col
 	}
-	for i, r := range []rune(text) {
-		col := pr.Col + i
-		if col < 0 || col >= c.contentCols() || i >= gut {
+	// Don't leave half a wide rune on either side of the overwritten cells.
+	if start > 0 && start-1 < len(line) && line[start-1].Width() > 1 {
+		line[start-1] = emu.EmptyGlyph()
+	}
+	for i, r := range text {
+		col := start + i
+		if col < 0 || col >= len(line) {
 			continue
+		}
+		if line[col].Width() > 1 && col+1 < len(line) {
+			line[col+1] = emu.EmptyGlyph()
 		}
 		line[col] = emu.Glyph{Char: r, FG: c.cfg.FillFG, BG: emu.DefaultBG, Mode: emu.AttrDim}
 	}
@@ -3069,13 +3060,13 @@ func (c *compositor) copyMouse(me proto.MouseEvent) ([]byte, copyResult) {
 			cm.cy += n
 		}
 	case isLeft && me.Press && !isMotion:
-		cm.cy, cm.cx = cm.top+(row-pr.Row), col-pr.Col-c.copyGutterWidth(pr)
+		cm.cy, cm.cx = cm.top+(row-pr.Row), col-pr.Col
 		cm.clamp()
 		cm.selY, cm.selX, cm.selecting, cm.lineSel = cm.cy, cm.cx, true, false
 	case isLeft && isMotion && cm.selecting:
-		cm.cy, cm.cx = cm.top+(row-pr.Row), col-pr.Col-c.copyGutterWidth(pr)
+		cm.cy, cm.cx = cm.top+(row-pr.Row), col-pr.Col
 		if cm.cx < 0 {
-			cm.cx = 0 // dragged into the gutter; release clamps the rest
+			cm.cx = 0 // dragged past the left edge; release clamps the rest
 		}
 	case !me.Press && cm.selecting:
 		cm.clamp()

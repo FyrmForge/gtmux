@@ -267,54 +267,77 @@ func TestCompositorCopyModeCursorHighlight(t *testing.T) {
 	}
 }
 
-// TestCompositorCopyModeRelativeNumbers verifies the copy_line_numbers gutter:
-// distances from the cursor line (which shows 0), right-aligned, with the pane
-// text shifted right past it and the cursor block moving with it.
+// TestCompositorCopyModeRelativeNumbers verifies copy_line_numbers draws over
+// the pane's left border without shifting the text: the last digit sits on the
+// border, longer numbers spill left into the neighbour, and a pane at the
+// window edge takes the number over its own first column(s).
 func TestCompositorCopyModeRelativeNumbers(t *testing.T) {
+	rowText := func(c *compositor, row, n int) string {
+		var got []rune
+		for _, g := range c.buildRow(row)[:n] {
+			got = append(got, g.Char)
+		}
+		return string(got)
+	}
+	// Pane 2 (cols 0-4) | border col 5 | pane 1 (cols 6-11) in copy mode.
 	c := newCompositor()
 	c.cfg.CopyLineNumbers = "relative"
 	c.apply(&proto.ServerMsg{
-		Layout: &proto.Layout{Cols: 8, Rows: 3, Panes: []proto.PaneRect{
-			{ID: 1, Row: 0, Col: 0, Rows: 3, Cols: 8, Active: true},
+		Layout: &proto.Layout{Cols: 12, Rows: 3, Panes: []proto.PaneRect{
+			{ID: 2, Row: 0, Col: 0, Rows: 3, Cols: 5},
+			{ID: 1, Row: 0, Col: 6, Rows: 3, Cols: 6, Active: true},
 		}},
+		PaneContent: []proto.PaneContent{{PaneID: 2, Lines: map[int]emu.Line{
+			0: lineOf("xxxxx"), 1: lineOf("xxxxx"), 2: lineOf("xxxxx"),
+		}}},
 		Status: &proto.StatusInfo{},
 	})
 	c.apply(&proto.ServerMsg{CopyModeEnter: &proto.CopyModeEnter{
 		PaneID: 1, Lines: []emu.Line{lineOf("aaa"), lineOf("bbb"), lineOf("ccc")},
 		CursorY: 1, CursorX: 0,
 	}})
-
-	// 3 rows => max distance 2 => one digit + a trailing space.
-	const gut = 2
-	for row, want := range []string{"1 aaa", "0 bbb", "1 ccc"} {
-		var got []rune
-		for _, g := range c.buildRow(row)[:len(want)] {
-			got = append(got, g.Char)
-		}
-		if string(got) != want {
-			t.Errorf("row %d = %q, want %q", row, string(got), want)
+	for row, want := range []string{"xxxxx1aaa", "xxxxx0bbb", "xxxxx1ccc"} {
+		if got := rowText(c, row, len(want)); got != want {
+			t.Errorf("row %d = %q, want %q", row, got, want)
 		}
 	}
-	// Cursor block sits on the first text cell, not in the gutter.
-	if g := c.buildRow(1)[gut]; g.FG != c.cfg.CopyCursorFG || g.BG != c.cfg.CopyCursorBG {
-		t.Errorf("cursor cell at col %d: FG=%v BG=%v, want copy-cursor colors", gut, g.FG, g.BG)
+	// Text isn't shifted: the cursor block and the real cursor sit on col 6.
+	if g := c.buildRow(1)[6]; g.FG != c.cfg.CopyCursorFG || g.BG != c.cfg.CopyCursorBG {
+		t.Errorf("cursor cell at col 6: FG=%v BG=%v, want copy-cursor colors", g.FG, g.BG)
+	}
+	if _, col, _ := c.activeCursor(); col != 6 {
+		t.Errorf("activeCursor col = %d, want 6", col)
 	}
 
-	// The real terminal cursor tracks the painted block, or the outer terminal
-	// draws a second cursor gut cells to its left.
-	if _, col, _ := c.activeCursor(); col != gut {
-		t.Errorf("activeCursor col = %d, want %d (past the gutter)", col, gut)
-	}
-
-	// Absolute numbers the snapshot from 1, oldest scrollback line first.
+	// Absolute: two-digit numbers spill one cell into the neighbour.
 	c.cfg.CopyLineNumbers = "absolute"
-	for row, want := range []string{"1 aaa", "2 bbb", "3 ccc"} {
-		var got []rune
-		for _, g := range c.buildRow(row)[:len(want)] {
-			got = append(got, g.Char)
+	var lines []emu.Line
+	for i := 0; i < 12; i++ {
+		lines = append(lines, lineOf("aaa"))
+	}
+	c.apply(&proto.ServerMsg{CopyModeEnter: &proto.CopyModeEnter{PaneID: 1, Lines: lines, CursorY: 11}})
+	for row, want := range []string{"xxxx10aaa", "xxxx11aaa", "xxxx12aaa"} {
+		if got := rowText(c, row, len(want)); got != want {
+			t.Errorf("absolute row %d = %q, want %q", row, got, want)
 		}
-		if string(got) != want {
-			t.Errorf("absolute row %d = %q, want %q", row, string(got), want)
+	}
+
+	// Window-edge pane: nothing to the left, the number covers its own text.
+	c = newCompositor()
+	c.cfg.CopyLineNumbers = "relative"
+	c.apply(&proto.ServerMsg{
+		Layout: &proto.Layout{Cols: 6, Rows: 3, Panes: []proto.PaneRect{
+			{ID: 1, Row: 0, Col: 0, Rows: 3, Cols: 6, Active: true},
+		}},
+		Status: &proto.StatusInfo{},
+	})
+	c.apply(&proto.ServerMsg{CopyModeEnter: &proto.CopyModeEnter{
+		PaneID: 1, Lines: []emu.Line{lineOf("aaa"), lineOf("bbb"), lineOf("ccc")},
+		CursorY: 1,
+	}})
+	for row, want := range []string{"1aa", "0bb", "1cc"} {
+		if got := rowText(c, row, len(want)); got != want {
+			t.Errorf("edge row %d = %q, want %q", row, got, want)
 		}
 	}
 }
@@ -629,5 +652,33 @@ func TestCopyDragFinishOption(t *testing.T) {
 	}
 	if res := drag(false); res.exit || res.yank != "" {
 		t.Errorf("finish=false: want no exit/yank, got %+v", res)
+	}
+}
+
+// A picker or prompt opened over a focused copy-mode pane takes the input:
+// copyFocused goes false so client.go routes keys/mouse to the overlay.
+func TestCopyModeYieldsToPickerAndPrompt(t *testing.T) {
+	c := newCompositor()
+	c.apply(&proto.ServerMsg{
+		Layout: &proto.Layout{Cols: 4, Rows: 1, Panes: []proto.PaneRect{
+			{ID: 1, Row: 0, Col: 0, Rows: 1, Cols: 4, Active: true},
+		}},
+		Status: &proto.StatusInfo{},
+	})
+	c.apply(&proto.ServerMsg{CopyModeEnter: &proto.CopyModeEnter{PaneID: 1, Lines: []emu.Line{lineOf("abc")}}})
+	if !c.copyFocused() {
+		t.Fatal("copy-mode should be focused before any overlay")
+	}
+	c.picker = &picker{title: "sessions"}
+	if c.copyFocused() {
+		t.Error("copyFocused with a picker open, want false")
+	}
+	c.picker, c.prompt = nil, &prompt{}
+	if c.copyFocused() {
+		t.Error("copyFocused with a prompt open, want false")
+	}
+	c.prompt = nil
+	if !c.copyFocused() {
+		t.Error("copy-mode should regain focus once the overlay closes")
 	}
 }

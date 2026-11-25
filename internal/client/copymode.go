@@ -45,6 +45,7 @@ type copyMode struct {
 func newCopyMode(m *proto.CopyModeEnter, rows int, emacs bool, wordSep string) *copyMode {
 	cm := &copyMode{paneID: m.PaneID, lines: m.Lines, rows: rows, cy: m.CursorY, cx: m.CursorX, emacs: emacs, wordSep: wordSep}
 	cm.clamp()
+	cm.top = len(cm.lines) - rows // open on the live screen, not scrolled to the cursor
 	// Drag-to-copy: begin a selection anchored at the entry cursor so the
 	// continuing mouse drag extends it.
 	if m.Select {
