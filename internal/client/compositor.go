@@ -2105,6 +2105,9 @@ func (c *compositor) composeContentRow(content emu.Line, winRow int) emu.Line {
 		if l := coff - 1; l >= 0 && l < len(phys) {
 			fg, bg, attr := c.borderStyleAt(-1, winRow) // frame col in content coords
 			phys[l] = emu.Glyph{Char: c.borderRuneAt(winRow, -1, '│'), FG: fg, BG: bg, Mode: attr}
+			if start, text, ok := c.copyNumberAt(winRow); ok && start == -1 {
+				phys[l] = c.numberGlyph([]rune(text)[0]) // leftmost pane's number starts on the frame
+			}
 		}
 		if r := coff + c.contentCols(); r >= 0 && r < len(phys) {
 			fg, bg, attr := c.borderStyleAt(c.contentCols(), winRow)
@@ -2340,24 +2343,25 @@ func (c *compositor) buildCopyRow(pr proto.PaneRect, localRow int, line emu.Line
 	}
 }
 
-// drawCopyNumber paints a copy-mode row's line number (copy_line_numbers) over
-// the pane's left border, so the text never shifts: the last digit sits on the
-// border and longer numbers spill left into the neighbour pane. A pane with no
-// room on its left (window edge) takes the number over its own first columns.
-// Runs after every pane is painted, or a neighbour drawn later would cover it.
+// copyNumberAt returns window row `row`'s copy-mode line number
+// (copy_line_numbers) and the content column of its first digit. The number
+// sits over the pane's left border so the text never shifts: the last digit
+// on the border, longer numbers spilling left into the neighbour. A pane with
+// no room on its left starts at the leftmost free cell — the framed outer
+// border (col -1, painted by composeContentRow) or else its own first column.
 // Relative mode counts from the cursor line, which shows 0.
-func (c *compositor) drawCopyNumber(row int, line emu.Line) {
+func (c *compositor) copyNumberAt(row int) (start int, text string, ok bool) {
 	cm := c.copy
-	if cm == nil || (c.cfg.CopyLineNumbers != "relative" && c.cfg.CopyLineNumbers != "absolute") {
-		return
+	if cm == nil || c.preview != nil || (c.cfg.CopyLineNumbers != "relative" && c.cfg.CopyLineNumbers != "absolute") {
+		return 0, "", false
 	}
-	pr, ok := c.rectFor(cm.paneID)
-	if !ok || row < pr.Row || row >= pr.Row+pr.Rows {
-		return
+	pr, found := c.rectFor(cm.paneID)
+	if !found || row < pr.Row || row >= pr.Row+pr.Rows {
+		return 0, "", false
 	}
 	bufY := cm.top + row - pr.Row
 	if bufY < 0 || bufY >= len(cm.lines) {
-		return
+		return 0, "", false
 	}
 	num := bufY + 1
 	if c.cfg.CopyLineNumbers == "relative" {
@@ -2366,10 +2370,22 @@ func (c *compositor) drawCopyNumber(row int, line emu.Line) {
 			num = -num
 		}
 	}
-	text := strconv.Itoa(num)
-	start := pr.Col - len(text)
-	if start < 0 {
-		start = pr.Col
+	text = strconv.Itoa(num)
+	return max(pr.Col-len(text), -c.frameInset()), text, true
+}
+
+// numberGlyph styles one copy-mode line-number digit.
+func (c *compositor) numberGlyph(r rune) emu.Glyph {
+	return emu.Glyph{Char: r, FG: c.cfg.FillFG, BG: emu.DefaultBG, Mode: emu.AttrDim}
+}
+
+// drawCopyNumber paints the in-content part of row's copy-mode line number
+// (copyNumberAt); a digit on the framed outer border is composeContentRow's.
+// Runs after every pane is painted, or a neighbour drawn later would cover it.
+func (c *compositor) drawCopyNumber(row int, line emu.Line) {
+	start, text, ok := c.copyNumberAt(row)
+	if !ok {
+		return
 	}
 	// Don't leave half a wide rune on either side of the overwritten cells.
 	if start > 0 && start-1 < len(line) && line[start-1].Width() > 1 {
@@ -2383,7 +2399,7 @@ func (c *compositor) drawCopyNumber(row int, line emu.Line) {
 		if line[col].Width() > 1 && col+1 < len(line) {
 			line[col+1] = emu.EmptyGlyph()
 		}
-		line[col] = emu.Glyph{Char: r, FG: c.cfg.FillFG, BG: emu.DefaultBG, Mode: emu.AttrDim}
+		line[col] = c.numberGlyph(r)
 	}
 }
 

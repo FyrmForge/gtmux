@@ -340,6 +340,17 @@ func TestCompositorCopyModeRelativeNumbers(t *testing.T) {
 			t.Errorf("edge row %d = %q, want %q", row, got, want)
 		}
 	}
+
+	// framed: the edge pane's number starts on the outer frame column instead,
+	// so a single digit covers no text.
+	c.cfg.PaneBorders = "framed"
+	c.setPhysical(8, 6) // room for the frame and status bar around the 6x3 window
+	off := c.contentOffset()
+	for row, want := range []string{"1aaa", "0bbb", "1ccc"} {
+		if got := rowText(c, row+off, len(want)); got != want {
+			t.Errorf("framed edge row %d = %q, want %q", row, got, want)
+		}
+	}
 }
 
 // TestCompositorCopyModeUnfocused verifies copy-mode is a frozen overlay
